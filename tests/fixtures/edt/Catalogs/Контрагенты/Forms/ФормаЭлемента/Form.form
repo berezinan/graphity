@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xmlns:form="http://g5.1c.ru/v8/dt/form">
+  <handlers>
+    <event>OnCreateAtServer</event>
+    <name>ПриСозданииНаСервере</name>
+  </handlers>
+  <attributes>
+    <name>Объект</name>
+    <valueType>
+      <types>CatalogObject.Контрагенты</types>
+    </valueType>
+    <main>true</main>
+  </attributes>
+  <attributes>
+    <name>ОсновнойМенеджер</name>
+    <valueType>
+      <types>CatalogRef.Пользователи</types>
+    </valueType>
+  </attributes>
+  <attributes>
+    <name>СписокДоговоров</name>
+    <valueType>
+      <types>DynamicList</types>
+    </valueType>
+    <extInfo xsi:type="form:DynamicListExtInfo">
+      <mainTable>Catalog.Контрагенты</mainTable>
+    </extInfo>
+  </attributes>
+</form:Form>

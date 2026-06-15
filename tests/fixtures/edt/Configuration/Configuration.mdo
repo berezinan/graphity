@@ -9,8 +9,10 @@
   </synonym>
   <scriptVariant>Russian</scriptVariant>
   <defaultRoles>Role.ПолныеПрава</defaultRoles>
+  <subsystems>Subsystem.Продажи</subsystems>
   <catalogs>Catalog.Контрагенты</catalogs>
   <catalogs>Catalog.Пользователи</catalogs>
   <enums>Enum.СтатусДоговора</enums>
   <roles>Role.ПолныеПрава</roles>
+  <roles>Role.Менеджер</roles>
 </mdclass:Configuration>

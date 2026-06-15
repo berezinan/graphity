@@ -9,7 +9,7 @@ from graphify.extract import (
     extract_groovy, extract_sln, extract_csproj, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_verilog,
-    extract_bsl, extract_edt_mdo,
+    extract_bsl, extract_edt_mdo, extract_edt_rights, extract_edt_form,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1809,3 +1809,52 @@ def test_bsl_metadata_ref_id_matches_mdo_object_id():
     bsl_ids = {n["id"] for n in rb["nodes"] if n["label"] == "Catalog.Контрагенты"}
     mdo_ids = {n["id"] for n in rm["nodes"] if n["label"] == "Catalog.Контрагенты"}
     assert bsl_ids and bsl_ids == mdo_ids
+
+
+# ── 1C:EDT subsystems / rights / forms ───────────────────────────────────────
+
+SUBSYSTEM_MDO = EDT / "Subsystems" / "Продажи" / "Продажи.mdo"
+RIGHTS = EDT / "Roles" / "Менеджер" / "Rights.rights"
+FORM = EDT / "Catalogs" / "Контрагенты" / "Forms" / "ФормаЭлемента" / "Form.form"
+
+
+def test_edt_subsystem_contains_content():
+    r = extract_edt_mdo(SUBSYSTEM_MDO)
+    assert "Subsystem.Продажи" in _labels(r)
+    contains = _edge_labels(r, "contains")
+    assert ("Subsystem.Продажи", "Catalog.Контрагенты") in contains
+    assert ("Subsystem.Продажи", "Enum.СтатусДоговора") in contains
+
+
+def test_edt_rights_secures_granted_object():
+    r = extract_edt_rights(RIGHTS)
+    assert "error" not in r
+    secures = _edge_labels(r, "secures")
+    # Granted object -> edge; attribute-level FQN collapses onto the owning object.
+    assert ("Role.Менеджер", "Catalog.Контрагенты") in secures
+
+
+def test_edt_rights_skips_denied_object():
+    # Catalog.Пользователи has only <value>false</value> rights -> no edge.
+    r = extract_edt_rights(RIGHTS)
+    secures = _edge_labels(r, "secures")
+    assert ("Role.Менеджер", "Catalog.Пользователи") not in secures
+
+
+def test_edt_form_references_data_objects():
+    r = extract_edt_form(FORM)
+    assert "error" not in r
+    refs = _edge_labels(r, "references", "form")
+    targets = {t for _, t in refs}
+    assert "Catalog.Контрагенты" in targets      # <mainTable>
+    assert "Catalog.Пользователи" in targets      # CatalogRef.Пользователи attribute
+
+
+def test_edt_form_anchor_matches_mdo_form_child_id():
+    # The form's reference edges hang off the SAME node the owner .mdo emits for
+    # <forms><name>ФормаЭлемента</name>, so they merge at build time.
+    rf = extract_edt_form(FORM)
+    rm = extract_edt_mdo(CATALOG_MDO)
+    anchor = rf["nodes"][0]["id"]
+    mdo_form_ids = {n["id"] for n in rm["nodes"] if n["label"] == "ФормаЭлемента"}
+    assert anchor in mdo_form_ids

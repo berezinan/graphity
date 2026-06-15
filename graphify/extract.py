@@ -6583,15 +6583,43 @@ _EDT_OBJECT_MODULES: tuple[str, ...] = (
     "ValueManagerModule.bsl", "Module.bsl",
 )
 
-# Configuration.mdo registration value, e.g. "Catalog.Контрагенты". Restricted to
+# Configuration.mdo registration value, e.g. a catalog FQN. Restricted to
 # known kind prefixes so non-FQN children (e.g. <compatibilityMode>8.3.24) are
 # ignored.
 _EDT_FQN_RE = re.compile(r'^([A-Za-z]+)\.(.+)$')
+
+# A ref-type in a form, e.g. "CatalogRef.Клиенты" -> kind "Catalog". The prefix
+# minus the "Ref" suffix is the English singular kind.
+_EDT_REF_TYPE_RE = re.compile(r'^([A-Za-z]+)Ref\.(.+)$')
+
+# On-disk plural folder name (src/<KindPlural>/) -> English singular kind. Used to
+# rebuild a form's owner-object node id from its file path so the id matches the
+# `<forms>` child id that extract_edt_mdo emits from the owner .mdo.
+_EDT_PLURAL_TO_KIND: dict[str, str] = {
+    "Catalogs": "Catalog", "Documents": "Document", "Enums": "Enum",
+    "Constants": "Constant", "InformationRegisters": "InformationRegister",
+    "AccumulationRegisters": "AccumulationRegister",
+    "AccountingRegisters": "AccountingRegister",
+    "CalculationRegisters": "CalculationRegister",
+    "ChartsOfCharacteristicTypes": "ChartOfCharacteristicTypes",
+    "ChartsOfAccounts": "ChartOfAccounts",
+    "ChartsOfCalculationTypes": "ChartOfCalculationTypes",
+    "ExchangePlans": "ExchangePlan", "BusinessProcesses": "BusinessProcess",
+    "Tasks": "Task", "DataProcessors": "DataProcessor", "Reports": "Report",
+}
 
 
 def _edt_localname(tag: str) -> str:
     """Strip the `{namespace}` prefix ElementTree puts on every tag."""
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _edt_child_text(elem, localname: str) -> str | None:
+    """Text of the first direct child of `elem` whose local tag is `localname`."""
+    for c in elem:
+        if _edt_localname(c.tag) == localname and c.text:
+            return c.text.strip()
+    return None
 
 
 def extract_edt_mdo(path: Path) -> dict:
@@ -6695,11 +6723,170 @@ def extract_edt_mdo(path: Path) -> dict:
         if mod is not None and mod.is_file():
             add_edge(child_id, _make_id(str(mod)), "defines")
 
+    # A subsystem registers the objects it groups via <content>Kind.Name</content>.
+    if kind == "Subsystem":
+        for child in root:
+            if _edt_localname(child.tag) != "content":
+                continue
+            text = (child.text or "").strip()
+            m = _EDT_FQN_RE.match(text)
+            if not m or m.group(1) not in _EDT_KIND_PREFIXES:
+                continue
+            member_id = _make_id(m.group(1), m.group(2))
+            add_node(member_id, text)
+            add_edge(obj_id, member_id, "contains")
+
     # Object-level modules sitting beside the .mdo.
     for mod_name in _EDT_OBJECT_MODULES:
         mod = path.parent / mod_name
         if mod.is_file():
             add_edge(obj_id, _make_id(str(mod)), "defines")
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def _edt_parse_xml(path: Path):
+    """Shared, guarded parse for .rights/.form XML. Returns (root, error_result).
+
+    Exactly one of the two is non-None.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        src = path.read_bytes()
+    except OSError:
+        return None, {"nodes": [], "edges": [], "error": f"cannot read {path}"}
+    if len(src) > _PROJECT_XML_MAX_BYTES:
+        return None, {"nodes": [], "edges": [], "error": "xml file too large"}
+    if not _project_xml_is_safe(src):
+        return None, {"nodes": [], "edges": [],
+                      "error": "refusing XML with DOCTYPE/ENTITY declaration"}
+    try:
+        return ET.fromstring(src), None
+    except ET.ParseError as e:
+        return None, {"nodes": [], "edges": [], "error": f"XML parse error: {e}"}
+
+
+def extract_edt_rights(path: Path) -> dict:
+    """Extract a 1C:EDT role's access rights from a Rights.rights file.
+
+    The role is identified by its folder (`src/Roles/<Role>/Rights.rights`). Each
+    granted `<object>` (one whose rights include a `<value>true</value>`) yields a
+    `secures` edge Role -> object, collapsing attribute-level FQNs
+    (`Catalog.X.Attribute.Y`) onto the owning object (`Catalog.X`).
+    """
+    root, err = _edt_parse_xml(path)
+    if err is not None:
+        return err
+
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_edges: set[str] = set()
+
+    def add_node(nid: str, label: str) -> None:
+        if nid and nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"})
+
+    role_name = path.parent.name
+    role_id = _make_id("Role", role_name)
+    add_node(role_id, f"Role.{role_name}")
+
+    for obj in root.iter():
+        if _edt_localname(obj.tag) != "object":
+            continue
+        fqn = _edt_child_text(obj, "name")
+        if not fqn:
+            continue
+        granted = any(_edt_localname(r.tag) == "right"
+                      and _edt_child_text(r, "value") == "true" for r in obj)
+        if not granted:
+            continue
+        parts = fqn.split(".")
+        if len(parts) < 2 or parts[0] not in _EDT_KIND_PREFIXES:
+            continue
+        member_id = _make_id(parts[0], parts[1])
+        if member_id == role_id or member_id in seen_edges:
+            continue
+        seen_edges.add(member_id)
+        add_node(member_id, f"{parts[0]}.{parts[1]}")
+        edges.append({"source": role_id, "target": member_id, "relation": "secures",
+                      "confidence": "EXTRACTED", "source_file": str_path, "weight": 1.0})
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def _edt_form_owner_id(path: Path) -> str | None:
+    """Rebuild the node id of the form that `Form.form` describes, from its path.
+
+    Object-owned: `.../<KindPlural>/<Owner>/Forms/<FormName>/Form.form`
+                  -> `_make_id(<Kind>, <Owner>, "Form", <FormName>)`.
+    Common form:  `.../CommonForms/<Name>/Form.form` -> `_make_id("CommonForm", <Name>)`.
+    """
+    parts = path.parts
+    if "Forms" in parts:
+        i = parts.index("Forms")
+        if 0 < i - 1 and i + 1 < len(parts):
+            kind = _EDT_PLURAL_TO_KIND.get(parts[i - 2])
+            if kind:
+                return _make_id(kind, parts[i - 1], "Form", parts[i + 1])
+    elif "CommonForms" in parts:
+        j = parts.index("CommonForms")
+        if j + 1 < len(parts):
+            return _make_id("CommonForm", parts[j + 1])
+    return None
+
+
+def extract_edt_form(path: Path) -> dict:
+    """Extract data references from a 1C:EDT managed form (Form.form).
+
+    Anchors on the form's own node (the same id extract_edt_mdo emits for it) and
+    emits `references` edges to the metadata objects the form binds: the dynamic
+    list `<mainTable>Kind.Name</mainTable>` and every ref-typed attribute
+    `<types>KindRef.Name</types>`.
+    """
+    root, err = _edt_parse_xml(path)
+    if err is not None:
+        return err
+
+    form_id = _edt_form_owner_id(path)
+    if not form_id:
+        return {"nodes": [], "edges": []}
+
+    str_path = str(path)
+    nodes: list[dict] = [{"id": form_id, "label": path.parent.name,
+                          "file_type": "code", "source_file": str_path,
+                          "source_location": "L1"}]
+    edges: list[dict] = []
+    seen_targets: set[str] = set()
+
+    def add_ref(kind: str, name: str) -> None:
+        tgt = _make_id(kind, name)
+        if tgt == form_id or tgt in seen_targets:
+            return
+        seen_targets.add(tgt)
+        nodes.append({"id": tgt, "label": f"{kind}.{name}", "file_type": "code",
+                      "source_file": str_path, "source_location": "L1"})
+        edges.append({"source": form_id, "target": tgt, "relation": "references",
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "weight": 1.0, "context": "form"})
+
+    for elem in root.iter():
+        text = (elem.text or "").strip()
+        if not text:
+            continue
+        ln = _edt_localname(elem.tag)
+        if ln == "mainTable":
+            m = _EDT_FQN_RE.match(text)
+            if m and m.group(1) in _EDT_KIND_PREFIXES:
+                add_ref(m.group(1), m.group(2))
+        elif ln == "types":
+            m = _EDT_REF_TYPE_RE.match(text)
+            if m and m.group(1) in _EDT_KIND_PREFIXES:
+                add_ref(m.group(1), m.group(2))
 
     return {"nodes": nodes, "edges": edges}
 
@@ -11906,6 +12093,8 @@ _DISPATCH: dict[str, Any] = {
     ".os": extract_bsl,
     ".osl": extract_bsl,
     ".mdo": extract_edt_mdo,
+    ".rights": extract_edt_rights,
+    ".form": extract_edt_form,
 }
 
 
