@@ -9,6 +9,7 @@ from graphify.extract import (
     extract_groovy, extract_sln, extract_csproj, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_verilog,
+    extract_bsl,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1677,3 +1678,55 @@ def test_systemverilog_no_dangling_edges():
     for e in r["edges"]:
         assert e["source"] in node_ids, f"dangling source: {e}"
         assert e["target"] in node_ids, f"dangling target: {e}"
+
+
+# ── BSL (1C / OneScript) ─────────────────────────────────────────────────────
+
+def test_bsl_no_error():
+    r = extract_bsl(FIXTURES / "sample.bsl")
+    assert "error" not in r
+
+
+def test_bsl_finds_procedures_and_functions():
+    r = extract_bsl(FIXTURES / "sample.bsl")
+    labels = _labels(r)
+    assert "ОбработатьЗаказ()" in labels
+    assert "ВычислитьСумму()" in labels
+
+
+def test_bsl_extracts_call_graph():
+    # ОбработатьЗаказ() calls ВычислитьСумму() by bare name in the same module.
+    r = extract_bsl(FIXTURES / "sample.bsl")
+    assert ("ОбработатьЗаказ()", "ВычислитьСумму()") in _calls(r)
+
+
+def test_bsl_new_expression_references_platform_type():
+    r = extract_bsl(FIXTURES / "sample.bsl")
+    # _edge_labels normalizes labels (strips the "()" suffix).
+    refs = _edge_labels(r, "references", "new")
+    assert ("ОбработатьЗаказ", "ТаблицаЗначений") in refs
+    assert ("ОбработатьЗаказ", "Запрос") in refs
+
+
+def test_bsl_member_call_not_resolved_cross_module():
+    # Заказ.Записать() is a member call → recorded as is_member_call so it is
+    # not falsely resolved to a free procedure of the same name elsewhere.
+    r = extract_bsl(FIXTURES / "sample.bsl")
+    member = [rc for rc in r["raw_calls"] if rc["callee"] == "Записать"]
+    assert member and all(rc["is_member_call"] for rc in member)
+
+
+def test_bsl_no_dangling_edges():
+    r = extract_bsl(FIXTURES / "sample.bsl")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"dangling source: {e}"
+        if e["relation"] != "imports":
+            assert e["target"] in node_ids, f"dangling target: {e}"
+
+
+def test_bsl_onescript_use_directive_imports():
+    r = extract_bsl(FIXTURES / "sample.os")
+    assert "imports" in _relations(r)
+    # Cross-procedure call inside a OneScript module still resolves.
+    assert ("ГлавныйМетод()", "Запустить()") in _calls(r)

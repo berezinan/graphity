@@ -75,6 +75,15 @@ wheels = [
 ]
 
 [[package]]
+name = "async-timeout"
+version = "5.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a5/ae/136395dfbfe00dfc94da3f3e136d0b13f394cba8f4841120e34226265780/async_timeout-5.0.1.tar.gz", hash = "sha256:d9321a7a3d5a6a5e187e824d2fa0793ce379a202935782d555d6e9d2735677d3", size = 9274, upload-time = "2024-11-06T16:41:39.6Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/ba/e2081de779ca30d473f21f5b30e0e737c438205440784c7dfc81efc2b029/async_timeout-5.0.1-py3-none-any.whl", hash = "sha256:39e3809566ff85354557ec2398b55e096c8364bacac9405a7a1fa429e77fe76c", size = 6233, upload-time = "2024-11-06T16:41:37.9Z" },
+]
+
+[[package]]
 name = "attrs"
 version = "26.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -988,6 +997,19 @@ wheels = [
 ]
 
 [[package]]
+name = "falkordb"
+version = "1.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+    { name = "redis" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/3a/58da510e5800a5cdbf9591111e4287cbf68b475bf074db12a94e5db8bcea/falkordb-1.6.1.tar.gz", hash = "sha256:bbef448a0b43e00ff3062bd6201368618d7b36e969d16ba71e8b8e3fa90873d4", size = 103185, upload-time = "2026-04-28T13:24:44.524Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/90/02/1cf9cef72228ca2b2776b4ed0cb2645298ddcc57c1fe2c545cd46bc11eae/falkordb-1.6.1-py3-none-any.whl", hash = "sha256:cf51caeb433c04db303de5967a0c2590675fcc0354e80997870b1e0497d30c34", size = 37802, upload-time = "2026-04-28T13:24:45.677Z" },
+]
+
+[[package]]
 name = "faster-whisper"
 version = "1.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1131,7 +1153,7 @@ wheels = [
 
 [[package]]
 name = "graphifyy"
-version = "0.8.37"
+version = "0.8.39"
 source = { editable = "." }
 dependencies = [
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1141,6 +1163,7 @@ dependencies = [
     { name = "rapidfuzz" },
     { name = "tree-sitter" },
     { name = "tree-sitter-bash" },
+    { name = "tree-sitter-bsl" },
     { name = "tree-sitter-c" },
     { name = "tree-sitter-c-sharp" },
     { name = "tree-sitter-cpp" },
@@ -1171,6 +1194,7 @@ dependencies = [
 all = [
     { name = "anthropic" },
     { name = "boto3" },
+    { name = "falkordb" },
     { name = "faster-whisper", marker = "python_full_version >= '3.11'" },
     { name = "graspologic", marker = "python_full_version < '3.13'" },
     { name = "jieba" },
@@ -1201,6 +1225,9 @@ chinese = [
 ]
 dm = [
     { name = "tree-sitter-dm" },
+]
+falkordb = [
+    { name = "falkordb" },
 ]
 gemini = [
     { name = "openai" },
@@ -1284,6 +1311,8 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'" },
     { name = "boto3", marker = "extra == 'all'" },
     { name = "boto3", marker = "extra == 'bedrock'" },
+    { name = "falkordb", marker = "extra == 'all'" },
+    { name = "falkordb", marker = "extra == 'falkordb'" },
     { name = "faster-whisper", marker = "python_full_version >= '3.11' and extra == 'all'" },
     { name = "faster-whisper", marker = "python_full_version >= '3.11' and extra == 'video'" },
     { name = "graspologic", marker = "python_full_version < '3.13' and extra == 'all'" },
@@ -1320,44 +1349,45 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'gemini'" },
     { name = "tiktoken", marker = "extra == 'kimi'" },
     { name = "tiktoken", marker = "extra == 'openai'" },
-    { name = "tree-sitter", specifier = ">=0.23.0" },
-    { name = "tree-sitter-bash" },
-    { name = "tree-sitter-c" },
-    { name = "tree-sitter-c-sharp" },
-    { name = "tree-sitter-cpp" },
+    { name = "tree-sitter", specifier = ">=0.23.0,<0.26" },
+    { name = "tree-sitter-bash", specifier = ">=0.23,<0.27" },
+    { name = "tree-sitter-bsl", specifier = ">=0.1.6,<0.2" },
+    { name = "tree-sitter-c", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-c-sharp", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-cpp", specifier = ">=0.23,<0.25" },
     { name = "tree-sitter-dm", marker = "extra == 'all'" },
     { name = "tree-sitter-dm", marker = "extra == 'dm'" },
-    { name = "tree-sitter-elixir" },
-    { name = "tree-sitter-fortran" },
-    { name = "tree-sitter-go" },
-    { name = "tree-sitter-groovy" },
+    { name = "tree-sitter-elixir", specifier = ">=0.3,<0.5" },
+    { name = "tree-sitter-fortran", specifier = ">=0.6,<0.8" },
+    { name = "tree-sitter-go", specifier = ">=0.23,<0.26" },
+    { name = "tree-sitter-groovy", specifier = ">=0.1,<0.3" },
     { name = "tree-sitter-hcl", marker = "extra == 'all'" },
     { name = "tree-sitter-hcl", marker = "extra == 'terraform'" },
-    { name = "tree-sitter-java" },
-    { name = "tree-sitter-javascript" },
-    { name = "tree-sitter-json" },
-    { name = "tree-sitter-julia" },
-    { name = "tree-sitter-kotlin" },
-    { name = "tree-sitter-lua" },
-    { name = "tree-sitter-objc" },
-    { name = "tree-sitter-php" },
-    { name = "tree-sitter-powershell" },
-    { name = "tree-sitter-python" },
-    { name = "tree-sitter-ruby" },
-    { name = "tree-sitter-rust" },
-    { name = "tree-sitter-scala" },
+    { name = "tree-sitter-java", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-javascript", specifier = ">=0.23,<0.26" },
+    { name = "tree-sitter-json", specifier = ">=0.23,<0.26" },
+    { name = "tree-sitter-julia", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-kotlin", specifier = ">=1.0,<2.0" },
+    { name = "tree-sitter-lua", specifier = ">=0.2,<0.6" },
+    { name = "tree-sitter-objc", specifier = ">=3.0,<4.0" },
+    { name = "tree-sitter-php", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-powershell", specifier = ">=0.26,<0.28" },
+    { name = "tree-sitter-python", specifier = ">=0.23,<0.26" },
+    { name = "tree-sitter-ruby", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-rust", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-scala", specifier = ">=0.23,<0.27" },
     { name = "tree-sitter-sql", marker = "extra == 'all'" },
     { name = "tree-sitter-sql", marker = "extra == 'sql'" },
-    { name = "tree-sitter-swift" },
-    { name = "tree-sitter-typescript" },
-    { name = "tree-sitter-verilog" },
-    { name = "tree-sitter-zig" },
+    { name = "tree-sitter-swift", specifier = ">=0.7,<0.9" },
+    { name = "tree-sitter-typescript", specifier = ">=0.23,<0.25" },
+    { name = "tree-sitter-verilog", specifier = ">=1.0,<2.0" },
+    { name = "tree-sitter-zig", specifier = ">=1.0,<2.0" },
     { name = "watchdog", marker = "extra == 'all'" },
     { name = "watchdog", marker = "extra == 'watch'" },
     { name = "yt-dlp", marker = "extra == 'all'" },
     { name = "yt-dlp", marker = "extra == 'video'" },
 ]
-provides-extras = ["mcp", "neo4j", "pdf", "watch", "svg", "leiden", "office", "google", "postgres", "video", "kimi", "ollama", "bedrock", "anthropic", "gemini", "openai", "chinese", "sql", "dm", "terraform", "all"]
+provides-extras = ["mcp", "neo4j", "falkordb", "pdf", "watch", "svg", "leiden", "office", "google", "postgres", "video", "kimi", "ollama", "bedrock", "anthropic", "gemini", "openai", "chinese", "sql", "dm", "terraform", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3681,6 +3711,18 @@ wheels = [
 ]
 
 [[package]]
+name = "redis"
+version = "8.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "async-timeout", marker = "python_full_version < '3.11.3'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/53/ae/ed461cca5780b5fc8b9fe8ca0ed98d89508645fb9d880c24cc42c087678f/redis-8.0.0.tar.gz", hash = "sha256:a00c5355432051ac14e593b8b197fc76c887ee12d55a0984f69328a1115fdc49", size = 5101591, upload-time = "2026-05-28T12:45:13.5Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/e3/b519734372d305bd547534a9f32e4ce9f98552af753dce72cf3483a0ff0b/redis-8.0.0-py3-none-any.whl", hash = "sha256:c938c18338585009f0bc310f4c7e4e4b4d37639356c4ac072cedf3af570c8dc7", size = 499870, upload-time = "2026-05-28T12:45:11.697Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4703,6 +4745,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f7/a0/c3050a6277dfcac8c480f514dc4fe49f3f65f0eac68b4702cbaca2584e85/tree_sitter_bash-0.25.1-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a3332d71c7b7d5f78259b19d02d0ea111fcb82b72712ee4a93aaa5b226d3f0a8", size = 230074, upload-time = "2025-12-02T17:01:05.05Z" },
     { url = "https://files.pythonhosted.org/packages/71/0f/203fe6b27211387f4b9ba8c4a321567ca4ded2624dae6ccdbd2b6e940e17/tree_sitter_bash-0.25.1-cp310-abi3-win_amd64.whl", hash = "sha256:52a6802d9218f86278aa3e8b459c3abdad67eed0fde1f9f13aca5b6c634217a6", size = 195574, upload-time = "2025-12-02T17:01:06.412Z" },
     { url = "https://files.pythonhosted.org/packages/47/75/4ca1a9fabd8fb5aea78cea70f7837ce4dbf2afae115f62051e5fa99cba1c/tree_sitter_bash-0.25.1-cp310-abi3-win_arm64.whl", hash = "sha256:59115057ec2bae319e8082ff29559861045002964c3431ccb0fc92aa4bc9bccb", size = 191196, upload-time = "2025-12-02T17:01:07.486Z" },
+]
+
+[[package]]
+name = "tree-sitter-bsl"
+version = "0.1.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/2c/0906c7a938b41459b34b2078bc4c72ef6a0ad0a26a3b1ebc93f6a018d68a/tree_sitter_bsl-0.1.6.tar.gz", hash = "sha256:053dfccc6317ee75255a8e36622910a03b42ce2eeeb37cddb611554fd77f41a1", size = 61758, upload-time = "2026-03-10T21:51:07.28Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/60/51f245b1751d8f06370009a6e9dcb81df9e19ab0c166e39445a41b99a89f/tree_sitter_bsl-0.1.6-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:79fff9e2d44bdf8cb725e63cea15c1263f29c1b490333bb0da649b7832f5c8c1", size = 29521, upload-time = "2026-03-10T21:50:56.045Z" },
+    { url = "https://files.pythonhosted.org/packages/03/d3/68eb0e4235bbafee3635f19536d2bcc27a0b1d3228dbcab05a5c745aaa2e/tree_sitter_bsl-0.1.6-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:e0a0b7a5be33374fa6b09cda736bd868621fc38f1294e36beb2b2b06114a5de1", size = 31477, upload-time = "2026-03-10T21:50:57.638Z" },
+    { url = "https://files.pythonhosted.org/packages/58/6e/073677fcfef132adcb80e02c15950cfd584ee1e6a95d5f2c17ff71dfd15a/tree_sitter_bsl-0.1.6-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:d4da1dbb0e517256fc9037dec5b97eb21fe06381a8d174eb436db1157d63ac13", size = 38733, upload-time = "2026-03-10T21:50:59.254Z" },
+    { url = "https://files.pythonhosted.org/packages/41/85/ed836b6be68cfe3a86d2a6b1e06d33632e2c4258004937b43362ad6477ce/tree_sitter_bsl-0.1.6-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1c6958b9377c24e8183b41edb328cf4d221e37ab9403b9ea886381a65bea8099", size = 39558, upload-time = "2026-03-10T21:51:00.357Z" },
+    { url = "https://files.pythonhosted.org/packages/58/d8/23cd398e26e09b4e766a3866dbc0663bb372791fa4861584b954b24c539d/tree_sitter_bsl-0.1.6-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:8ccce439728d16a5daffe74c73958a8a507a6ae0911d81fe3a53b73dcbf5412e", size = 39251, upload-time = "2026-03-10T21:51:01.448Z" },
+    { url = "https://files.pythonhosted.org/packages/38/14/7fd81e18e829663d174a0a9565f3e7e7814a948c4f2b279cc0eb4f2b033e/tree_sitter_bsl-0.1.6-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:2639b66a06ac685e5d8530cffc4cd80270c839a3954cc80d46b7fbf041ff3459", size = 38709, upload-time = "2026-03-10T21:51:02.719Z" },
+    { url = "https://files.pythonhosted.org/packages/02/0c/269adf5ddbd563dadb72b2d4170c9747e3d6156229cf5350a6836e3cfa96/tree_sitter_bsl-0.1.6-cp310-abi3-win_amd64.whl", hash = "sha256:93cea344182d58d0b92e18b2e038e2c13f095cc0509f0c50134e02d56490433f", size = 33109, upload-time = "2026-03-10T21:51:03.78Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/02/a3afde83d34ab9999d2824d17804d9c33a4cedb21c24ce29b38977155bff/tree_sitter_bsl-0.1.6-cp310-abi3-win_arm64.whl", hash = "sha256:a27c7d367f9a70eb9e14547e438316a85c59bcdbb3ed4f8201d8f29d8f0619b3", size = 31850, upload-time = "2026-03-10T21:51:05.372Z" },
 ]
 
 [[package]]

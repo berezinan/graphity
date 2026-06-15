@@ -6284,6 +6284,209 @@ def extract_go(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
 
 
+# ── BSL (1C / OneScript) extractor (custom walk) ──────────────────────────────
+
+# OneScript `#Использовать <lib>` / `#Использовать "path"` (RU) and the English
+# `#Use` synonym. The tree-sitter-bsl grammar does not model this directive (it
+# parses as an ERROR node), so imports are recovered with a regex pass, mirroring
+# the Lua/Svelte fallbacks elsewhere in this module.
+_BSL_USE_RE = re.compile(
+    r'#\s*(?:Использовать|Use)\s+(?:"(?P<path>[^"]+)"|(?P<name>[\w.]+))',
+    re.IGNORECASE,
+)
+
+
+def extract_bsl(path: Path) -> dict:
+    """Extract procedures, functions, call graph, `Новый <Тип>` references, and
+    OneScript `#Использовать` imports from a .bsl/.os/.osl file via tree-sitter.
+
+    1C has no class or import constructs: a module is a flat list of procedures
+    and functions that call each other (and procedures in other modules) by bare
+    name. Cross-module calls are emitted as unresolved `raw_calls` and resolved
+    later by symbol_resolution.resolve_cross_file_raw_calls. Procedure/function
+    names are bilingual (Процедура/Procedure) but the grammar already normalises
+    both to the same node types, so no language-specific handling is needed.
+    """
+    try:
+        import tree_sitter_bsl as tsbsl
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree-sitter-bsl not installed"}
+
+    try:
+        language = Language(tsbsl.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, object]] = []  # (caller_nid, definition node)
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid,
+                "label": label,
+                "file_type": "code",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {
+            "source": src,
+            "target": tgt,
+            "relation": relation,
+            "confidence": confidence,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": weight,
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    def ensure_named_node(name: str, line: int) -> str:
+        nid = _make_id(stem, name)
+        if nid in seen_ids:
+            return nid
+        nid = _make_id(name)
+        if nid not in seen_ids:
+            add_node(nid, name, line)
+        return nid
+
+    def _named_field(node, field: str):
+        """child_by_field_name with a first-identifier fallback."""
+        n = node.child_by_field_name(field)
+        if n is not None:
+            return n
+        for child in node.children:
+            if child.type == "identifier":
+                return child
+        return None
+
+    def walk(node) -> None:
+        t = node.type
+        if t in ("procedure_definition", "function_definition"):
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                name = _read_text(name_node, source)
+                line = node.start_point[0] + 1
+                func_nid = _make_id(stem, name)
+                add_node(func_nid, f"{name}()", line)
+                add_edge(file_nid, func_nid, "contains", line)
+                # The definition node holds statements as direct children (no body
+                # wrapper), so the whole node is queued; walk_calls recurses its
+                # children. Definitions cannot nest in BSL, so nothing is missed.
+                function_bodies.append((func_nid, node))
+            return
+        # Recurse — definitions may be nested inside `#Область` (preprocessor) nodes.
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+
+    # OneScript imports (regex; see _BSL_USE_RE).
+    try:
+        text = source.decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    for m in _BSL_USE_RE.finditer(text):
+        raw = (m.group("path") or m.group("name") or "").strip()
+        if not raw:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        if m.group("path") and (raw.startswith(".") or "/" in raw or "\\" in raw):
+            resolved = Path(os.path.normpath(path.parent / raw))
+            tgt_nid = _make_id(str(resolved))
+        else:
+            tgt_nid = _make_id(raw)
+        add_edge(file_nid, tgt_nid, "imports", line, context="import")
+
+    label_to_nid: dict[str, str] = {}
+    for n in nodes:
+        normalised = n["label"].strip("()").lstrip(".")
+        label_to_nid[normalised] = n["id"]
+
+    seen_call_pairs: set[tuple[str, str]] = set()
+    raw_calls: list[dict] = []
+
+    def walk_calls(node, caller_nid: str) -> None:
+        t = node.type
+        if t in ("procedure_definition", "function_definition"):
+            return  # defensive: BSL has no nested definitions
+
+        if t == "method_call":
+            name_node = _named_field(node, "name")
+            if name_node is not None:
+                callee_name = _read_text(name_node, source)
+                # `Объект.Метод()` nests the method_call inside a call_expression /
+                # property_access after an `access` receiver — treat as a member
+                # call so it is not resolved cross-module (it's a platform/object
+                # method, not a free procedure).
+                is_member_call = (
+                    node.parent is not None
+                    and node.parent.type in ("call_expression", "property_access")
+                )
+                if callee_name and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
+                    tgt_nid = label_to_nid.get(callee_name)
+                    if tgt_nid and tgt_nid != caller_nid:
+                        pair = (caller_nid, tgt_nid)
+                        if pair not in seen_call_pairs:
+                            seen_call_pairs.add(pair)
+                            add_edge(caller_nid, tgt_nid, "calls",
+                                     node.start_point[0] + 1, context="call")
+                    elif not tgt_nid:
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": callee_name,
+                            "is_member_call": is_member_call,
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+
+        elif t == "new_expression":
+            # `Новый <Тип>(...)` — platform type instantiation. Record a reference
+            # so the graph shows which modules use which platform types.
+            type_node = node.child_by_field_name("type") or _named_field(node, "type")
+            if type_node is not None:
+                type_name = _read_text(type_node, source)
+                if type_name:
+                    line = node.start_point[0] + 1
+                    tgt_nid = ensure_named_node(type_name, line)
+                    if tgt_nid != caller_nid:
+                        add_edge(caller_nid, tgt_nid, "references", line, context="new")
+
+        for child in node.children:
+            walk_calls(child, caller_nid)
+
+    for caller_nid, def_node in function_bodies:
+        for child in def_node.children:
+            walk_calls(child, caller_nid)
+
+    valid_ids = seen_ids
+    clean_edges = []
+    for edge in edges:
+        src, tgt = edge["source"], edge["target"]
+        if src in valid_ids and (tgt in valid_ids or edge["relation"] == "imports"):
+            clean_edges.append(edge)
+
+    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+
+
 # ── Rust extractor (custom walk) ──────────────────────────────────────────────
 
 # Common Rust trait/stdlib method names that appear in virtually every codebase.
@@ -11482,6 +11685,9 @@ _DISPATCH: dict[str, Any] = {
     ".cshtml": extract_razor,
     ".cls": extract_apex,
     ".trigger": extract_apex,
+    ".bsl": extract_bsl,
+    ".os": extract_bsl,
+    ".osl": extract_bsl,
 }
 
 
