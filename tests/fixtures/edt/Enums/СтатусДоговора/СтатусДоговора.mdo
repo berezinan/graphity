@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Enum xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+              xmlns:core="http://g5.1c.ru/v8/dt/mcore"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              uuid="cccccccc-cccc-4ccc-8ccc-cccccccccccc">
+  <producedTypes>
+    <refType typeId="dddddddd-dddd-4ddd-8ddd-dddddddddddd" valueTypeId="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"/>
+  </producedTypes>
+  <name>СтатусДоговора</name>
+  <synonym>
+    <key>ru</key>
+    <value>Статус договора</value>
+  </synonym>
+  <enumValues uuid="f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1">
+    <name>Действует</name>
+    <synonym>
+      <key>ru</key>
+      <value>Действует</value>
+    </synonym>
+  </enumValues>
+  <enumValues uuid="f2f2f2f2-f2f2-4f2f-8f2f-f2f2f2f2f2f2">
+    <name>Закрыт</name>
+    <synonym>
+      <key>ru</key>
+      <value>Закрыт</value>
+    </synonym>
+  </enumValues>
+</mdclass:Enum>

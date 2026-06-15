@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Configuration xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                       uuid="c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0">
+  <name>ТестоваяКонфигурация</name>
+  <synonym>
+    <key>ru</key>
+    <value>Тестовая конфигурация</value>
+  </synonym>
+  <scriptVariant>Russian</scriptVariant>
+  <defaultRoles>Role.ПолныеПрава</defaultRoles>
+  <catalogs>Catalog.Контрагенты</catalogs>
+  <catalogs>Catalog.Пользователи</catalogs>
+  <enums>Enum.СтатусДоговора</enums>
+  <roles>Role.ПолныеПрава</roles>
+</mdclass:Configuration>

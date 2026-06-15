@@ -6422,7 +6422,29 @@ def extract_bsl(path: Path) -> dict:
         label_to_nid[normalised] = n["id"]
 
     seen_call_pairs: set[tuple[str, str]] = set()
+    seen_meta_refs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
+
+    def _manager_object_ref(node) -> tuple[str, str] | None:
+        """If `node` is `<Collection>.<Name>` (e.g. `Справочники.Клиенты`), return
+        (Kind, Name) for the referenced metadata object, else None. Both
+        `property_access` (bare expression) and the chained `access` (receiver of a
+        further `.method()`) share the shape `access(identifier) '.' property`."""
+        base = prop = None
+        for c in node.children:
+            if c.type == "access" and base is None:
+                base = c
+            elif c.type == "property" and prop is None:
+                prop = c
+        if base is None or prop is None:
+            return None
+        ident = [c for c in base.children if c.type == "identifier"]
+        if len(base.children) != 1 or not ident:
+            return None  # base must be a bare identifier, not a deeper chain
+        kind = _EDT_MANAGER_TO_KIND.get(_read_text(ident[0], source))
+        if not kind:
+            return None
+        return kind, _read_text(prop, source)
 
     def walk_calls(node, caller_nid: str) -> None:
         t = node.type
@@ -6470,6 +6492,23 @@ def extract_bsl(path: Path) -> dict:
                     if tgt_nid != caller_nid:
                         add_edge(caller_nid, tgt_nid, "references", line, context="new")
 
+        elif t in ("access", "property_access"):
+            # `Справочники.Клиенты` / `Documents.Order` — a reference to a metadata
+            # object. Emit it with the same canonical id extract_edt_mdo uses, so
+            # code and the .mdo backbone merge into one node at build time.
+            ref = _manager_object_ref(node)
+            if ref:
+                kind, obj_name = ref
+                if obj_name:
+                    meta_id = _make_id(kind, obj_name)
+                    pair = (caller_nid, meta_id)
+                    if meta_id != caller_nid and pair not in seen_meta_refs:
+                        seen_meta_refs.add(pair)
+                        line = node.start_point[0] + 1
+                        add_node(meta_id, f"{kind}.{obj_name}", line)
+                        add_edge(caller_nid, meta_id, "references", line,
+                                 context="metadata")
+
         for child in node.children:
             walk_calls(child, caller_nid)
 
@@ -6485,6 +6524,184 @@ def extract_bsl(path: Path) -> dict:
             clean_edges.append(edge)
 
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+
+
+# ── 1C:EDT metadata (.mdo) extractor ──────────────────────────────────────────
+#
+# A 1C:EDT project export is more than its .bsl modules: the structural backbone
+# lives in *.mdo files (one per metadata object, plus Configuration.mdo). This
+# extractor turns that backbone into graph nodes so the call graph from extract_bsl
+# connects to the catalogs/documents/registers the code actually operates on.
+#
+# The canonical node id of a metadata object is `_make_id(<EnglishKind>, <Name>)`
+# — e.g. `_make_id("Catalog", "Контрагенты")`. That same id is produced by
+# extract_bsl when it sees `Справочники.Контрагенты`, so the two halves merge into
+# one node at build time. The object's root .mdo element local name IS the English
+# singular kind prefix (`<mdclass:Catalog>` -> "Catalog"), which is why no
+# kind-name translation table is needed on the .mdo side.
+
+# English singular type prefixes (skill: edt-structures §3 type-prefix table).
+# Used to recognise `Kind.Name` registration values inside Configuration.mdo.
+_EDT_KIND_PREFIXES: frozenset[str] = frozenset({
+    "Catalog", "Document", "Enum", "Constant", "InformationRegister",
+    "AccumulationRegister", "AccountingRegister", "CalculationRegister",
+    "CommonModule", "CommonForm", "CommonCommand", "CommonTemplate",
+    "CommonPicture", "CommonAttribute", "Subsystem", "Role", "ScheduledJob",
+    "SessionParameter", "DefinedType", "ExchangePlan",
+    "ChartOfCharacteristicTypes", "ChartOfAccounts", "ChartOfCalculationTypes",
+    "BusinessProcess", "Task", "Report", "DataProcessor", "HTTPService",
+    "WebService", "XDTOPackage", "EventSubscription", "FilterCriterion",
+    "FunctionalOption", "FunctionalOptionsParameter", "Language", "Sequence",
+})
+
+# Manager-collection identifiers (RU + EN) -> English kind prefix. A BSL access
+# `<Collection>.<Name>` (e.g. `Справочники.Клиенты`, `Documents.Order`) is a
+# reference to the metadata object `_make_id(<Kind>, <Name>)`.
+_EDT_MANAGER_TO_KIND: dict[str, str] = {
+    "Справочники": "Catalog", "Catalogs": "Catalog",
+    "Документы": "Document", "Documents": "Document",
+    "Перечисления": "Enum", "Enums": "Enum",
+    "Константы": "Constant", "Constants": "Constant",
+    "РегистрыСведений": "InformationRegister", "InformationRegisters": "InformationRegister",
+    "РегистрыНакопления": "AccumulationRegister", "AccumulationRegisters": "AccumulationRegister",
+    "РегистрыБухгалтерии": "AccountingRegister", "AccountingRegisters": "AccountingRegister",
+    "РегистрыРасчета": "CalculationRegister", "CalculationRegisters": "CalculationRegister",
+    "ПланыВидовХарактеристик": "ChartOfCharacteristicTypes", "ChartsOfCharacteristicTypes": "ChartOfCharacteristicTypes",
+    "ПланыСчетов": "ChartOfAccounts", "ChartsOfAccounts": "ChartOfAccounts",
+    "ПланыВидовРасчета": "ChartOfCalculationTypes", "ChartsOfCalculationTypes": "ChartOfCalculationTypes",
+    "ПланыОбмена": "ExchangePlan", "ExchangePlans": "ExchangePlan",
+    "БизнесПроцессы": "BusinessProcess", "BusinessProcesses": "BusinessProcess",
+    "Задачи": "Task", "Tasks": "Task",
+    "Обработки": "DataProcessor", "DataProcessors": "DataProcessor",
+    "Отчеты": "Report", "Reports": "Report",
+}
+
+# Object-level BSL modules that may sit next to a <Name>.mdo, by their fixed
+# filename. Each existing one is linked object -> module with a `defines` edge.
+_EDT_OBJECT_MODULES: tuple[str, ...] = (
+    "ObjectModule.bsl", "ManagerModule.bsl", "RecordSetModule.bsl",
+    "ValueManagerModule.bsl", "Module.bsl",
+)
+
+# Configuration.mdo registration value, e.g. "Catalog.Контрагенты". Restricted to
+# known kind prefixes so non-FQN children (e.g. <compatibilityMode>8.3.24) are
+# ignored.
+_EDT_FQN_RE = re.compile(r'^([A-Za-z]+)\.(.+)$')
+
+
+def _edt_localname(tag: str) -> str:
+    """Strip the `{namespace}` prefix ElementTree puts on every tag."""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def extract_edt_mdo(path: Path) -> dict:
+    """Extract a 1C:EDT metadata object (or the configuration root) from a .mdo file.
+
+    Object .mdo  -> one object node (`Kind.Name`) plus `contains` edges to its
+    attributes, tabular sections, enum values, forms and commands, and `defines`
+    edges to the sibling .bsl modules (ObjectModule/ManagerModule/…) that exist
+    on disk. Configuration.mdo -> a Configuration node with `contains` edges to
+    every registered child object.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        src = path.read_bytes()
+    except OSError:
+        return {"nodes": [], "edges": [], "error": f"cannot read {path}"}
+    if len(src) > _PROJECT_XML_MAX_BYTES:
+        return {"nodes": [], "edges": [], "error": "mdo file too large"}
+    if not _project_xml_is_safe(src):
+        return {"nodes": [], "edges": [],
+                "error": "refusing XML with DOCTYPE/ENTITY declaration"}
+    try:
+        root = ET.fromstring(src)
+    except ET.ParseError as e:
+        return {"nodes": [], "edges": [], "error": f"XML parse error: {e}"}
+
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
+
+    def add_node(nid: str, label: str, file_type: str = "code") -> None:
+        if nid and nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": file_type,
+                          "source_file": str_path, "source_location": "L1"})
+
+    def add_edge(src_id: str, tgt_id: str, relation: str) -> None:
+        key = (src_id, tgt_id, relation)
+        if not src_id or not tgt_id or src_id == tgt_id or key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({"source": src_id, "target": tgt_id, "relation": relation,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "weight": 1.0})
+
+    def child_text(elem, localname: str) -> str | None:
+        for c in elem:
+            if _edt_localname(c.tag) == localname and c.text:
+                return c.text.strip()
+        return None
+
+    kind = _edt_localname(root.tag)
+
+    # ── Configuration root: register every contained child object ──────────────
+    if kind == "Configuration":
+        conf_id = _make_id("Configuration")
+        add_node(conf_id, child_text(root, "name") or "Configuration", "concept")
+        for child in root:
+            text = (child.text or "").strip()
+            m = _EDT_FQN_RE.match(text)
+            if not m or m.group(1) not in _EDT_KIND_PREFIXES:
+                continue
+            obj_id = _make_id(m.group(1), m.group(2))
+            add_node(obj_id, text)
+            add_edge(conf_id, obj_id, "contains")
+        return {"nodes": nodes, "edges": edges}
+
+    # ── Object root: the object plus its child artifacts and modules ───────────
+    name = child_text(root, "name")
+    if not name:
+        return {"nodes": nodes, "edges": edges}
+
+    obj_id = _make_id(kind, name)
+    add_node(obj_id, f"{kind}.{name}")
+
+    # Child artifacts: attributes / tabular sections / enum values / forms / commands.
+    _CHILD_KINDS = {
+        "attributes": "Attribute", "tabularSections": "TabularSection",
+        "enumValues": "EnumValue", "forms": "Form", "commands": "Command",
+    }
+    for child in root:
+        sub = _CHILD_KINDS.get(_edt_localname(child.tag))
+        if not sub:
+            continue
+        child_name = child_text(child, "name")
+        if not child_name:
+            continue
+        child_id = _make_id(kind, name, sub, child_name)
+        add_node(child_id, child_name)
+        add_edge(obj_id, child_id, "contains")
+        # A form/command owns a BSL module folder next to the .mdo.
+        if sub == "Form":
+            mod = path.parent / "Forms" / child_name / "Module.bsl"
+        elif sub == "Command":
+            mod = path.parent / "Commands" / child_name / "CommandModule.bsl"
+        else:
+            mod = None
+        if mod is not None and mod.is_file():
+            add_edge(child_id, _make_id(str(mod)), "defines")
+
+    # Object-level modules sitting beside the .mdo.
+    for mod_name in _EDT_OBJECT_MODULES:
+        mod = path.parent / mod_name
+        if mod.is_file():
+            add_edge(obj_id, _make_id(str(mod)), "defines")
+
+    return {"nodes": nodes, "edges": edges}
 
 
 # ── Rust extractor (custom walk) ──────────────────────────────────────────────
@@ -11688,6 +11905,7 @@ _DISPATCH: dict[str, Any] = {
     ".bsl": extract_bsl,
     ".os": extract_bsl,
     ".osl": extract_bsl,
+    ".mdo": extract_edt_mdo,
 }
 
 

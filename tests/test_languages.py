@@ -9,7 +9,7 @@ from graphify.extract import (
     extract_groovy, extract_sln, extract_csproj, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_verilog,
-    extract_bsl,
+    extract_bsl, extract_edt_mdo,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1730,3 +1730,82 @@ def test_bsl_onescript_use_directive_imports():
     assert "imports" in _relations(r)
     # Cross-procedure call inside a OneScript module still resolves.
     assert ("ГлавныйМетод()", "Запустить()") in _calls(r)
+
+
+# ── 1C:EDT metadata (.mdo) ───────────────────────────────────────────────────
+
+EDT = FIXTURES / "edt"
+CATALOG_MDO = EDT / "Catalogs" / "Контрагенты" / "Контрагенты.mdo"
+ENUM_MDO = EDT / "Enums" / "СтатусДоговора" / "СтатусДоговора.mdo"
+CONFIG_MDO = EDT / "Configuration" / "Configuration.mdo"
+
+
+def test_edt_mdo_no_error():
+    assert "error" not in extract_edt_mdo(CATALOG_MDO)
+
+
+def test_edt_mdo_object_node():
+    assert "Catalog.Контрагенты" in _labels(extract_edt_mdo(CATALOG_MDO))
+
+
+def test_edt_mdo_contains_children():
+    r = extract_edt_mdo(CATALOG_MDO)
+    labels = _labels(r)
+    assert "ИНН" in labels             # attribute
+    assert "Контакты" in labels        # tabular section
+    assert "ФормаЭлемента" in labels   # form
+    assert "Печать" in labels          # command
+    contains = _edge_labels(r, "contains")
+    assert ("Catalog.Контрагенты", "ИНН") in contains
+    assert ("Catalog.Контрагенты", "ФормаЭлемента") in contains
+
+
+def test_edt_mdo_defines_sibling_modules():
+    r = extract_edt_mdo(CATALOG_MDO)
+    obj_id = _node_by_label(r, "Catalog.Контрагенты")["id"]
+    obj_defines = {e["target"] for e in r["edges"]
+                   if e["relation"] == "defines" and e["source"] == obj_id}
+    # ObjectModule.bsl and ManagerModule.bsl both exist next to the .mdo.
+    assert len(obj_defines) >= 2
+
+
+def test_edt_mdo_form_defines_its_module():
+    r = extract_edt_mdo(CATALOG_MDO)
+    form_id = _node_by_label(r, "ФормаЭлемента")["id"]
+    assert any(e["relation"] == "defines" and e["source"] == form_id
+               for e in r["edges"])
+
+
+def test_edt_mdo_enum_values():
+    r = extract_edt_mdo(ENUM_MDO)
+    labels = _labels(r)
+    assert "Enum.СтатусДоговора" in labels
+    assert "Действует" in labels
+    assert "Закрыт" in labels
+
+
+def test_edt_configuration_registers_children():
+    r = extract_edt_mdo(CONFIG_MDO)
+    labels = _labels(r)
+    assert "ТестоваяКонфигурация" in labels          # Configuration node label = <name>
+    contains = _edge_labels(r, "contains")
+    assert ("ТестоваяКонфигурация", "Catalog.Контрагенты") in contains
+    assert ("ТестоваяКонфигурация", "Enum.СтатусДоговора") in contains
+    # Non-FQN scalar children (scriptVariant, compatibilityMode) create no nodes.
+    assert "Russian" not in labels
+
+
+def test_bsl_links_manager_access_to_metadata():
+    r = extract_bsl(EDT / "Catalogs" / "Контрагенты" / "ManagerModule.bsl")
+    refs = _edge_labels(r, "references", "metadata")
+    assert ("НайтиПоИНН", "Catalog.Контрагенты") in refs
+
+
+def test_bsl_metadata_ref_id_matches_mdo_object_id():
+    # The crux: code-side and .mdo-side produce the SAME node id, so they merge
+    # into one node at build time.
+    rb = extract_bsl(EDT / "Catalogs" / "Контрагенты" / "ManagerModule.bsl")
+    rm = extract_edt_mdo(CATALOG_MDO)
+    bsl_ids = {n["id"] for n in rb["nodes"] if n["label"] == "Catalog.Контрагенты"}
+    mdo_ids = {n["id"] for n in rm["nodes"] if n["label"] == "Catalog.Контрагенты"}
+    assert bsl_ids and bsl_ids == mdo_ids

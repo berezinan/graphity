@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                 xmlns:core="http://g5.1c.ru/v8/dt/mcore"
+                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 uuid="11111111-1111-4111-8111-111111111111">
+  <producedTypes>
+    <objectType typeId="22222222-2222-4222-8222-222222222222" valueTypeId="33333333-3333-4333-8333-333333333333"/>
+    <refType typeId="44444444-4444-4444-8444-444444444444" valueTypeId="55555555-5555-4555-8555-555555555555"/>
+  </producedTypes>
+  <name>Контрагенты</name>
+  <synonym>
+    <key>ru</key>
+    <value>Контрагенты</value>
+  </synonym>
+  <standardAttributes>
+    <name>Description</name>
+    <fullTextSearch>Use</fullTextSearch>
+  </standardAttributes>
+  <attributes uuid="66666666-6666-4666-8666-666666666666">
+    <name>ИНН</name>
+    <synonym>
+      <key>ru</key>
+      <value>ИНН</value>
+    </synonym>
+    <type>
+      <types>String</types>
+      <stringQualifiers>
+        <length>12</length>
+      </stringQualifiers>
+    </type>
+    <indexing>Index</indexing>
+  </attributes>
+  <attributes uuid="77777777-7777-4777-8777-777777777777">
+    <name>ОсновнойМенеджер</name>
+    <type>
+      <types>CatalogRef.Пользователи</types>
+    </type>
+  </attributes>
+  <tabularSections uuid="88888888-8888-4888-8888-888888888888">
+    <name>Контакты</name>
+    <synonym>
+      <key>ru</key>
+      <value>Контакты</value>
+    </synonym>
+    <attributes uuid="99999999-9999-4999-8999-999999999999">
+      <name>Значение</name>
+      <type>
+        <types>String</types>
+        <stringQualifiers>
+          <length>100</length>
+        </stringQualifiers>
+      </type>
+    </attributes>
+  </tabularSections>
+  <forms uuid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa">
+    <name>ФормаЭлемента</name>
+    <synonym>
+      <key>ru</key>
+      <value>Форма элемента</value>
+    </synonym>
+  </forms>
+  <commands uuid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb">
+    <name>Печать</name>
+    <synonym>
+      <key>ru</key>
+      <value>Печать</value>
+    </synonym>
+  </commands>
+</mdclass:Catalog>
