@@ -13,6 +13,7 @@
   <catalogs>Catalog.Контрагенты</catalogs>
   <catalogs>Catalog.Пользователи</catalogs>
   <enums>Enum.СтатусДоговора</enums>
+  <reports>Report.ВзаиморасчетыОтчет</reports>
   <roles>Role.ПолныеПрава</roles>
   <roles>Role.Менеджер</roles>
 </mdclass:Configuration>

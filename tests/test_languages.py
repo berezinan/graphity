@@ -10,6 +10,7 @@ from graphify.extract import (
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_verilog,
     extract_bsl, extract_edt_mdo, extract_edt_rights, extract_edt_form,
+    extract_edt_dcs,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1858,3 +1859,34 @@ def test_edt_form_anchor_matches_mdo_form_child_id():
     anchor = rf["nodes"][0]["id"]
     mdo_form_ids = {n["id"] for n in rm["nodes"] if n["label"] == "ФормаЭлемента"}
     assert anchor in mdo_form_ids
+
+
+def test_edt_form_handler_links_to_bsl_procedure():
+    # <handlers><name>ПриСозданииНаСервере</name> -> the procedure node that
+    # extract_bsl emits for the sibling Module.bsl (same id, so it merges).
+    rf = extract_edt_form(FORM)
+    handler_targets = {e["target"] for e in rf["edges"]
+                       if e.get("context") == "form-handler"}
+    rb = extract_bsl(FORM.parent / "Module.bsl")
+    proc_ids = {n["id"] for n in rb["nodes"] if n["label"].strip("()") == "ПриСозданииНаСервере"}
+    assert proc_ids and proc_ids <= handler_targets
+
+
+DCS = (EDT / "Reports" / "ВзаиморасчетыОтчет" / "Templates" / "ОсновнаяСхема"
+       / "Template.dcs")
+
+
+def test_edt_dcs_references_query_tables():
+    r = extract_edt_dcs(DCS)
+    assert "error" not in r
+    refs = _edge_labels(r, "references", "dcs")
+    # Owner report -> the FROM-clause source tables (RU singular prefixes).
+    assert ("Report.ВзаиморасчетыОтчет", "Catalog.Контрагенты") in refs
+    assert ("Report.ВзаиморасчетыОтчет", "Document.Договор") in refs
+
+
+def test_edt_dcs_ignores_field_aliases():
+    # `Контрагенты.ИНН` (alias.field) must NOT become a metadata reference.
+    r = extract_edt_dcs(DCS)
+    targets = {t for _, t in _edge_labels(r, "references", "dcs")}
+    assert not any(t.endswith(".ИНН") for t in targets)

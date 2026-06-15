@@ -6608,6 +6608,39 @@ _EDT_PLURAL_TO_KIND: dict[str, str] = {
     "Tasks": "Task", "DataProcessors": "DataProcessor", "Reports": "Report",
 }
 
+# Common (owner-less) plural folders -> singular kind, for path-based owner
+# resolution of artifacts that live under them (e.g. CommonTemplates/<Name>).
+_EDT_COMMON_FOLDER_TO_KIND: dict[str, str] = {
+    "CommonForms": "CommonForm", "CommonTemplates": "CommonTemplate",
+    "CommonModules": "CommonModule", "CommonCommands": "CommonCommand",
+    "CommonPictures": "CommonPicture", "CommonAttributes": "CommonAttribute",
+}
+
+# Query-language (SDBL) source-table prefixes -> English kind. These are the
+# SINGULAR RU/EN names used in a query FROM/ИЗ clause (e.g.
+# `РегистрНакопления.Взаиморасчеты.Остатки`), distinct from the plural manager
+# collections in _EDT_MANAGER_TO_KIND.
+_EDT_QUERY_TABLE_TO_KIND: dict[str, str] = {
+    "Справочник": "Catalog", "Catalog": "Catalog",
+    "Документ": "Document", "Document": "Document",
+    "Перечисление": "Enum", "Enum": "Enum",
+    "Константа": "Constant", "Constant": "Constant",
+    "РегистрСведений": "InformationRegister", "InformationRegister": "InformationRegister",
+    "РегистрНакопления": "AccumulationRegister", "AccumulationRegister": "AccumulationRegister",
+    "РегистрБухгалтерии": "AccountingRegister", "AccountingRegister": "AccountingRegister",
+    "РегистрРасчета": "CalculationRegister", "CalculationRegister": "CalculationRegister",
+    "ПланВидовХарактеристик": "ChartOfCharacteristicTypes", "ChartOfCharacteristicTypes": "ChartOfCharacteristicTypes",
+    "ПланСчетов": "ChartOfAccounts", "ChartOfAccounts": "ChartOfAccounts",
+    "ПланВидовРасчета": "ChartOfCalculationTypes", "ChartOfCalculationTypes": "ChartOfCalculationTypes",
+    "ПланОбмена": "ExchangePlan", "ExchangePlan": "ExchangePlan",
+    "БизнесПроцесс": "BusinessProcess", "BusinessProcess": "BusinessProcess",
+    "Задача": "Task", "Task": "Task",
+}
+
+# A `Prefix.Name` reference in query text. group(2) is the metadata object name;
+# any trailing `.VirtualTable`/`.field` segment is left for the caller to ignore.
+_EDT_QUERY_REF_RE = re.compile(r'([A-Za-zА-Яа-яЁё]+)\.([A-Za-zА-Яа-яЁё0-9_]+)')
+
 
 def _edt_localname(tag: str) -> str:
     """Strip the `{namespace}` prefix ElementTree puts on every tag."""
@@ -6887,6 +6920,87 @@ def extract_edt_form(path: Path) -> dict:
             m = _EDT_REF_TYPE_RE.match(text)
             if m and m.group(1) in _EDT_KIND_PREFIXES:
                 add_ref(m.group(1), m.group(2))
+
+    # An event/command handler binds the form to a procedure in its Module.bsl.
+    # `<handlers><event>E</event><name>Proc</name>` (item/form events) and
+    # `<handler><name>Proc</name>` (command actions) both name the procedure via a
+    # direct <name> child. extract_bsl ids that procedure _make_id(stem, Proc) with
+    # stem == _file_stem(Module.bsl), so the edge lands on the real node.
+    module = path.parent / "Module.bsl"
+    if module.is_file():
+        mod_stem = _file_stem(module)
+        seen_handlers: set[str] = set()
+        for elem in root.iter():
+            if _edt_localname(elem.tag) not in ("handlers", "handler"):
+                continue
+            proc = _edt_child_text(elem, "name")
+            if not proc:
+                continue
+            proc_id = _make_id(mod_stem, proc)
+            if proc_id == form_id or proc_id in seen_handlers:
+                continue
+            seen_handlers.add(proc_id)
+            edges.append({"source": form_id, "target": proc_id, "relation": "references",
+                          "confidence": "EXTRACTED", "source_file": str_path,
+                          "weight": 1.0, "context": "form-handler"})
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def _edt_owner_id_from_path(path: Path) -> tuple[str, str] | None:
+    """Resolve the owning metadata object from an artifact's file path.
+
+    Walks the path for the first `<KindPlural>/<Owner>` segment pair — either an
+    object kind folder (`Reports/<Name>`) or a common folder
+    (`CommonTemplates/<Name>`) — and returns `(node_id, "Kind.Name")`.
+    """
+    parts = path.parts
+    for i, seg in enumerate(parts[:-1]):
+        kind = _EDT_COMMON_FOLDER_TO_KIND.get(seg) or _EDT_PLURAL_TO_KIND.get(seg)
+        if kind:
+            return _make_id(kind, parts[i + 1]), f"{kind}.{parts[i + 1]}"
+    return None
+
+
+def extract_edt_dcs(path: Path) -> dict:
+    """Extract data lineage from a 1C:EDT data composition schema (Template.dcs).
+
+    Each `<query>` is SDBL; its FROM/ИЗ source tables (`Справочник.X`,
+    `РегистрНакопления.Y.Остатки`, …) are the metadata objects the schema reads.
+    Anchors on the owning object (the report/data-processor/common-template the
+    template belongs to) and emits `references` edges to each source object.
+    """
+    root, err = _edt_parse_xml(path)
+    if err is not None:
+        return err
+
+    owner = _edt_owner_id_from_path(path)
+    if not owner:
+        return {"nodes": [], "edges": []}
+    owner_id, owner_label = owner
+
+    str_path = str(path)
+    nodes: list[dict] = [{"id": owner_id, "label": owner_label, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    seen_targets: set[str] = set()
+
+    for elem in root.iter():
+        if _edt_localname(elem.tag) != "query" or not elem.text:
+            continue
+        for m in _EDT_QUERY_REF_RE.finditer(elem.text):
+            kind = _EDT_QUERY_TABLE_TO_KIND.get(m.group(1))
+            if not kind:
+                continue
+            tgt = _make_id(kind, m.group(2))
+            if tgt == owner_id or tgt in seen_targets:
+                continue
+            seen_targets.add(tgt)
+            nodes.append({"id": tgt, "label": f"{kind}.{m.group(2)}", "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"})
+            edges.append({"source": owner_id, "target": tgt, "relation": "references",
+                          "confidence": "EXTRACTED", "source_file": str_path,
+                          "weight": 1.0, "context": "dcs"})
 
     return {"nodes": nodes, "edges": edges}
 
@@ -12095,6 +12209,7 @@ _DISPATCH: dict[str, Any] = {
     ".mdo": extract_edt_mdo,
     ".rights": extract_edt_rights,
     ".form": extract_edt_form,
+    ".dcs": extract_edt_dcs,
 }
 
 

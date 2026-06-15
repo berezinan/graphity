@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema"
+                       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dataSource>
+    <name>ИсточникДанных1</name>
+    <dataSourceType>Local</dataSourceType>
+  </dataSource>
+  <dataSet xsi:type="DataSetQuery">
+    <name>НаборДанных1</name>
+    <field xsi:type="DataSetFieldField">
+      <dataPath>ИНН</dataPath>
+    </field>
+    <dataSource>ИсточникДанных1</dataSource>
+    <query>ВЫБРАТЬ
+	Контрагенты.ИНН КАК ИНН
+ИЗ
+	Справочник.Контрагенты КАК Контрагенты
+ГДЕ
+	Контрагенты.Ссылка В (ВЫБРАТЬ Договоры.Ссылка ИЗ Документ.Договор КАК Договоры)</query>
+  </dataSet>
+</DataCompositionSchema>
