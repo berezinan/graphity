@@ -2668,8 +2668,6 @@ def main() -> None:
         if len(sys.argv) < 3:
             print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _query_graph_text
-        from graphify.security import sanitize_label
         from networkx.readwrite import json_graph
         from graphify import querylog
 
@@ -2706,43 +2704,47 @@ def main() -> None:
                 i += 2
             else:
                 i += 1
-        gp = Path(graph_path).resolve()
-        if not gp.exists():
-            print(f"error: graph file not found: {gp}", file=sys.stderr)
-            sys.exit(1)
-        if not gp.suffix == ".json":
-            print(f"error: graph file must be a .json file", file=sys.stderr)
-            sys.exit(1)
-        _enforce_graph_size_cap_or_exit(gp)
-        try:
-            import json as _json
-            import networkx as _nx
-
-            _raw = _json.loads(gp.read_text(encoding="utf-8"))
-            if "links" not in _raw and "edges" in _raw:
-                _raw = dict(_raw, links=_raw["edges"])
+        from graphify.query_backend import (
+            resolve_backend_config, open_backend, JsonBackend, render_query,
+        )
+        _cfg = resolve_backend_config(graph_path)
+        if _cfg["kind"] == "arcadedb":
+            backend = open_backend(config=_cfg)
+            _corpus = _cfg["database"]
+        else:
+            gp = Path(graph_path).resolve()
+            if not gp.exists():
+                print(f"error: graph file not found: {gp}", file=sys.stderr)
+                sys.exit(1)
+            if not gp.suffix == ".json":
+                print(f"error: graph file must be a .json file", file=sys.stderr)
+                sys.exit(1)
+            _enforce_graph_size_cap_or_exit(gp)
             try:
-                G = json_graph.node_link_graph(_raw, edges="links")
-            except TypeError:
-                G = json_graph.node_link_graph(_raw)
-        except Exception as exc:
-            print(f"error: could not load graph: {exc}", file=sys.stderr)
-            sys.exit(1)
+                import json as _json
+                _raw = _json.loads(gp.read_text(encoding="utf-8"))
+                if "links" not in _raw and "edges" in _raw:
+                    _raw = dict(_raw, links=_raw["edges"])
+                try:
+                    G = json_graph.node_link_graph(_raw, edges="links")
+                except TypeError:
+                    G = json_graph.node_link_graph(_raw)
+            except Exception as exc:
+                print(f"error: could not load graph: {exc}", file=sys.stderr)
+                sys.exit(1)
+            backend = JsonBackend(G)
+            _corpus = str(gp)
         import time as _time
         _t0 = _time.perf_counter()
         _mode = "dfs" if use_dfs else "bfs"
-        _result = _query_graph_text(
-            G,
-            question,
-            mode=_mode,
-            depth=2,
+        _result = render_query(
+            backend.query(question, mode=_mode, depth=2, context_filters=context_filters),
             token_budget=budget,
-            context_filters=context_filters,
         )
         querylog.log_query(
             kind="query",
             question=question,
-            corpus=str(gp),
+            corpus=_corpus,
             result=_result,
             mode=_mode,
             depth=2,
@@ -2838,9 +2840,9 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        from graphify.serve import _score_nodes
+        from graphify.query_backend import resolve_backend_config, open_backend, JsonBackend
         from networkx.readwrite import json_graph
-        import networkx as _nx
+        from graphify import querylog
 
         source_label = sys.argv[2]
         target_label = sys.argv[3]
@@ -2849,89 +2851,71 @@ def main() -> None:
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
-        gp = Path(graph_path).resolve()
-        if not gp.exists():
-            print(f"error: graph file not found: {gp}", file=sys.stderr)
-            sys.exit(1)
-        _enforce_graph_size_cap_or_exit(gp)
-        _raw = json.loads(gp.read_text(encoding="utf-8"))
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
-        # Force directed so the renderer can recover stored caller→callee direction.
-        _raw = {**_raw, "directed": True}
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
-        src_scored = _score_nodes(G, [t.lower() for t in source_label.split()])
-        tgt_scored = _score_nodes(G, [t.lower() for t in target_label.split()])
-        if not src_scored:
-            print(f"No node matching '{source_label}' found.", file=sys.stderr)
-            sys.exit(1)
-        if not tgt_scored:
-            print(f"No node matching '{target_label}' found.", file=sys.stderr)
-            sys.exit(1)
-        src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
-        # Ambiguity guard: when both queries resolve to the same node, the
-        # shortest path is trivially zero hops, which is almost never what the
-        # caller wanted (see bug #828).
-        if src_nid == tgt_nid:
-            print(
-                f"'{source_label}' and '{target_label}' both resolved to the same "
-                f"node '{src_nid}'. Use a more specific label or the exact node ID.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        for _name, _scored in (("source", src_scored), ("target", tgt_scored)):
-            if len(_scored) >= 2:
-                _top, _runner = _scored[0][0], _scored[1][0]
-                if _top > 0 and (_top - _runner) / _top < 0.10:
-                    print(
-                        f"warning: {_name} match was ambiguous "
-                        f"(top score {_top:g}, runner-up {_runner:g})",
-                        file=sys.stderr,
-                    )
-        try:
-            path_nodes = _nx.shortest_path(G.to_undirected(as_view=True), src_nid, tgt_nid)
-        except (_nx.NetworkXNoPath, _nx.NodeNotFound):
+        _cfg = resolve_backend_config(graph_path)
+        if _cfg["kind"] == "arcadedb":
+            backend = open_backend(config=_cfg)
+            _corpus = _cfg["database"]
+        else:
+            gp = Path(graph_path).resolve()
+            if not gp.exists():
+                print(f"error: graph file not found: {gp}", file=sys.stderr)
+                sys.exit(1)
+            _enforce_graph_size_cap_or_exit(gp)
+            _raw = json.loads(gp.read_text(encoding="utf-8"))
+            if "links" not in _raw and "edges" in _raw:
+                _raw = dict(_raw, links=_raw["edges"])
+            # Force directed so the renderer can recover stored caller→callee direction.
+            _raw = {**_raw, "directed": True}
+            try:
+                G = json_graph.node_link_graph(_raw, edges="links")
+            except TypeError:
+                G = json_graph.node_link_graph(_raw)
+            backend = JsonBackend(G)
+            _corpus = str(gp)
+        # CLI path is unbounded (unlike the MCP tool's max_hops default).
+        result = backend.shortest_path(source_label, target_label, max_hops=10**9)
+        if not result.found:
+            if result.reason == "no-source":
+                print(f"No node matching '{source_label}' found.", file=sys.stderr)
+                sys.exit(1)
+            if result.reason == "no-target":
+                print(f"No node matching '{target_label}' found.", file=sys.stderr)
+                sys.exit(1)
+            if result.reason == "same-node":
+                print(
+                    f"'{source_label}' and '{target_label}' both resolved to the same "
+                    f"node '{result.start_label}'. Use a more specific label or the exact node ID.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for _w in result.warnings:
+                print(_w, file=sys.stderr)
             print(f"No path found between '{source_label}' and '{target_label}'.")
             sys.exit(0)
-        hops = len(path_nodes) - 1
-        segments = []
-        from graphify.build import edge_data
-        for i in range(len(path_nodes) - 1):
-            u, v = path_nodes[i], path_nodes[i + 1]
-            # Check which direction the stored edge points.
-            if G.has_edge(u, v):
-                edata = edge_data(G, u, v)
-                forward = True
+        for _w in result.warnings:
+            print(_w, file=sys.stderr)
+        segments = [result.start_label]
+        for seg in result.segments:
+            conf_str = f" [{seg.confidence}]" if seg.confidence else ""
+            if seg.outgoing:
+                segments.append(f"--{seg.relation}{conf_str}--> {seg.label}")
             else:
-                edata = edge_data(G, v, u)
-                forward = False
-            rel = edata.get("relation", "")
-            conf = edata.get("confidence", "")
-            conf_str = f" [{conf}]" if conf else ""
-            if i == 0:
-                segments.append(G.nodes[u].get("label", u))
-            if forward:
-                segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
-            else:
-                segments.append(f"<--{rel}{conf_str}-- {G.nodes[v].get('label', v)}")
-        print(f"Shortest path ({hops} hops):\n  " + " ".join(segments))
-        from graphify import querylog
+                segments.append(f"<--{seg.relation}{conf_str}-- {seg.label}")
+        print(f"Shortest path ({result.hops} hops):\n  " + " ".join(segments))
         querylog.log_query(
             kind="path",
             question=f"{sys.argv[2]} -> {sys.argv[3]}",
-            corpus=str(gp),
-            nodes_returned=hops,
+            corpus=_corpus,
+            nodes_returned=result.hops,
         )
 
     elif cmd == "explain":
         if len(sys.argv) < 3:
             print('Usage: graphify explain "<node>" [--graph path]', file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _find_node
+        from graphify.query_backend import resolve_backend_config, open_backend, JsonBackend, render_explain
         from networkx.readwrite import json_graph
+        from graphify import querylog
 
         label = sys.argv[2]
         graph_path = _default_graph_path()
@@ -2939,57 +2923,75 @@ def main() -> None:
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
-        gp = Path(graph_path).resolve()
-        if not gp.exists():
-            print(f"error: graph file not found: {gp}", file=sys.stderr)
-            sys.exit(1)
-        _enforce_graph_size_cap_or_exit(gp)
-        _raw = json.loads(gp.read_text(encoding="utf-8"))
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
-        # Force directed so the renderer can recover stored caller→callee direction.
-        _raw = {**_raw, "directed": True}
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
-        matches = _find_node(G, label)
-        if not matches:
+        _cfg = resolve_backend_config(graph_path)
+        if _cfg["kind"] == "arcadedb":
+            backend = open_backend(config=_cfg)
+            _corpus = _cfg["database"]
+        else:
+            gp = Path(graph_path).resolve()
+            if not gp.exists():
+                print(f"error: graph file not found: {gp}", file=sys.stderr)
+                sys.exit(1)
+            _enforce_graph_size_cap_or_exit(gp)
+            _raw = json.loads(gp.read_text(encoding="utf-8"))
+            if "links" not in _raw and "edges" in _raw:
+                _raw = dict(_raw, links=_raw["edges"])
+            # Force directed so the renderer can recover stored caller→callee direction.
+            _raw = {**_raw, "directed": True}
+            try:
+                G = json_graph.node_link_graph(_raw, edges="links")
+            except TypeError:
+                G = json_graph.node_link_graph(_raw)
+            backend = JsonBackend(G)
+            _corpus = str(gp)
+        result = backend.explain(label)
+        if result is None:
             print(f"No node matching '{label}' found.")
             sys.exit(0)
-        nid = matches[0]
-        d = G.nodes[nid]
-        print(f"Node: {d.get('label', nid)}")
-        print(f"  ID:        {nid}")
-        print(
-            f"  Source:    {d.get('source_file', '')} {d.get('source_location', '')}".rstrip()
-        )
-        print(f"  Type:      {d.get('file_type', '')}")
-        print(f"  Community: {d.get('community', '')}")
-        print(f"  Degree:    {G.degree(nid)}")
-        from graphify.build import edge_data
-        connections: list[tuple[str, str, dict]] = []  # (direction, neighbor_id, edge_data)
-        for nb in G.successors(nid):
-            connections.append(("out", nb, edge_data(G, nid, nb)))
-        for nb in G.predecessors(nid):
-            connections.append(("in", nb, edge_data(G, nb, nid)))
-        if connections:
-            print(f"\nConnections ({len(connections)}):")
-            connections.sort(key=lambda c: G.degree(c[1]), reverse=True)
-            for direction, nb, edata in connections[:20]:
-                rel = edata.get("relation", "")
-                conf = edata.get("confidence", "")
-                arrow = "-->" if direction == "out" else "<--"
-                print(f"  {arrow} {G.nodes[nb].get('label', nb)} [{rel}] [{conf}]")
-            if len(connections) > 20:
-                print(f"  ... and {len(connections) - 20} more")
-        from graphify import querylog
+        print(render_explain(result, label))
         querylog.log_query(
             kind="explain",
             question=sys.argv[2],
-            corpus=str(gp),
-            nodes_returned=len(connections),
+            corpus=_corpus,
+            nodes_returned=len(result.connections),
         )
+
+    elif cmd == "arcade":
+        from graphify import arcade_server as _arc
+        sub = sys.argv[2] if len(sys.argv) > 2 else "status"
+        pw = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or "playwithdata"
+        url = os.environ.get("GRAPHIFY_ARCADE_URL", "http://127.0.0.1:2480")
+        _rest = url.split("://", 1)[-1]
+        _host, _, _port = _rest.partition(":")
+        _host = _host or "127.0.0.1"
+        _port = int(_port or 2480)
+        if sub == "status":
+            st = _arc.status(_host, _port, pw)
+            print(f"ArcadeDB: {'running' if st['ready'] else 'stopped'} | "
+                  f"installed={st['installed']} | pid={st['pid']} | {url}")
+        elif sub == "start":
+            res = _arc.start(pw, host=_host, port=_port)
+            if res.get("already_running"):
+                print(f"ArcadeDB already running at {url}")
+            else:
+                print(f"ArcadeDB starting (pid {res['pid']}, log {res['log']}) — waiting for ready...")
+                import time as _t
+                for _ in range(60):
+                    if _arc.status(_host, _port, pw)["ready"]:
+                        print(f"ArcadeDB ready at {res['url']}")
+                        break
+                    _t.sleep(1)
+                else:
+                    print("warning: ArcadeDB did not report ready within 60s; check the log.", file=sys.stderr)
+        elif sub == "stop":
+            print("ArcadeDB stopped." if _arc.stop() else "No tracked ArcadeDB server to stop.")
+        elif sub == "download":
+            print(f"Installing ArcadeDB to {_arc.arcade_home()} ...")
+            _arc.download()
+            print("ArcadeDB installed.")
+        else:
+            print("Usage: graphify arcade <start|stop|status|download>", file=sys.stderr)
+            sys.exit(2)
 
     elif cmd == "diagnose":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -3532,6 +3534,12 @@ def main() -> None:
         out_path.write_text(json.dumps(out_data, indent=2), encoding="utf-8")
         print(f"Merged {len(graphs)} graphs -> {merged.number_of_nodes()} nodes, {merged.number_of_edges()} edges")
         print(f"Written to: {out_path}")
+        print(
+            "warning: this merged graph contains repo-tagged nodes and is NOT "
+            "incrementally updatable — do not save it as a project graphify-out/graph.json "
+            "(graphify update would strip the foreign-repo nodes).",
+            file=sys.stderr,
+        )
 
     elif cmd == "clone":
         if len(sys.argv) < 3:
@@ -4502,6 +4510,35 @@ def main() -> None:
         from graphify.export import backup_if_protected as _backup
         _backup(graphify_out)
         _to_json(G, communities, str(graph_json_path), force=True)
+
+        # Sync the configured graph database (connect-only), if any. JSON is the
+        # default, so this is a no-op for existing users. Incremental updates
+        # touch only the changed/deleted files; a first/full build loads fresh.
+        from graphify.query_backend import resolve_backend_config, open_backend
+        _db_cfg = resolve_backend_config(str(graph_json_path))
+        if _db_cfg["kind"] == "arcadedb":
+            try:
+                _db = open_backend(config=_db_cfg)
+                _db.ensure_database()
+                if incremental_mode and _db.is_populated():
+                    from graphify.build import _norm_source_file
+                    _root = str(target.resolve())
+                    _changed = {
+                        _norm_source_file(str(p), _root)
+                        for p in (code_files + doc_files + paper_files + image_files)
+                    }
+                    _pruned = {_norm_source_file(str(p), _root) for p in deleted_files}
+                    _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=_pruned)
+                    print(f"[graphify db] synced ArcadeDB '{_db_cfg['database']}' "
+                          f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
+                          f"{_st['deleted_sources']} dirty sources).")
+                else:
+                    _db.ensure_database(drop=True)
+                    _st = _db.load_from_graph_json(str(graph_json_path))
+                    print(f"[graphify db] loaded ArcadeDB '{_db_cfg['database']}' "
+                          f"({_st['nodes']} nodes, {_st['edges']} edges).")
+            except Exception as exc:
+                print(f"[graphify db] warning: ArcadeDB sync failed: {exc}", file=sys.stderr)
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
                 json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"

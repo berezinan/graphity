@@ -420,6 +420,26 @@ def build_merge(
         links_key = "links" if "links" in data else "edges"
         existing_nodes = list(data.get("nodes", []))
         existing_edges = list(data.get(links_key, []))
+        # Self-heal: a per-project graph must be single-repo (untagged). Nodes
+        # carrying a `repo` attribute are leftovers from merge-graphs/global
+        # (prefix_graph_for_global) that leaked into graphify-out/graph.json. The
+        # current scan never reproduces them (extraction never sets `repo`), so
+        # they are orphans that can only block the multi-repo dedup guard (#729).
+        # Strip them (and their incident edges) loudly instead of crashing.
+        foreign_ids = {n["id"] for n in existing_nodes if n.get("repo")}
+        if foreign_ids:
+            foreign_repos = sorted({n["repo"] for n in existing_nodes if n.get("repo")})
+            existing_nodes = [n for n in existing_nodes if n["id"] not in foreign_ids]
+            existing_edges = [
+                e for e in existing_edges
+                if e.get("source") not in foreign_ids and e.get("target") not in foreign_ids
+            ]
+            print(
+                f"[graphify] stripped {len(foreign_ids)} node(s) from foreign repos "
+                f"{foreign_repos} — leftover merge-graphs/global artifacts; "
+                f"project graph must be single-repo.",
+                file=sys.stderr,
+            )
         base = [{"nodes": existing_nodes, "edges": existing_edges}]
     else:
         existing_nodes = []

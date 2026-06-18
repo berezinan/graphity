@@ -268,3 +268,17 @@ def test_prefix_guard_fires_for_extension_pairs():
         assert hi.startswith(lo) and hi != lo, (
             f"Prefix guard should fire for ({a!r}, {b!r}) but did not"
         )
+
+
+# ── cross-project guard (#729) ───────────────────────────────────────────────
+
+def test_dedup_guard_rejects_multi_repo_nodes():
+    """Safety assertion: deduplicate_entities must refuse a node set that
+    spans more than one repo. Unreachable in the normal update flow (build_merge
+    strips foreign nodes first), but guards against future regressions."""
+    nodes = [
+        {"id": "a::x", "label": "x", "repo": "a"},
+        {"id": "b::y", "label": "y", "repo": "b"},
+    ]
+    with pytest.raises(ValueError, match="multiple repos"):
+        deduplicate_entities(nodes, [], communities={})

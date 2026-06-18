@@ -8,7 +8,6 @@ from pathlib import Path
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap
-from graphify.build import edge_data
 
 try:
     import jieba as _jieba  # type: ignore[import-untyped]
@@ -109,6 +108,15 @@ _SUBSTRING_MATCH_BONUS = 1.0
 _SOURCE_MATCH_BONUS = 0.5
 
 
+def _idf_value(N: int, df: int) -> float:
+    """IDF weight from corpus size N and a term's document frequency df.
+
+    The one formula both backends use, so an in-memory and a DB-backed corpus
+    weight identical terms identically.
+    """
+    return math.log(1 + N / (1 + df))
+
+
 def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
     """IDF weights for query terms, cached in G.graph['_idf_cache'].
 
@@ -130,58 +138,68 @@ def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
                 if t in norm_label:
                     df[t] += 1
         for t in uncached:
-            cache[t] = math.log(1 + N / (1 + df[t]))
-    return {t: cache.get(t, math.log(1 + N)) for t in terms}
+            cache[t] = _idf_value(N, df[t])
+    return {t: cache.get(t, _idf_value(N, 0)) for t in terms}
+
+
+def _score_record(
+    nid: str, norm_label: str, label: str, source: str,
+    norm_terms: list[str], idf: dict[str, float], joined: str, joined_w: float,
+) -> float:
+    """Score one node against the query terms. Pure kernel shared by every
+    backend: given a node's text fields plus the precomputed idf/joined weights,
+    it returns the identical score the in-memory scan would.
+    """
+    bare_label = norm_label.rstrip("()")
+    label_tokens = " ".join(_search_tokens(label or ""))
+    src = (source or "").lower()
+    score = 0.0
+    if joined:
+        nid_lower = nid.lower()
+        if joined in (norm_label, bare_label, label_tokens, nid_lower):
+            score += _EXACT_MATCH_BONUS * 10 * joined_w
+        elif (
+            norm_label.startswith(joined)
+            or bare_label.startswith(joined)
+            or label_tokens.startswith(joined)
+        ):
+            score += _PREFIX_MATCH_BONUS * 10 * joined_w
+    for t in norm_terms:
+        w = idf.get(t, 1.0)
+        if t == norm_label or t == bare_label:
+            score += _EXACT_MATCH_BONUS * w
+        elif norm_label.startswith(t) or bare_label.startswith(t):
+            score += _PREFIX_MATCH_BONUS * w
+        elif t in norm_label:
+            score += _SUBSTRING_MATCH_BONUS * w
+        if t in src:
+            score += _SOURCE_MATCH_BONUS * w
+    return score
+
+
+def _score_terms(terms: list[str], idf: dict[str, float]) -> tuple[list[str], str, float]:
+    """Derive the (norm_terms, joined, joined_w) triple used by _score_record.
+
+    Shared so a DB backend weights the whole-query tier exactly as the in-memory
+    scan does. ``idf`` must already cover every norm_term.
+    """
+    norm_terms = [tok for t in terms for tok in _search_tokens(t)]
+    joined = " ".join(norm_terms)
+    joined_w = max((idf.get(t, 1.0) for t in norm_terms), default=1.0)
+    return norm_terms, joined, joined_w
 
 
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
-    scored = []
     norm_terms = [tok for t in terms for tok in _search_tokens(t)]
     idf = _compute_idf(G, norm_terms)
-    # Whole-query string for full-label matching (mirrors _find_node's `term`).
-    joined = " ".join(norm_terms)
-    # Weight the full-query bonus by the rarest constituent term so a specific
-    # multi-word label still outweighs common-token noise; floor at 1.0.
-    joined_w = max((idf.get(t, 1.0) for t in norm_terms), default=1.0)
+    norm_terms, joined, joined_w = _score_terms(terms, idf)
+    scored = []
     for nid, data in G.nodes(data=True):
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
-        bare_label = norm_label.rstrip("()")
-        # Tokenized form of the label (punctuation stripped, same transform as the
-        # query). norm_label may still carry punctuation like ':' or '-', which a
-        # tokenized query can never equal; comparing token-joined forms on both
-        # sides makes "uoce: dehumidifier driver" match query "uoce dehumidifier
-        # driver".
-        label_tokens = " ".join(_search_tokens(data.get("label") or ""))
-        source = (data.get("source_file") or "").lower()
-        score = 0.0
-        # Full-query tier: a multi-word query that equals (or prefixes) the whole
-        # label must dominate the per-token bag-of-words sums below, so `path`/
-        # `query` resolve the same node `explain` does (via _find_node). Without
-        # this, no single token equals a multi-word label, the per-token exact
-        # tier never fires, and every node sharing the token set ties -> arbitrary
-        # node-id sort -> wrong/disconnected endpoint -> false "No path found".
-        if joined:
-            nid_lower = nid.lower()
-            if joined in (norm_label, bare_label, label_tokens, nid_lower):
-                score += _EXACT_MATCH_BONUS * 10 * joined_w
-            elif (
-                norm_label.startswith(joined)
-                or bare_label.startswith(joined)
-                or label_tokens.startswith(joined)
-            ):
-                score += _PREFIX_MATCH_BONUS * 10 * joined_w
-        for t in norm_terms:
-            w = idf.get(t, 1.0)
-            # Three-tier precedence: exact > prefix > substring (take the
-            # strongest tier per term so a single term cannot double-count).
-            if t == norm_label or t == bare_label:
-                score += _EXACT_MATCH_BONUS * w
-            elif norm_label.startswith(t) or bare_label.startswith(t):
-                score += _PREFIX_MATCH_BONUS * w
-            elif t in norm_label:
-                score += _SUBSTRING_MATCH_BONUS * w
-            if t in source:
-                score += _SOURCE_MATCH_BONUS * w
+        score = _score_record(
+            nid, norm_label, data.get("label") or "", data.get("source_file") or "",
+            norm_terms, idf, joined, joined_w,
+        )
         if score > 0:
             scored.append((score, nid))
     # Sort by score desc; break ties toward the shorter label so a concise exact
@@ -312,16 +330,20 @@ def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> 
     return H
 
 
-def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
-    # Compute hub threshold: nodes above this degree are not expanded as transit.
-    # p99 of degree distribution, floored at 50 to avoid over-blocking small graphs.
-    degrees = [G.degree(n) for n in G.nodes()]
+def _hub_threshold(degrees: list[int]) -> int:
+    """Hub-degree cutoff: p99 of the degree distribution, floored at 50 so small
+    graphs don't over-block. Nodes at or above it are not expanded as transit."""
     if degrees:
         degrees_sorted = sorted(degrees)
         p99_idx = int(len(degrees_sorted) * 0.99)
-        hub_threshold = max(50, degrees_sorted[p99_idx])
-    else:
-        hub_threshold = 50
+        return max(50, degrees_sorted[p99_idx])
+    return 50
+
+
+def _bfs_core(neighbors, degree, start_nodes, depth, hub_threshold):
+    """Hub-aware breadth-first frontier expansion. Pure kernel: ``neighbors(n)``
+    yields adjacency and ``degree(n)`` gives the global degree for the hub guard,
+    so the in-memory graph and a DB-fetched neighborhood traverse identically."""
     seed_set = set(start_nodes)
     visited: set[str] = set(start_nodes)
     frontier = set(start_nodes)
@@ -331,9 +353,9 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
         for n in frontier:
             # Don't expand through high-degree hubs (except seeds - a hub that
             # is the starting node should still be explored).
-            if n not in seed_set and G.degree(n) >= hub_threshold:
+            if n not in seed_set and degree(n) >= hub_threshold:
                 continue
-            for neighbor in G.neighbors(n):
+            for neighbor in neighbors(n):
                 if neighbor not in visited:
                     next_frontier.add(neighbor)
                     edges_seen.append((n, neighbor))
@@ -342,14 +364,7 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
-def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
-    degrees = [G.degree(n) for n in G.nodes()]
-    if degrees:
-        degrees_sorted = sorted(degrees)
-        p99_idx = int(len(degrees_sorted) * 0.99)
-        hub_threshold = max(50, degrees_sorted[p99_idx])
-    else:
-        hub_threshold = 50
+def _dfs_core(neighbors, degree, start_nodes, depth, hub_threshold):
     seed_set = set(start_nodes)
     visited: set[str] = set()
     edges_seen: list[tuple] = []
@@ -359,13 +374,23 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
         if node in visited or d > depth:
             continue
         visited.add(node)
-        if node not in seed_set and G.degree(node) >= hub_threshold:
+        if node not in seed_set and degree(node) >= hub_threshold:
             continue
-        for neighbor in G.neighbors(node):
+        for neighbor in neighbors(node):
             if neighbor not in visited:
                 stack.append((neighbor, d + 1))
                 edges_seen.append((node, neighbor))
     return visited, edges_seen
+
+
+def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
+    threshold = _hub_threshold([G.degree(n) for n in G.nodes()])
+    return _bfs_core(G.neighbors, G.degree, start_nodes, depth, threshold)
+
+
+def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
+    threshold = _hub_threshold([G.degree(n) for n in G.nodes()])
+    return _dfs_core(G.neighbors, G.degree, start_nodes, depth, threshold)
 
 
 def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
@@ -521,8 +546,26 @@ def _build_server(graph_path: str):
     except ImportError as e:
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
 
-    G = _load_graph(graph_path)
-    communities = _communities_from_graph(G)
+    # Lazy import avoids a circular import (query_backend imports serve helpers
+    # that are defined further down this module).
+    from graphify.query_backend import (
+        JsonBackend, render_query, render_node, render_neighbors,
+        render_community, render_god_nodes, render_stats, render_path,
+        resolve_backend_config, open_backend,
+    )
+
+    # Backend selection: JSON (default) loads the graph into memory and supports
+    # the G-dependent resources + hot-reload; ArcadeDB connects to the running
+    # server and leaves G unset (those resources degrade gracefully below).
+    _cfg = resolve_backend_config(graph_path)
+    if _cfg["kind"] == "arcadedb":
+        backend = open_backend(config=_cfg)
+        G = None
+        communities = {}
+    else:
+        G = _load_graph(graph_path)
+        communities = _communities_from_graph(G)
+        backend = JsonBackend(G, communities)
 
     # Hot-reload state: mtime+size key lets us detect graph.json changes without
     # polling. Initialised from the file stat at startup so the first tool call
@@ -535,7 +578,9 @@ def _build_server(graph_path: str):
         _reload_state = {"mtime_ns": 0, "size": -1}
 
     def _maybe_reload() -> None:
-        nonlocal G, communities
+        nonlocal G, communities, backend
+        if G is None:
+            return  # ArcadeDB backend: updated out-of-band, no file to hot-reload
         try:
             s = Path(graph_path).stat()
             key = (s.st_mtime_ns, s.st_size)
@@ -557,6 +602,7 @@ def _build_server(graph_path: str):
                 return  # keep serving stale graph on transient read error
             G = new_G
             communities = _communities_from_graph(new_G)
+            backend = JsonBackend(G, communities)
             _reload_state["mtime_ns"], _reload_state["size"] = key
 
     server = Server("graphify")
@@ -694,13 +740,9 @@ def _build_server(graph_path: str):
         budget = int(arguments.get("token_budget", 2000))
         context_filter = arguments.get("context_filter")
         _t0 = _time.perf_counter()
-        result = _query_graph_text(
-            G,
-            question,
-            mode=mode,
-            depth=depth,
+        result = render_query(
+            backend.query(question, mode=mode, depth=depth, context_filters=context_filter),
             token_budget=budget,
-            context_filters=context_filter,
         )
         querylog.log_query(
             kind="mcp_query",
@@ -715,138 +757,28 @@ def _build_server(graph_path: str):
         return result
 
     def _tool_get_node(arguments: dict) -> str:
-        label = arguments["label"].lower()
-        matches = [(nid, d) for nid, d in G.nodes(data=True)
-                   if label in (d.get("label") or "").lower() or label == nid.lower()]
-        if not matches:
-            return f"No node matching '{label}' found."
-        nid, d = matches[0]
-        # Sanitise every LLM-derived field before concatenation (F-010).
-        return "\n".join([
-            f"Node: {sanitize_label(d.get('label', nid))}",
-            f"  ID: {sanitize_label(nid)}",
-            f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
-            f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
-            f"  Community: {sanitize_label(str(d.get('community', '')))}",
-            f"  Degree: {G.degree(nid)}",
-        ])
+        label = arguments["label"]
+        return render_node(backend.get_node(label), label.lower())
 
     def _tool_get_neighbors(arguments: dict) -> str:
-        label = arguments["label"].lower()
-        rel_filter = arguments.get("relation_filter", "").lower()
-        matches = _find_node(G, label)
-        if not matches:
-            return f"No node matching '{label}' found."
-        nid = matches[0]
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
-        for nb in G.successors(nid):
-            d = edge_data(G, nid, nb)
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-            )
-        for nb in G.predecessors(nid):
-            d = edge_data(G, nb, nid)
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-            )
-        return "\n".join(lines)
+        label = arguments["label"]
+        rel_filter = arguments.get("relation_filter", "")
+        return render_neighbors(backend.get_neighbors(label, rel_filter), label.lower())
 
     def _tool_get_community(arguments: dict) -> str:
         cid = int(arguments["community_id"])
-        nodes = communities.get(cid, [])
-        if not nodes:
-            return f"Community {cid} not found."
-        lines = [f"Community {cid} ({len(nodes)} nodes):"]
-        for n in nodes:
-            d = G.nodes[n]
-            # Sanitise label and source_file (F-010).
-            lines.append(
-                f"  {sanitize_label(d.get('label', n))} "
-                f"[{sanitize_label(str(d.get('source_file', '')))}]"
-            )
-        return "\n".join(lines)
+        return render_community(backend.get_community(cid), cid)
 
     def _tool_god_nodes(arguments: dict) -> str:
-        from graphify.analyze import god_nodes as _god_nodes
-        nodes = _god_nodes(G, top_n=int(arguments.get("top_n", 10)))
-        lines = ["God nodes (most connected):"]
-        lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
-        return "\n".join(lines)
+        return render_god_nodes(backend.god_nodes(top_n=int(arguments.get("top_n", 10))))
 
     def _tool_graph_stats(_: dict) -> str:
-        confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
-        total = len(confs) or 1
-        return (
-            f"Nodes: {G.number_of_nodes()}\n"
-            f"Edges: {G.number_of_edges()}\n"
-            f"Communities: {len(communities)}\n"
-            f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
-            f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
-            f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
-        )
+        return render_stats(backend.graph_stats())
 
     def _tool_shortest_path(arguments: dict) -> str:
-        src_scored = _score_nodes(G, [t.lower() for t in arguments["source"].split()])
-        tgt_scored = _score_nodes(G, [t.lower() for t in arguments["target"].split()])
-        if not src_scored:
-            return f"No node matching source '{arguments['source']}' found."
-        if not tgt_scored:
-            return f"No node matching target '{arguments['target']}' found."
-        src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
-        # Ambiguity guard: when both queries resolve to the same node, the
-        # shortest path is trivially zero hops, which is almost never what the
-        # caller wanted (see bug #828).
-        if src_nid == tgt_nid:
-            return (
-                f"'{arguments['source']}' and '{arguments['target']}' both resolved to "
-                f"the same node '{src_nid}'. Use a more specific label or the exact node ID."
-            )
-        warnings: list[str] = []
-        for name, scored in (("source", src_scored), ("target", tgt_scored)):
-            if len(scored) >= 2:
-                top, runner = scored[0][0], scored[1][0]
-                if top > 0 and (top - runner) / top < 0.10:
-                    warnings.append(
-                        f"warning: {name} match was ambiguous "
-                        f"(top score {top:g}, runner-up {runner:g})"
-                    )
         max_hops = int(arguments.get("max_hops", 8))
-        try:
-            # Use undirected view for path-finding (works regardless of query src/tgt order)
-            path_nodes = nx.shortest_path(G.to_undirected(as_view=True), src_nid, tgt_nid)
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return f"No path found between '{G.nodes[src_nid].get('label', src_nid)}' and '{G.nodes[tgt_nid].get('label', tgt_nid)}'."
-        hops = len(path_nodes) - 1
-        if hops > max_hops:
-            return f"Path exceeds max_hops={max_hops} ({hops} hops found)."
-        segments = []
-        for i in range(len(path_nodes) - 1):
-            u, v = path_nodes[i], path_nodes[i + 1]
-            if G.has_edge(u, v):
-                edata = edge_data(G, u, v)
-                forward = True
-            else:
-                edata = edge_data(G, v, u)
-                forward = False
-            rel = edata.get("relation", "")
-            conf = edata.get("confidence", "")
-            conf_str = f" [{conf}]" if conf else ""
-            if i == 0:
-                segments.append(G.nodes[u].get("label", u))
-            if forward:
-                segments.append(f"--{rel}{conf_str}--> {G.nodes[v].get('label', v)}")
-            else:
-                segments.append(f"<--{rel}{conf_str}-- {G.nodes[v].get('label', v)}")
-        prefix = ("\n".join(warnings) + "\n") if warnings else ""
-        return prefix + f"Shortest path ({hops} hops):\n  " + " ".join(segments)
+        result = backend.shortest_path(arguments["source"], arguments["target"], max_hops=max_hops)
+        return render_path(result, arguments["source"], arguments["target"], max_hops)
 
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
@@ -862,7 +794,7 @@ def _build_server(graph_path: str):
         return format_prs_text(prs, base)
 
     def _tool_get_pr_impact(arguments: dict) -> str:
-        from graphify.prs import fetch_pr_files, compute_pr_impact, _gh, _parse_ci
+        from graphify.prs import fetch_pr_files, _gh, _parse_ci
         number = int(arguments["pr_number"])
         repo = arguments.get("repo") or None
         # Use gh pr view directly — works for any base branch, not just the default
@@ -876,7 +808,7 @@ def _build_server(graph_path: str):
         files = fetch_pr_files(number, repo)
         if not files:
             return f"PR #{number}: no changed files found (may require gh auth)."
-        comms, nodes = compute_pr_impact(files, G)
+        comms, nodes = backend.pr_impact(files)
         ci = _parse_ci(pr_data.get("statusCheckRollup") or [])
         lines = [
             f"PR #{number}: {pr_data['title']}",
@@ -893,7 +825,7 @@ def _build_server(graph_path: str):
 
     def _tool_triage_prs(arguments: dict) -> str:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from graphify.prs import fetch_prs, fetch_worktrees, fetch_pr_files, compute_pr_impact, _STATUS_ORDER, _detect_default_branch
+        from graphify.prs import fetch_prs, fetch_worktrees, fetch_pr_files, _STATUS_ORDER, _detect_default_branch
         repo = arguments.get("repo") or None
         base = arguments.get("base") or _detect_default_branch(repo)
         try:
@@ -918,7 +850,7 @@ def _build_server(graph_path: str):
                     files = []
                 if files:
                     pr.files_changed = files
-                    pr.communities_touched, pr.nodes_affected = compute_pr_impact(files, G)
+                    pr.communities_touched, pr.nodes_affected = backend.pr_impact(files)
         header = (
             f"Actionable PRs targeting {base}: {len(actionable)}\n"
             "Rank these by review priority. Higher blast_radius = more graph communities affected = higher merge risk.\n"
@@ -980,6 +912,8 @@ def _build_server(graph_path: str):
         if uri_str == "graphify://god-nodes":
             return _tool_god_nodes({"top_n": 10})
         if uri_str == "graphify://surprises":
+            if G is None:
+                return "Surprising connections are not available on the ArcadeDB backend yet."
             try:
                 from graphify.analyze import surprising_connections
                 surprises = surprising_connections(G, communities, top_n=10)
@@ -992,6 +926,8 @@ def _build_server(graph_path: str):
             except Exception as exc:
                 return f"Could not compute surprising connections: {exc}"
         if uri_str == "graphify://audit":
+            if G is None:
+                return "Confidence audit is not available on the ArcadeDB backend yet."
             confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
             total = len(confs) or 1
             return (
@@ -1001,6 +937,8 @@ def _build_server(graph_path: str):
                 f"AMBIGUOUS: {confs.count('AMBIGUOUS')} ({round(confs.count('AMBIGUOUS')/total*100)}%)\n"
             )
         if uri_str == "graphify://questions":
+            if G is None:
+                return "Suggested questions are not available on the ArcadeDB backend yet."
             try:
                 from graphify.analyze import suggest_questions
                 community_labels = _load_community_labels()

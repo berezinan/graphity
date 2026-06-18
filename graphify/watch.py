@@ -765,6 +765,27 @@ def _rebuild_code(
             if callflow_files:
                 products += f", {len(callflow_files)} callflow HTML"
             print(f"[graphify watch] {products} updated in {out}")
+            # Sync the configured graph database (connect-only). No-op unless
+            # GRAPHIFY_BACKEND=arcadedb; a failure never fails the rebuild.
+            try:
+                from graphify.query_backend import resolve_backend_config, open_backend
+                _cfg = resolve_backend_config(str(out / "graph.json"))
+                if _cfg["kind"] == "arcadedb":
+                    _db = open_backend(config=_cfg)
+                    _db.ensure_database()
+                    if changed_paths is not None and _db.is_populated():
+                        _changed = {_nsf(str(p), str(project_root)) for p in extract_targets}
+                        _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=set(deleted_paths))
+                        print(f"[graphify db] synced ArcadeDB '{_cfg['database']}' "
+                              f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
+                              f"{_st['deleted_sources']} dirty sources).")
+                    else:
+                        _db.ensure_database(drop=True)
+                        _st = _db.load_from_graph_json(str(out / "graph.json"))
+                        print(f"[graphify db] loaded ArcadeDB '{_cfg['database']}' "
+                              f"({_st['nodes']} nodes, {_st['edges']} edges).")
+            except Exception as _db_exc:
+                print(f"[graphify db] warning: ArcadeDB sync skipped: {_db_exc}")
         return True
 
     except Exception as exc:

@@ -74,6 +74,31 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def _sync_global_db() -> None:
+    """Reload the global ArcadeDB database from global-graph.json.
+
+    No-op unless ``GRAPHIFY_BACKEND=arcadedb`` (so the default JSON model is
+    untouched). The global graph is a single dedup'd merge that ``global_add``
+    rewrites whole, so a full reload matches its semantics; it targets a separate
+    database (``GRAPHIFY_ARCADE_GLOBAL_DB``, default ``graphify_global``). Never
+    raises — a DB hiccup must not break the global merge.
+    """
+    import os
+    if os.environ.get("GRAPHIFY_BACKEND", "").strip().lower() not in ("arcadedb", "arcade"):
+        return
+    try:
+        from graphify.query_backend import resolve_backend_config, open_backend
+        cfg = resolve_backend_config(None)
+        cfg["database"] = os.environ.get("GRAPHIFY_ARCADE_GLOBAL_DB", "graphify_global")
+        be = open_backend(config=cfg)
+        be.ensure_database(drop=True)
+        st = be.load_from_graph_json(str(_GLOBAL_GRAPH))
+        print(f"[graphify global] synced ArcadeDB '{cfg['database']}' "
+              f"({st['nodes']} nodes, {st['edges']} edges).")
+    except Exception as exc:
+        print(f"[graphify global] warning: ArcadeDB global sync failed: {exc}", file=sys.stderr)
+
+
 def global_add(source_path: Path, repo_tag: str) -> dict:
     """Add or update a project graph in the global graph.
 
@@ -143,6 +168,7 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
 
     added = prefixed.number_of_nodes() - len(remap)
     _save_global_graph(G)
+    _sync_global_db()
 
     manifest["repos"][repo_tag] = {
         "added_at": datetime.now(timezone.utc).isoformat(),
@@ -167,6 +193,7 @@ def global_remove(repo_tag: str) -> int:
     G = _load_global_graph()
     removed = prune_repo_from_graph(G, repo_tag)
     _save_global_graph(G)
+    _sync_global_db()
 
     del manifest["repos"][repo_tag]
     _save_manifest(manifest)

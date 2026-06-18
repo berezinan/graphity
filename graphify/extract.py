@@ -6655,6 +6655,21 @@ def _edt_child_text(elem, localname: str) -> str | None:
     return None
 
 
+def _edt_subsystem_chain(path: Path) -> list[str]:
+    """Parent->child names of the subsystem `path` describes, from its location.
+
+    A subsystem nests on disk as `.../Subsystems/<S1>/Subsystems/<S2>/.../<Sn>.mdo`
+    (skill: edt-structures §4.8 — nested subsystems are real folders, registered in
+    the parent by bare name). Each folder name immediately after a `Subsystems`
+    segment is one chain link. Two subsystems sharing a bare name under different
+    parents thus get distinct ids (`Subsystem.A.Настройки` vs `Subsystem.B.Настройки`),
+    while a top-level subsystem keeps its single-part id unchanged.
+    """
+    parts = path.parts
+    return [parts[i + 1] for i, seg in enumerate(parts[:-1])
+            if seg == "Subsystems" and i + 1 < len(parts)]
+
+
 def extract_edt_mdo(path: Path) -> dict:
     """Extract a 1C:EDT metadata object (or the configuration root) from a .mdo file.
 
@@ -6686,11 +6701,19 @@ def extract_edt_mdo(path: Path) -> dict:
     seen_ids: set[str] = set()
     seen_edges: set[tuple[str, str, str]] = set()
 
-    def add_node(nid: str, label: str, file_type: str = "code") -> None:
+    def add_node(nid: str, label: str, file_type: str = "code",
+                 uuid: str | None = None) -> None:
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({"id": nid, "label": label, "file_type": file_type,
-                          "source_file": str_path, "source_location": "L1"})
+            node = {"id": nid, "label": label, "file_type": file_type,
+                    "source_file": str_path, "source_location": "L1"}
+            # EDT object/child uuid (skill: edt-structures §3). Stored as an
+            # attribute only — the node id stays name-based so code↔metadata
+            # nodes still merge by FQN. The uuid disambiguates genuine name
+            # collisions and anchors uuid-keyed lookups downstream.
+            if uuid:
+                node["uuid"] = uuid
+            nodes.append(node)
 
     def add_edge(src_id: str, tgt_id: str, relation: str) -> None:
         key = (src_id, tgt_id, relation)
@@ -6712,7 +6735,8 @@ def extract_edt_mdo(path: Path) -> dict:
     # ── Configuration root: register every contained child object ──────────────
     if kind == "Configuration":
         conf_id = _make_id("Configuration")
-        add_node(conf_id, child_text(root, "name") or "Configuration", "concept")
+        add_node(conf_id, child_text(root, "name") or "Configuration", "concept",
+                 uuid=root.get("uuid"))
         for child in root:
             text = (child.text or "").strip()
             m = _EDT_FQN_RE.match(text)
@@ -6729,7 +6753,16 @@ def extract_edt_mdo(path: Path) -> dict:
         return {"nodes": nodes, "edges": edges}
 
     obj_id = _make_id(kind, name)
-    add_node(obj_id, f"{kind}.{name}")
+    obj_label = f"{kind}.{name}"
+    sub_chain: list[str] = []
+    if kind == "Subsystem":
+        sub_chain = _edt_subsystem_chain(path)
+        # Only nested subsystems (chain length > 1) change id; top-level keeps the
+        # bare `Subsystem.Name` id so existing references/merge are untouched.
+        if len(sub_chain) > 1 and sub_chain[-1] == name:
+            obj_id = _make_id(kind, *sub_chain)
+            obj_label = f"{kind}." + ".".join(sub_chain)
+    add_node(obj_id, obj_label, uuid=root.get("uuid"))
 
     # Child artifacts: attributes / tabular sections / enum values / forms / commands.
     _CHILD_KINDS = {
@@ -6744,7 +6777,7 @@ def extract_edt_mdo(path: Path) -> dict:
         if not child_name:
             continue
         child_id = _make_id(kind, name, sub, child_name)
-        add_node(child_id, child_name)
+        add_node(child_id, child_name, uuid=child.get("uuid"))
         add_edge(obj_id, child_id, "contains")
         # A form/command owns a BSL module folder next to the .mdo.
         if sub == "Form":
@@ -6756,18 +6789,27 @@ def extract_edt_mdo(path: Path) -> dict:
         if mod is not None and mod.is_file():
             add_edge(child_id, _make_id(str(mod)), "defines")
 
-    # A subsystem registers the objects it groups via <content>Kind.Name</content>.
+    # A subsystem registers the objects it groups via <content>Kind.Name</content>,
+    # and its child subsystems via <subsystems>BareName</subsystems> (skill §4.8).
     if kind == "Subsystem":
+        base_chain = sub_chain or [name]
         for child in root:
-            if _edt_localname(child.tag) != "content":
-                continue
+            ln = _edt_localname(child.tag)
             text = (child.text or "").strip()
-            m = _EDT_FQN_RE.match(text)
-            if not m or m.group(1) not in _EDT_KIND_PREFIXES:
-                continue
-            member_id = _make_id(m.group(1), m.group(2))
-            add_node(member_id, text)
-            add_edge(obj_id, member_id, "contains")
+            if ln == "content":
+                m = _EDT_FQN_RE.match(text)
+                if not m or m.group(1) not in _EDT_KIND_PREFIXES:
+                    continue
+                member_id = _make_id(m.group(1), m.group(2))
+                add_node(member_id, text)
+                add_edge(obj_id, member_id, "contains")
+            elif ln == "subsystems" and text:
+                # Child registered by bare name; its id is the full parent chain +
+                # child, matching what the child's own .mdo emits, so they merge.
+                child_chain = base_chain + [text]
+                child_sid = _make_id("Subsystem", *child_chain)
+                add_node(child_sid, "Subsystem." + ".".join(child_chain))
+                add_edge(obj_id, child_sid, "contains")
 
     # Object-level modules sitting beside the .mdo.
     for mod_name in _EDT_OBJECT_MODULES:
@@ -6873,6 +6915,47 @@ def _edt_form_owner_id(path: Path) -> str | None:
     return None
 
 
+def _edt_owner_dir(path: Path) -> Path | None:
+    """Folder of the metadata object that owns the artifact at `path`.
+
+    Returns the first `.../<KindPlural>/<Owner>` (or common-folder) directory on
+    the way down, e.g. `.../Catalogs/Контрагенты` for a form, or
+    `.../Reports/X` for a DCS template.
+    """
+    parts = path.parts
+    for i, seg in enumerate(parts[:-1]):
+        if seg in _EDT_PLURAL_TO_KIND or seg in _EDT_COMMON_FOLDER_TO_KIND:
+            return Path(*parts[:i + 2])
+    return None
+
+
+def _edt_parent_uuid(path: Path, form_name: str | None = None) -> str | None:
+    """Best-effort uuid of the artifact's parent object, read from the owner .mdo.
+
+    Form attributes and DCS fields carry no uuid of their own (skill: edt-structures
+    §3, §5 — Form.form has no uuid). Per the agreed design, such children inherit
+    the parent's uuid: for a form, the `<forms uuid>` matching `form_name` (the
+    form's identity, which the Form.form file itself lacks); otherwise the owner
+    object's root uuid. Returns None if the .mdo can't be located/parsed — the node
+    id already encodes the parent path, so this uuid is provenance, not identity.
+    """
+    owner_dir = _edt_owner_dir(path)
+    if owner_dir is None:
+        return None
+    mdo = owner_dir / f"{owner_dir.name}.mdo"
+    if not mdo.is_file():
+        return None
+    root, err = _edt_parse_xml(mdo)
+    if err is not None:
+        return None
+    if form_name is not None:
+        for c in root:
+            if _edt_localname(c.tag) == "forms" and _edt_child_text(c, "name") == form_name:
+                return c.get("uuid")
+        return None
+    return root.get("uuid")
+
+
 def extract_edt_form(path: Path) -> dict:
     """Extract data references from a 1C:EDT managed form (Form.form).
 
@@ -6890,11 +6973,38 @@ def extract_edt_form(path: Path) -> dict:
         return {"nodes": [], "edges": []}
 
     str_path = str(path)
-    nodes: list[dict] = [{"id": form_id, "label": path.parent.name,
-                          "file_type": "code", "source_file": str_path,
-                          "source_location": "L1"}]
+    form_name = path.parent.name
+    form_uuid = _edt_parent_uuid(path, form_name=form_name)
+    anchor = {"id": form_id, "label": form_name, "file_type": "code",
+              "source_file": str_path, "source_location": "L1"}
+    if form_uuid:
+        anchor["uuid"] = form_uuid
+    nodes: list[dict] = [anchor]
     edges: list[dict] = []
     seen_targets: set[str] = set()
+
+    # Form attributes (реквизиты формы) become their own nodes. They carry no
+    # uuid of their own, so the id is the form path + attribute name (unique per
+    # form) and the form's uuid is recorded as parent_uuid.
+    seen_attrs: set[str] = set()
+    for elem in root:
+        if _edt_localname(elem.tag) != "attributes":
+            continue
+        attr_name = _edt_child_text(elem, "name")
+        if not attr_name:
+            continue
+        attr_id = _make_id(form_id, "FormAttribute", attr_name)
+        if attr_id == form_id or attr_id in seen_attrs:
+            continue
+        seen_attrs.add(attr_id)
+        node = {"id": attr_id, "label": attr_name, "file_type": "code",
+                "source_file": str_path, "source_location": "L1"}
+        if form_uuid:
+            node["parent_uuid"] = form_uuid
+        nodes.append(node)
+        edges.append({"source": form_id, "target": attr_id, "relation": "contains",
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "weight": 1.0})
 
     def add_ref(kind: str, name: str) -> None:
         tgt = _make_id(kind, name)
@@ -6984,6 +7094,30 @@ def extract_edt_dcs(path: Path) -> dict:
                           "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
     seen_targets: set[str] = set()
+
+    # DCS fields (`<field><dataPath>…`) become their own nodes. Like form
+    # attributes they have no uuid; id is owner path + dataPath, with the owner
+    # object's uuid recorded as parent_uuid.
+    owner_uuid = _edt_parent_uuid(path)
+    seen_fields: set[str] = set()
+    for elem in root.iter():
+        if _edt_localname(elem.tag) != "field":
+            continue
+        data_path = _edt_child_text(elem, "dataPath")
+        if not data_path:
+            continue
+        field_id = _make_id(owner_id, "DcsField", data_path)
+        if field_id == owner_id or field_id in seen_fields:
+            continue
+        seen_fields.add(field_id)
+        node = {"id": field_id, "label": data_path, "file_type": "code",
+                "source_file": str_path, "source_location": "L1"}
+        if owner_uuid:
+            node["parent_uuid"] = owner_uuid
+        nodes.append(node)
+        edges.append({"source": owner_id, "target": field_id, "relation": "contains",
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "weight": 1.0})
 
     for elem in root.iter():
         if _edt_localname(elem.tag) != "query" or not elem.text:

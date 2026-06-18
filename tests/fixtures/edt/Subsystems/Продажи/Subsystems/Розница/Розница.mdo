@@ -1,13 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mdclass:Subsystem xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
-                   uuid="50505050-5050-4505-8505-505050505050">
-  <name>Продажи</name>
+                   uuid="51515151-5151-4515-8515-515151515151">
+  <name>Розница</name>
   <synonym>
     <key>ru</key>
-    <value>Продажи</value>
+    <value>Розница</value>
   </synonym>
   <content>Catalog.Контрагенты</content>
-  <content>Enum.СтатусДоговора</content>
-  <subsystems>Розница</subsystems>
   <includeInCommandInterface>true</includeInCommandInterface>
 </mdclass:Subsystem>

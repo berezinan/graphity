@@ -10,7 +10,7 @@ from graphify.extract import (
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_verilog,
     extract_bsl, extract_edt_mdo, extract_edt_rights, extract_edt_form,
-    extract_edt_dcs,
+    extract_edt_dcs, _make_id,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1777,6 +1777,23 @@ def test_edt_mdo_form_defines_its_module():
                for e in r["edges"])
 
 
+def test_edt_mdo_captures_uuid():
+    # Object and child uuids land as node attributes (id stays name-based).
+    r = extract_edt_mdo(CATALOG_MDO)
+    obj = _node_by_label(r, "Catalog.Контрагенты")
+    assert obj["uuid"] == "11111111-1111-4111-8111-111111111111"
+    attr = _node_by_label(r, "ИНН")
+    assert attr["uuid"] == "66666666-6666-4666-8666-666666666666"
+    # The id is unchanged by uuid capture, so code↔metadata merge still holds.
+    assert "uuid" not in obj["id"]
+
+
+def test_edt_configuration_captures_uuid():
+    r = extract_edt_mdo(CONFIG_MDO)
+    conf = _node_by_label(r, "ТестоваяКонфигурация")
+    assert conf.get("uuid")
+
+
 def test_edt_mdo_enum_values():
     r = extract_edt_mdo(ENUM_MDO)
     labels = _labels(r)
@@ -1827,6 +1844,38 @@ def test_edt_subsystem_contains_content():
     assert ("Subsystem.Продажи", "Enum.СтатусДоговора") in contains
 
 
+NESTED_SUBSYSTEM_MDO = (EDT / "Subsystems" / "Продажи" / "Subsystems" / "Розница"
+                        / "Розница.mdo")
+
+
+def test_edt_nested_subsystem_id_includes_parent_chain():
+    # A nested subsystem is identified by its full parent chain, so a same-named
+    # subsystem under a different parent would NOT collide onto it.
+    r = extract_edt_mdo(NESTED_SUBSYSTEM_MDO)
+    node = _node_by_label(r, "Subsystem.Продажи.Розница")
+    assert node is not None
+    assert node["id"] != _make_id("Subsystem", "Розница")   # not the bare id
+    assert node["id"] == _make_id("Subsystem", "Продажи", "Розница")
+
+
+def test_edt_parent_registers_nested_subsystem():
+    # Parent's <subsystems>Розница</subsystems> -> contains edge whose target id
+    # matches the nested subsystem's own .mdo node (they merge at build time).
+    rp = extract_edt_mdo(SUBSYSTEM_MDO)
+    contains = _edge_labels(rp, "contains")
+    assert ("Subsystem.Продажи", "Subsystem.Продажи.Розница") in contains
+    parent_child_id = _node_by_label(rp, "Subsystem.Продажи.Розница")["id"]
+    nested_self_id = _node_by_label(extract_edt_mdo(NESTED_SUBSYSTEM_MDO),
+                                    "Subsystem.Продажи.Розница")["id"]
+    assert parent_child_id == nested_self_id
+
+
+def test_edt_top_level_subsystem_id_unchanged():
+    # Top-level subsystem keeps its bare id, so existing references/merge hold.
+    r = extract_edt_mdo(SUBSYSTEM_MDO)
+    assert _node_by_label(r, "Subsystem.Продажи")["id"] == _make_id("Subsystem", "Продажи")
+
+
 def test_edt_rights_secures_granted_object():
     r = extract_edt_rights(RIGHTS)
     assert "error" not in r
@@ -1861,6 +1910,21 @@ def test_edt_form_anchor_matches_mdo_form_child_id():
     assert anchor in mdo_form_ids
 
 
+def test_edt_form_attributes_are_nodes():
+    # Form attributes become their own nodes, contained by the form, with a
+    # path-based id and the form's uuid as parent_uuid (they have no own uuid).
+    r = extract_edt_form(FORM)
+    labels = _labels(r)
+    assert "Объект" in labels
+    assert "СписокДоговоров" in labels
+    contains = _edge_labels(r, "contains")
+    assert ("ФормаЭлемента", "Объект") in contains
+    attr = _node_by_label(r, "Объект")
+    assert attr["parent_uuid"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert attr["id"] != _make_id("Объект")          # not a bare id
+    assert r["nodes"][0]["uuid"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"  # form anchor
+
+
 def test_edt_form_handler_links_to_bsl_procedure():
     # <handlers><name>ПриСозданииНаСервере</name> -> the procedure node that
     # extract_bsl emits for the sibling Module.bsl (same id, so it merges).
@@ -1883,6 +1947,17 @@ def test_edt_dcs_references_query_tables():
     # Owner report -> the FROM-clause source tables (RU singular prefixes).
     assert ("Report.ВзаиморасчетыОтчет", "Catalog.Контрагенты") in refs
     assert ("Report.ВзаиморасчетыОтчет", "Document.Договор") in refs
+
+
+def test_edt_dcs_fields_are_nodes():
+    # DCS fields become their own nodes, contained by the owner, with a path-based
+    # id and the owner object's uuid as parent_uuid.
+    r = extract_edt_dcs(DCS)
+    assert "ИНН" in _labels(r)
+    contains = _edge_labels(r, "contains")
+    assert ("Report.ВзаиморасчетыОтчет", "ИНН") in contains
+    field = _node_by_label(r, "ИНН")
+    assert field["parent_uuid"] == "70707070-7070-4707-8707-707070707070"
 
 
 def test_edt_dcs_ignores_field_aliases():

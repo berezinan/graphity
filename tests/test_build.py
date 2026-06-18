@@ -518,3 +518,62 @@ def test_build_merge_rejects_oversized_existing_graph(monkeypatch, tmp_path):
     monkeypatch.setattr("graphify.security._MAX_GRAPH_FILE_BYTES", 8)
     with pytest.raises(ValueError, match="exceeds"):
         build_merge([], graph_path, dedup=False)
+
+
+def test_build_merge_strips_foreign_repo_nodes(tmp_path, capsys):
+    """Self-heal: a per-project graph.json polluted with repo-tagged nodes
+    (merge-graphs/global leftovers) must not crash build_merge's multi-repo
+    dedup guard. The foreign nodes and their incident edges are stripped
+    loudly; untagged nodes from the current scan are preserved."""
+    graph_path = tmp_path / "graph.json"
+    existing = {
+        "nodes": [
+            {"id": "n1", "label": "login", "file_type": "code", "source_file": "a.py"},
+            {"id": "graphify::g1", "label": "build", "file_type": "code",
+             "repo": "graphify", "local_id": "g1", "source_file": "build.py"},
+            {"id": "tree-sitter-bsl::t1", "label": "grammar", "file_type": "concept",
+             "repo": "tree-sitter-bsl", "local_id": "t1"},
+        ],
+        "links": [
+            {"source": "graphify::g1", "target": "tree-sitter-bsl::t1",
+             "relation": "references", "confidence": "EXTRACTED"},
+            {"source": "graphify::g1", "target": "n1",
+             "relation": "calls", "confidence": "EXTRACTED"},
+        ],
+    }
+    graph_path.write_text(json.dumps(existing), encoding="utf-8")
+
+    new_chunk = {"nodes": [
+        {"id": "n2", "label": "logout", "file_type": "code", "source_file": "a.py"},
+    ], "edges": []}
+
+    # dedup=True is what triggered the original ValueError("span multiple repos")
+    G = build_merge([new_chunk], graph_path, dedup=True, root=tmp_path)
+
+    ids = set(G.nodes)
+    assert ids == {"n1", "n2"}, "untagged scan nodes survive, foreign repo nodes stripped"
+    assert not any(d.get("repo") for _, d in G.nodes(data=True)), "no repo-tagged node remains"
+    # edges incident to stripped nodes are gone too
+    assert G.number_of_edges() == 0
+
+    err = capsys.readouterr().err
+    assert "stripped 2 node(s)" in err
+    assert "graphify" in err and "tree-sitter-bsl" in err
+
+
+def test_build_merge_no_crash_on_multi_repo_existing_graph(tmp_path):
+    """Guard #729 must be unreachable via the normal update path: build_merge
+    strips foreign-repo nodes before build()/deduplicate_entities runs, so a
+    polluted graph completes instead of raising 'span multiple repos'."""
+    graph_path = tmp_path / "graph.json"
+    existing = {
+        "nodes": [
+            {"id": "a::x", "label": "x", "file_type": "concept", "repo": "a", "local_id": "x"},
+            {"id": "b::y", "label": "y", "file_type": "concept", "repo": "b", "local_id": "y"},
+        ],
+        "links": [],
+    }
+    graph_path.write_text(json.dumps(existing), encoding="utf-8")
+    # Must not raise; result is empty (all existing nodes were foreign, no new chunks)
+    G = build_merge([], graph_path, dedup=True, root=tmp_path)
+    assert G.number_of_nodes() == 0

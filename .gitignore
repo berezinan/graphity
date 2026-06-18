@@ -37,3 +37,11 @@ scripts/llm.py
 scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
+# ArcadeDB spike: keep the PoC source scripts, ignore the downloaded server
+# binary, the generated 1M-node database/data and run logs (~1.1 GB).
+spikes/arcade/.arcade/
+spikes/arcade/synth_*.json
+spikes/arcade/*.out
+spikes/arcade/*.err
+# .NET build output generated from the sample.csproj language fixture.
+tests/fixtures/obj/
