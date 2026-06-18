@@ -1,5 +1,5 @@
 The project was driven by the need to process very large source code arrays for 1C business platform projects. The largest projects have an uncompressed text size of approximately 5 gigabytes. 
 
-Added support for the 1C programming language (BSL) has been added to the project. 
+Support for the 1C programming language (BSL) has been added to the project. 
 
 The data access layer has been redesigned: the GraphBackend abstraction has been introduced, and graph storage in ArkadaDB has been implemented (improving memory efficiency by a factor of 300).
