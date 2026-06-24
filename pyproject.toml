@@ -79,6 +79,10 @@ all = ["mcp", "neo4j", "falkordb", "requests", "pypdf", "markdownify", "watchdog
 [project.scripts]
 graphify = "graphify.__main__:main"
 graphify-mcp = "graphify.serve:_main"
+# graphity — локальный бренд-алиас (см. memory/graphity-rename-russian-deferred).
+# Добавляем, а не переименовываем: upstream-sync остаётся тривиальным, а слой
+# инструкций (skill*.md) продолжает звать `graphify`. graphity-mcp при нужде — ещё строка.
+graphity = "graphify.__main__:main"
 
 [dependency-groups]
 dev = [

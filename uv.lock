@@ -1153,7 +1153,7 @@ wheels = [
 
 [[package]]
 name = "graphifyy"
-version = "0.8.39"
+version = "0.8.41"
 source = { editable = "." }
 dependencies = [
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1207,6 +1207,7 @@ all = [
     { name = "openpyxl" },
     { name = "pypdf" },
     { name = "python-docx" },
+    { name = "requests" },
     { name = "tiktoken" },
     { name = "tree-sitter-dm" },
     { name = "tree-sitter-hcl" },
@@ -1216,6 +1217,9 @@ all = [
 ]
 anthropic = [
     { name = "anthropic" },
+]
+arcadedb = [
+    { name = "requests" },
 ]
 bedrock = [
     { name = "boto3" },
@@ -1345,6 +1349,8 @@ requires-dist = [
     { name = "python-docx", marker = "extra == 'all'" },
     { name = "python-docx", marker = "extra == 'office'" },
     { name = "rapidfuzz", specifier = ">=3.0" },
+    { name = "requests", marker = "extra == 'all'" },
+    { name = "requests", marker = "extra == 'arcadedb'" },
     { name = "tiktoken", marker = "extra == 'all'" },
     { name = "tiktoken", marker = "extra == 'gemini'" },
     { name = "tiktoken", marker = "extra == 'kimi'" },
@@ -1387,7 +1393,7 @@ requires-dist = [
     { name = "yt-dlp", marker = "extra == 'all'" },
     { name = "yt-dlp", marker = "extra == 'video'" },
 ]
-provides-extras = ["mcp", "neo4j", "falkordb", "pdf", "watch", "svg", "leiden", "office", "google", "postgres", "video", "kimi", "ollama", "bedrock", "anthropic", "gemini", "openai", "chinese", "sql", "dm", "terraform", "all"]
+provides-extras = ["mcp", "neo4j", "falkordb", "arcadedb", "pdf", "watch", "svg", "leiden", "office", "google", "postgres", "video", "kimi", "ollama", "bedrock", "anthropic", "gemini", "openai", "chinese", "sql", "dm", "terraform", "all"]
 
 [package.metadata.requires-dev]
 dev = [
