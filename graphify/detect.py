@@ -777,6 +777,30 @@ def _load_graphifyignore(root: Path) -> list[tuple[Path, str]]:
     return patterns
 
 
+def _load_global_graphifyignore(root: Path) -> list[tuple[Path, str]]:
+    """Read the user-global ignore file (~/.graphify/ignore) anchored at root.
+
+    This is the weakest ignore layer: callers prepend its patterns before any
+    local .gitignore/.graphifyignore so local rules (and !-negations) win via
+    last-match-wins. Missing file → empty list (no-op). Patterns are anchored
+    at the scan root, so an unanchored pattern matches at any depth while a
+    leading-slash pattern only matches relative to the project root.
+
+    Unlike _load_graphifyignore this intentionally breaks per-project
+    hermeticity — the same file applies to every scanned project — but can only
+    ever ADD exclusions.
+    """
+    global_file = Path.home() / ".graphify" / "ignore"
+    if not global_file.exists():
+        return []
+    patterns: list[tuple[Path, str]] = []
+    for raw in global_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = _parse_gitignore_line(raw)
+        if line:
+            patterns.append((root, line))
+    return patterns
+
+
 def _is_ignored(
     path: Path,
     root: Path,
@@ -1025,6 +1049,11 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             line = _parse_gitignore_line(pat)
             if line:
                 ignore_patterns.append((root, line))
+    # User-global ignore (~/.graphify/ignore) is the weakest layer: prepend so
+    # any local .gitignore/.graphifyignore rule or CLI --exclude wins via
+    # last-match-wins. Kept out of the graphifyignore_patterns count below,
+    # which reports local + --exclude patterns only.
+    match_patterns = _load_global_graphifyignore(root) + ignore_patterns
     include_patterns = _load_graphifyinclude(root)
 
     # Always include graphify-out/memory/ - query results filed back into the graph
@@ -1062,7 +1091,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                 dirnames[:] = [
                     d for d in dirnames
                     if not _is_noise_dir(d, dp)
-                    and not _is_ignored(dp / d, root, ignore_patterns, _cache=ignore_cache)
+                    and not _is_ignored(dp / d, root, match_patterns, _cache=ignore_cache)
                 ]
             for fname in filenames:
                 if fname in _SKIP_FILES:
@@ -1083,7 +1112,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             # Skip files inside our own converted/ dir (avoid re-processing sidecars)
             if str(p).startswith(str(converted_dir)):
                 continue
-        if not in_memory and _is_ignored(p, root, ignore_patterns, _cache=ignore_cache):
+        if not in_memory and _is_ignored(p, root, match_patterns, _cache=ignore_cache):
             continue
         if _is_sensitive(p):
             skipped_sensitive.append(str(p))
@@ -1104,7 +1133,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                     skipped_sensitive.append(str(p) + f" [Google Workspace export failed: {exc}]")
                     continue
                 if md_path:
-                    if _is_ignored(md_path, root, ignore_patterns, _cache=ignore_cache):
+                    if _is_ignored(md_path, root, match_patterns, _cache=ignore_cache):
                         continue
                     files[ftype].append(str(md_path))
                     total_words += count_words(md_path)
@@ -1115,7 +1144,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             if p.suffix.lower() in OFFICE_EXTENSIONS:
                 md_path = convert_office_file(p, converted_dir)
                 if md_path:
-                    if _is_ignored(md_path, root, ignore_patterns, _cache=ignore_cache):
+                    if _is_ignored(md_path, root, match_patterns, _cache=ignore_cache):
                         continue
                     files[ftype].append(str(md_path))
                     total_words += count_words(md_path)

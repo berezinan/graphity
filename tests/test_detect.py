@@ -1515,3 +1515,99 @@ def test_convert_office_file_does_not_rewrite_existing_sidecar(tmp_path, monkeyp
     second = detect_mod.convert_office_file(src, out_dir)
     assert second == first
     assert second.stat().st_mtime_ns == mtime_before
+
+
+# ---------------------------------------------------------------------------
+# Global user-level ignore (~/.graphify/ignore)
+
+def _set_global_ignore(monkeypatch, home: Path, content: str) -> None:
+    """Point Path.home() at `home` and write a global ignore file there."""
+    (home / ".graphify").mkdir(parents=True, exist_ok=True)
+    (home / ".graphify" / "ignore").write_text(content)
+    monkeypatch.setattr(detect_mod.Path, "home", lambda: home)
+
+
+def test_global_ignore_excludes_file(tmp_path, monkeypatch):
+    """A pattern in ~/.graphify/ignore excludes matching files in any project."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _set_global_ignore(monkeypatch, tmp_path / "home", "*.min.js\n")
+    (proj / "app.min.js").write_text("var x=1")
+    (proj / "main.py").write_text("x = 1")
+
+    result = detect(proj)
+    code = result["files"]["code"]
+    assert any("main.py" in f for f in code)
+    assert not any("app.min.js" in f for f in code)
+    # Global patterns are NOT counted as local graphifyignore patterns.
+    assert result["graphifyignore_patterns"] == 0
+
+
+def test_global_ignore_missing_is_noop(tmp_path, monkeypatch):
+    """No ~/.graphify/ignore leaves the file set unchanged (no-op)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    # Empty home: ~/.graphify/ignore does not exist.
+    monkeypatch.setattr(detect_mod.Path, "home", lambda: tmp_path / "home")
+    (proj / "app.min.js").write_text("var x=1")
+    (proj / "main.py").write_text("x = 1")
+
+    result = detect(proj)
+    code = result["files"]["code"]
+    assert any("main.py" in f for f in code)
+    assert any("app.min.js" in f for f in code)  # not excluded without the file
+    assert result["graphifyignore_patterns"] == 0
+
+
+def test_global_ignore_overridden_by_local_negation(tmp_path, monkeypatch):
+    """A local .graphifyignore `!` negation re-includes a globally-excluded file
+    via last-match-wins (global is the weakest layer)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _set_global_ignore(monkeypatch, tmp_path / "home", "*.min.js\n")
+    (proj / ".graphifyignore").write_text("!app.min.js\n")
+    (proj / "app.min.js").write_text("var x=1")
+    (proj / "vendor.min.js").write_text("var y=2")
+
+    result = detect(proj)
+    code = result["files"]["code"]
+    assert any("app.min.js" in f for f in code)        # rescued by local negation
+    assert not any("vendor.min.js" in f for f in code)  # still excluded by global
+
+
+def test_global_ignore_does_not_block_cli_exclude(tmp_path, monkeypatch):
+    """CLI --exclude still applies when a global ignore file is present."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _set_global_ignore(monkeypatch, tmp_path / "home", "*.min.js\n")
+    legacy = proj / "legacy"
+    legacy.mkdir()
+    (legacy / "old.py").write_text("y = 2")
+    (proj / "main.py").write_text("x = 1")
+
+    result = detect(proj, extra_excludes=["legacy/"])
+    code = result["files"]["code"]
+    assert any("main.py" in f for f in code)
+    assert not any("legacy" in f for f in code)
+
+
+def test_global_ignore_anchoring(tmp_path, monkeypatch):
+    """Global patterns are anchored at the scan root: a leading-slash pattern
+    matches only at the project root, an unanchored one matches at any depth."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _set_global_ignore(monkeypatch, tmp_path / "home", "/onlyroot/\nanywhere/\n")
+    (proj / "main.py").write_text("x = 1")
+    (proj / "onlyroot").mkdir()
+    (proj / "onlyroot" / "a.py").write_text("a = 1")          # root -> excluded
+    (proj / "sub" / "onlyroot").mkdir(parents=True)
+    (proj / "sub" / "onlyroot" / "b.py").write_text("b = 1")  # nested -> kept
+    (proj / "deep" / "anywhere").mkdir(parents=True)
+    (proj / "deep" / "anywhere" / "c.py").write_text("c = 1")  # nested -> excluded
+
+    result = detect(proj)
+    code = result["files"]["code"]
+    assert any("main.py" in f for f in code)
+    assert any(("sub" in f and "b.py" in f) for f in code)
+    assert not any(("onlyroot" in f and "a.py" in f) for f in code)
+    assert not any("anywhere" in f for f in code)
