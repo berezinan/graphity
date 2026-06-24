@@ -153,7 +153,7 @@ COMMUNITY_COLORS = [
     "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
 ]
 
-MAX_NODES_FOR_VIZ = 5_000
+MAX_NODES_FOR_VIZ = 10_000
 
 
 def _viz_node_limit() -> int:
@@ -650,62 +650,63 @@ def to_html(
     """
     limit = node_limit if node_limit is not None else _viz_node_limit()
     if G.number_of_nodes() > limit:
-        if node_limit is not None:
-            # Build aggregated community meta-graph
-            from collections import Counter as _Counter
-            import networkx as _nx
-            print(f"Graph has {G.number_of_nodes()} nodes (above {limit} limit). Building aggregated community view...")
-            node_to_community = {nid: cid for cid, members in communities.items() for nid in members}
-            meta = _nx.Graph()
-            for cid, members in communities.items():
-                meta.add_node(str(cid), label=(community_labels or {}).get(cid, f"Community {cid}"))
-            edge_counts = _Counter()
-            for u, v in G.edges():
-                cu, cv = node_to_community.get(u), node_to_community.get(v)
-                if cu is not None and cv is not None and cu != cv:
-                    edge_counts[(min(cu, cv), max(cu, cv))] += 1
-            for (cu, cv), w in edge_counts.items():
-                meta.add_edge(str(cu), str(cv), weight=w,
-                              relation=f"{w} cross-community edges", confidence="AGGREGATED")
-            if meta.number_of_nodes() <= 1:
-                print("Single community - aggregated view not useful. Skipping graph.html.")
-                return
-            meta_communities = {cid: [str(cid)] for cid in communities}
-            mc = {cid: len(members) for cid, members in communities.items()}
-            # Remap hyperedges from semantic node IDs to community IDs
-            raw_hyperedges = G.graph.get("hyperedges", [])
-            if raw_hyperedges:
-                remapped = []
-                for he in raw_hyperedges:
-                    he_members = he.get("nodes") or he.get("members") or []
-                    comm_ids, seen = [], set()
-                    for nid in he_members:
-                        c = node_to_community.get(nid)
-                        if c is None:
-                            continue
-                        s = str(c)
-                        if s in seen:
-                            continue
-                        seen.add(s)
-                        comm_ids.append(s)
-                    if len(comm_ids) < 2:
+        # Over the vis-network render budget. Rather than skip graph.html, collapse
+        # the graph to a community meta-graph so even very large projects still get
+        # a usable, fast-rendering artifact. Only fall back to ValueError when there
+        # is no multi-community structure to aggregate into. (#1019, extended from
+        # byte-cap-only to node-count over-limit.)
+        from collections import Counter as _Counter
+        import networkx as _nx
+        print(f"Graph has {G.number_of_nodes()} nodes (above {limit} limit). Building aggregated community view...")
+        node_to_community = {nid: cid for cid, members in communities.items() for nid in members}
+        meta = _nx.Graph()
+        for cid, members in communities.items():
+            meta.add_node(str(cid), label=(community_labels or {}).get(cid, f"Community {cid}"))
+        edge_counts = _Counter()
+        for u, v in G.edges():
+            cu, cv = node_to_community.get(u), node_to_community.get(v)
+            if cu is not None and cv is not None and cu != cv:
+                edge_counts[(min(cu, cv), max(cu, cv))] += 1
+        for (cu, cv), w in edge_counts.items():
+            meta.add_edge(str(cu), str(cv), weight=w,
+                          relation=f"{w} cross-community edges", confidence="AGGREGATED")
+        if meta.number_of_nodes() <= 1:
+            raise ValueError(
+                f"Graph has {G.number_of_nodes()} nodes - too large for HTML viz "
+                f"(limit: {limit}) and has no multi-community structure to aggregate. "
+                f"Use --no-viz, raise GRAPHIFY_VIZ_NODE_LIMIT, or reduce input size."
+            )
+        meta_communities = {cid: [str(cid)] for cid in communities}
+        mc = {cid: len(members) for cid, members in communities.items()}
+        # Remap hyperedges from semantic node IDs to community IDs
+        raw_hyperedges = G.graph.get("hyperedges", [])
+        if raw_hyperedges:
+            remapped = []
+            for he in raw_hyperedges:
+                he_members = he.get("nodes") or he.get("members") or []
+                comm_ids, seen = [], set()
+                for nid in he_members:
+                    c = node_to_community.get(nid)
+                    if c is None:
                         continue
-                    remapped.append({
-                        "id": he.get("id", ""),
-                        "label": he.get("label") or he.get("relation", "").replace("_", " "),
-                        "nodes": comm_ids,
-                    })
-                meta.graph["hyperedges"] = remapped
-            to_html(meta, meta_communities, output_path,
-                    community_labels=community_labels, member_counts=mc)
-            print(f"graph.html written (aggregated: {meta.number_of_nodes()} community nodes, {meta.number_of_edges()} cross-community edges)")
-            print("Tip: run with --obsidian for full node-level detail.")
-            return
-        raise ValueError(
-            f"Graph has {G.number_of_nodes()} nodes - too large for HTML viz "
-            f"(limit: {limit}). Use --no-viz, raise GRAPHIFY_VIZ_NODE_LIMIT, "
-            f"or reduce input size."
-        )
+                    s = str(c)
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    comm_ids.append(s)
+                if len(comm_ids) < 2:
+                    continue
+                remapped.append({
+                    "id": he.get("id", ""),
+                    "label": he.get("label") or he.get("relation", "").replace("_", " "),
+                    "nodes": comm_ids,
+                })
+            meta.graph["hyperedges"] = remapped
+        to_html(meta, meta_communities, output_path,
+                community_labels=community_labels, member_counts=mc)
+        print(f"graph.html written (aggregated: {meta.number_of_nodes()} community nodes, {meta.number_of_edges()} cross-community edges)")
+        print("Tip: run with --obsidian for full node-level detail.")
+        return
 
     node_community = _node_community_map(communities)
     degree = dict(G.degree())
