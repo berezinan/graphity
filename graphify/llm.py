@@ -18,15 +18,22 @@ from pathlib import Path
 
 from graphify.file_slice import (
     FileSlice,
+    bisect_path,
     bisect_slice,
     expand_oversized_files,
+    is_sliceable,
     read_slice_text,
     unit_path,
 )
 
-# `_read_files` truncates each file at this many characters before joining into
-# the user message. Token estimates use the same cap so packing matches reality.
-_FILE_CHAR_CAP = 20_000
+# `_read_files` slices or truncates each file before joining into the user
+# message; the cap is per-category (see `_char_cap_for`). Splittable text and
+# PDFs are sliced into `_TEXT_SLICE_CHARS`-sized units that cover the whole file
+# (lossless), while code and structured data are read whole up to
+# `_UNSLICED_CHAR_CAP` to preserve whole-symbol context. Token estimates use the
+# same per-category cap so packing matches reality.
+_TEXT_SLICE_CHARS = 20_000      # slice size for splittable text + extracted PDF
+_UNSLICED_CHAR_CAP = 1_200_000  # whole-file cap for code / structured data
 # `_read_files` wraps each file in an `<untrusted_source path=... sha256=...>`
 # delimiter block (see issue #1210); this is roughly the per-file overhead in
 # characters that wrapper adds (open tag + 64-char sha + close tag + newlines).
@@ -34,6 +41,11 @@ _PER_FILE_OVERHEAD_CHARS = 160
 # Coarse fallback used only when `tiktoken` is not installed. 1 token ≈ 4 chars
 # is the standard heuristic for English/code on BPE tokenizers.
 _CHARS_PER_TOKEN = 4
+# Cyrillic-heavy 1C/source measured at ~2.2 chars/token (cl100k_base); the
+# generic chars/4 heuristic underestimates such files ~1.8x, so the file-size
+# fallback in `_estimate_file_tokens` uses this denser ratio to avoid
+# under-packing when `tiktoken` is unavailable.
+_FALLBACK_CHARS_PER_TOKEN = 2.5
 
 
 def _get_tokenizer():
@@ -462,6 +474,17 @@ def _wrap_untrusted(rel: str, content: str) -> str:
     )
 
 
+def _char_cap_for(path: Path) -> int:
+    """Per-category character cap applied when reading a file for the prompt.
+
+    Splittable text and PDFs are sliced (see `expand_oversized_files`), so their
+    cap is the slice size and a `FileSlice` of either is already within it —
+    making the read-time truncation a no-op. Everything else (code,
+    `.json`/`.yaml`/`.html`/`.csv`, …) is read whole up to `_UNSLICED_CHAR_CAP`.
+    """
+    return _TEXT_SLICE_CHARS if is_sliceable(path) else _UNSLICED_CHAR_CAP
+
+
 def _read_files(units: "list[Path | FileSlice]", root: Path) -> str:
     """Return file/slice contents formatted for the extraction prompt.
 
@@ -487,9 +510,9 @@ def _read_files(units: "list[Path | FileSlice]", root: Path) -> str:
                 content = _file_to_text(p)
         except OSError:
             continue
-        # Whole files are still capped (covers non-splittable large files like
-        # code); slices are already bounded to the cap, so the cap is a no-op.
-        parts.append(_wrap_untrusted(rel, content[:_FILE_CHAR_CAP]))
+        # Whole code/structured files are capped at `_UNSLICED_CHAR_CAP`; a
+        # slice is already within its (smaller) text cap, so the cap is a no-op.
+        parts.append(_wrap_untrusted(rel, content[:_char_cap_for(p)]))
     return "\n\n".join(parts)
 
 
@@ -1398,22 +1421,26 @@ def _estimate_file_tokens(unit: "Path | FileSlice") -> int:
     """Estimate the prompt-token cost of a file or slice under `_read_files` rules.
 
     Uses tiktoken (`cl100k_base`) when available for accurate counts. Falls back
-    to the chars/4 heuristic if tiktoken is not installed. Both paths cap at
-    `_FILE_CHAR_CAP` to match `_read_files`'s truncation, plus a constant for
-    the wrapper. Returns 0 for unreadable paths so they don't blow up packing.
+    to a chars/`_FALLBACK_CHARS_PER_TOKEN` heuristic if tiktoken is not installed
+    (denser than chars/4 because Cyrillic-heavy code tokenizes worse). Both paths
+    cap at the unit's per-category char cap (`_char_cap_for`) to match
+    `_read_files`'s truncation, plus a constant for the wrapper. Returns 0 for
+    unreadable paths so they don't blow up packing.
     """
     if isinstance(unit, FileSlice):
-        # A slice's size is its char range (already ≤ _FILE_CHAR_CAP). Use the
-        # tokenizer on its text when available, else the chars/4 heuristic.
+        cap = _char_cap_for(unit.path)
+        # A slice's size is its char range (already ≤ the text cap). Use the
+        # tokenizer on its text when available, else the Cyrillic-aware fallback.
         if _TOKENIZER is None:
-            return (min(unit.end - unit.start, _FILE_CHAR_CAP) + _PER_FILE_OVERHEAD_CHARS) // _CHARS_PER_TOKEN
+            return int((min(unit.end - unit.start, cap) + _PER_FILE_OVERHEAD_CHARS) / _FALLBACK_CHARS_PER_TOKEN)
         try:
-            content = read_slice_text(unit)[:_FILE_CHAR_CAP]
+            content = read_slice_text(unit)[:cap]
         except OSError:
             return 0
         return len(_TOKENIZER.encode(content)) + (_PER_FILE_OVERHEAD_CHARS // _CHARS_PER_TOKEN)
 
     path = unit
+    cap = _char_cap_for(path)
     # Raster images are not read as text; a vision model bills them at a roughly
     # fixed token cost, so estimate by image count rather than (binary) byte size.
     if _is_vision_image(path):
@@ -1423,11 +1450,11 @@ def _estimate_file_tokens(unit: "Path | FileSlice") -> int:
             size = path.stat().st_size
         except OSError:
             return 0
-        chars = min(size, _FILE_CHAR_CAP) + _PER_FILE_OVERHEAD_CHARS
-        return chars // _CHARS_PER_TOKEN
+        chars = min(size, cap) + _PER_FILE_OVERHEAD_CHARS
+        return int(chars / _FALLBACK_CHARS_PER_TOKEN)
 
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")[:_FILE_CHAR_CAP]
+        content = _file_to_text(path)[:cap]
     except OSError:
         return 0
     return len(_TOKENIZER.encode(content)) + (_PER_FILE_OVERHEAD_CHARS // _CHARS_PER_TOKEN)
@@ -1547,10 +1574,11 @@ def _extract_with_adaptive_retry(
     still failing at the cap, we surface the (likely empty) result with a
     warning rather than infinite-loop.
 
-    A single-file chunk that overflows is recoverable only when it's a slice of
-    a splittable document: the slice is bisected and retried (#1369). A whole
-    non-splittable file (e.g. one huge code file) can't be made smaller than
-    itself, so we return what we got and warn.
+    A single-file chunk that overflows is recovered by splitting: a slice of a
+    splittable document is bisected and retried (#1369); a whole non-sliced file
+    (e.g. one huge code file) is emergency-sliced as a last resort so a
+    god-module degrades into a complete-but-fragmented graph instead of a silent
+    partial result (A-hybrid). Only a file too small to split is kept partial.
     """
     def _merge_two(left_units, right_units) -> dict:
         left = _extract_with_adaptive_retry(
@@ -1570,11 +1598,17 @@ def _extract_with_adaptive_retry(
         }
 
     def _split_lone_slice() -> "tuple[FileSlice, FileSlice] | None":
-        # When a single-unit chunk is a slice, bisect the slice so we can retry
-        # on a smaller range rather than give up (#1369).
-        if len(chunk) == 1 and isinstance(chunk[0], FileSlice) and _depth < max_depth:
-            return bisect_slice(chunk[0])
-        return None
+        # When a single-unit chunk overflows, split it so we can retry on a
+        # smaller range rather than give up. A FileSlice (oversized splittable
+        # doc, #1369) is bisected directly; a whole non-sliced file (code /
+        # structured data) is emergency-sliced (A-hybrid) so it degrades into a
+        # complete-but-fragmented graph instead of a silent partial result.
+        if len(chunk) != 1 or _depth >= max_depth:
+            return None
+        unit = chunk[0]
+        if isinstance(unit, FileSlice):
+            return bisect_slice(unit)
+        return bisect_path(unit)
 
     try:
         result = extract_files_direct(
@@ -1690,7 +1724,7 @@ def extract_corpus_parallel(
     root: Path = Path("."),
     chunk_size: int = 20,
     on_chunk_done: Callable | None = None,
-    token_budget: int | None = 60_000,
+    token_budget: int | None = 120_000,
     max_concurrency: int = 4,
     max_retry_depth: int = 3,
     deep_mode: bool = False,
@@ -1698,10 +1732,13 @@ def extract_corpus_parallel(
     """Extract a corpus in chunks, merging results.
 
     Chunking strategy:
-        - If `token_budget` is set (default 60_000), files are packed to fit
+        - If `token_budget` is set (default 120_000), files are packed to fit
           the budget and grouped by parent directory. This avoids the worst
           case where 20 randomly-grouped files exceed a model's context
-          window in a single request.
+          window in a single request. The default keeps typical large code
+          files whole on mainstream ~200k-context models; anything bigger that
+          overflows is emergency-sliced by the adaptive-retry path rather than
+          dropped (A-hybrid). 1M-context models can raise `--token-budget`.
         - If `token_budget=None`, falls back to the legacy fixed-count
           `chunk_size` packing for backwards compatibility.
 
@@ -1729,10 +1766,11 @@ def extract_corpus_parallel(
     output_tokens. Failed chunks are logged to stderr and skipped — one bad
     chunk does not abort the run.
     """
-    # Split oversized splittable documents into slices that cover the whole file
-    # before packing, so content past _FILE_CHAR_CAP is extracted instead of
-    # silently dropped (#1369). Files at/under the cap pass through unchanged.
-    files = expand_oversized_files(files, _FILE_CHAR_CAP)
+    # Split oversized sliceable documents (text + PDF) into slices that cover
+    # the whole file before packing, so content past `_TEXT_SLICE_CHARS` is
+    # extracted instead of silently dropped (#1369). Files at/under the cap (and
+    # all non-sliceable files like code) pass through unchanged.
+    files = expand_oversized_files(files, _TEXT_SLICE_CHARS)
     if token_budget is not None:
         chunks = _pack_chunks_by_tokens(files, token_budget=token_budget)
     else:

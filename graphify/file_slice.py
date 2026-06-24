@@ -1,10 +1,11 @@
 """Intra-file slicing for oversized text documents (#1369).
 
 The extraction packer (`_pack_chunks_by_tokens`) treats each file as atomic and
-`_read_files` caps every file at ``_FILE_CHAR_CAP`` characters, so a document
-larger than that cap had everything past the cap silently dropped — the model
-never saw it, and nothing in the adaptive-retry path could recover it ("a single
-file larger than the budget ... packing can't shrink one big file").
+`_read_files` caps every file at its per-category char cap (`_char_cap_for`), so
+a sliceable document larger than the slice cap would have everything past it
+silently dropped — the model never saw it, and nothing in the adaptive-retry
+path could recover it ("a single file larger than the budget ... packing can't
+shrink one big file").
 
 This module splits an oversized *splittable text* document (Markdown, plain
 text, reStructuredText) into contiguous ``FileSlice`` units at heading /
@@ -13,8 +14,9 @@ units. Every slice of a file reports the **parent file path** as its source, so
 the resulting nodes are never fragmented per-slice — they merge by source_file
 exactly as if the file had been extracted in one pass.
 
-Only plain-text documents are sliced: code files need whole-symbol context, and
-PDFs/images are read through their own extractors and have no char-offset model.
+Plain-text documents and PDFs are sliced (PDFs via their text extractor); code
+files are left whole because they need whole-symbol context, and raster images
+are handled by the vision path, not here.
 """
 
 from __future__ import annotations
@@ -64,6 +66,35 @@ def is_splittable_text(path: Path) -> bool:
     return path.suffix.lower() in _SPLITTABLE_TEXT_SUFFIXES
 
 
+# Sliceable suffixes whose text comes from a dedicated extractor rather than a
+# straight ``read_text`` (see ``_unit_text``). PDFs become plain text after
+# extraction, so they slice exactly like a Markdown/plain-text document.
+_SLICEABLE_EXTRA_SUFFIXES = frozenset({".pdf"})
+
+
+def is_sliceable(path: Path) -> bool:
+    """True for documents that may be split into ``FileSlice``s when oversized.
+
+    Plain-text docs (read as-is) plus PDFs (read via text extraction). Code and
+    structured data are deliberately excluded — they are read whole to keep
+    whole-symbol context.
+    """
+    return is_splittable_text(path) or path.suffix.lower() in _SLICEABLE_EXTRA_SUFFIXES
+
+
+def _unit_text(path: Path) -> str:
+    """Full text of a file for slicing/reading, dispatched by file type.
+
+    PDFs are binary, so route them through the pdf text extractor; everything
+    else is read as UTF-8. Mirrors ``llm._file_to_text`` so a slice's character
+    range matches the bytes the model is shown.
+    """
+    if path.suffix.lower() == ".pdf":
+        from graphify.detect import extract_pdf_text
+        return extract_pdf_text(path)
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def _best_cut(text: str, start: int, end: int) -> int:
     """Return a cut index in ``(start, end]`` at the strongest nearby boundary.
 
@@ -109,17 +140,18 @@ def expand_oversized_files(
 ) -> list["Path | FileSlice"]:
     """Replace each oversized splittable-text file with a list of ``FileSlice``s.
 
-    Files at or below ``max_chars`` (and all non-splittable files) pass through
-    unchanged as ``Path``, so behaviour is identical for everything that already
-    fit. Unreadable files pass through untouched (the reader handles the error).
+    Files at or below ``max_chars`` (and all non-sliceable files like code) pass
+    through unchanged as ``Path``, so behaviour is identical for everything that
+    already fit. Unreadable files pass through untouched (the reader handles the
+    error).
     """
     out: list["Path | FileSlice"] = []
     for f in files:
-        if not is_splittable_text(f):
+        if not is_sliceable(f):
             out.append(f)
             continue
         try:
-            text = f.read_text(encoding="utf-8", errors="replace")
+            text = _unit_text(f)
         except OSError:
             out.append(f)
             continue
@@ -135,7 +167,7 @@ def expand_oversized_files(
 
 def read_slice_text(fs: FileSlice) -> str:
     """Read just this slice's characters from its parent file."""
-    text = fs.path.read_text(encoding="utf-8", errors="replace")
+    text = _unit_text(fs.path)
     return text[fs.start:fs.end]
 
 
@@ -149,7 +181,7 @@ def bisect_slice(fs: FileSlice) -> tuple[FileSlice, FileSlice] | None:
     if fs.end - fs.start <= 1:
         return None
     try:
-        text = fs.path.read_text(encoding="utf-8", errors="replace")
+        text = _unit_text(fs.path)
     except OSError:
         return None
     mid = (fs.start + fs.end) // 2
@@ -160,3 +192,23 @@ def bisect_slice(fs: FileSlice) -> tuple[FileSlice, FileSlice] | None:
     left = FileSlice(fs.path, fs.start, cut, fs.index, fs.total)
     right = FileSlice(fs.path, cut, fs.end, fs.index, fs.total)
     return left, right
+
+
+def bisect_path(path: Path) -> "tuple[FileSlice, FileSlice] | None":
+    """Emergency-slice a whole non-sliced file (code / structured data).
+
+    Used by the adaptive-retry path when a single whole file overflows the
+    model's output or context (A-hybrid): wrap the whole file as one slice and
+    bisect it at a newline near the midpoint, so the file is retried in halves
+    instead of dropped or kept partial. Returns None when the file is unreadable
+    or too small to split. The resulting slices report ``path`` as their source,
+    so nodes still merge by ``source_file`` exactly as for a whole-file pass.
+    """
+    try:
+        text = _unit_text(path)
+    except OSError:
+        return None
+    n = len(text)
+    if n <= 1:
+        return None
+    return bisect_slice(FileSlice(path=path, start=0, end=n, index=0, total=1))
