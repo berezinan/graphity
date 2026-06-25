@@ -229,6 +229,36 @@ def test_cpp_struct_inherits_edge():
     assert found, "RetryingHttpClient (struct) should have inherits edge to HttpClient"
 
 
+# ── CUDA ──────────────────────────────────────────────────────────────────────
+# CUDA is a C++ superset, so .cu/.cuh route through the C++ (tree-sitter-cpp)
+# extractor. These tests guard that __global__/__device__ kernels, host
+# functions, structs and includes are all extracted.
+
+def test_cuda_no_error():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    assert "error" not in r
+
+def test_cuda_finds_kernel_and_device_functions():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    labels = _labels(r)
+    assert any("saxpy" in l for l in labels)   # __global__ kernel
+    assert any("dot" in l for l in labels)     # __device__ function
+
+def test_cuda_finds_struct():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    assert any("Vec3" in l for l in _labels(r))
+
+def test_cuda_finds_includes():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    assert "imports" in _relations(r)
+
+def test_cuda_host_call_edges():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    calls = _calls(r)
+    assert ("host_norm()", "dot()") in calls
+    assert ("main()", "host_norm()") in calls
+
+
 # ── Ruby ─────────────────────────────────────────────────────────────────────
 
 def test_ruby_no_error():
@@ -1421,6 +1451,68 @@ def test_markdown_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids, f"Dangling source: {e}"
+
+
+def _md_link_fixture(tmp_path):
+    """A hub doc linking to sibling docs, plus those docs (#1376)."""
+    pkg = tmp_path / "packages" / "coding-standards-csharp"
+    pkg.mkdir(parents=True)
+    (pkg / "index.md").write_text(
+        "# C# Coding Standards\n\n"
+        "| Topic | Doc |\n| --- | --- |\n"
+        "| Repository | [C# Repository Standards](./repository.md) |\n"
+        "| HTTP Client | [C# HTTP Client Standards](http-client.md) |\n"
+        "| Unit Tests | [C# Unit Test Standards](unit-tests.md) |\n\n"
+        "See also [external](https://example.com/x) and ![logo](./logo.png).\n"
+        "Anchor: [section](./repository.md#setup).\n"
+        "Wikilink: [[http-client]].\n"
+    )
+    (pkg / "repository.md").write_text("# C# Repository Standards\nContent.\n")
+    (pkg / "http-client.md").write_text("# C# HTTP Client Standards\nContent.\n")
+    (pkg / "unit-tests.md").write_text("# C# Unit Test Standards\nContent.\n")
+    return pkg
+
+
+def test_markdown_link_edges_emitted(tmp_path):
+    """Inline/wikilink markdown links to sibling docs become references edges (#1376)."""
+    pkg = _md_link_fixture(tmp_path)
+    r = extract_markdown(pkg / "index.md")
+    refs = [e for e in r["edges"] if e["relation"] == "references"]
+    targets = {e["target"] for e in refs}
+    # repository, http-client, unit-tests — each exactly once (deduped despite
+    # the anchor link and wikilink pointing at repository/http-client again).
+    assert len(refs) == 3, f"expected 3 reference edges, got {refs}"
+    assert any("repository" in t for t in targets)
+    assert any("http_client" in t for t in targets)
+    assert any("unit_tests" in t for t in targets)
+
+
+def test_markdown_link_skips_external_and_images(tmp_path):
+    """External URLs, in-page anchors and images must not produce edges (#1376)."""
+    pkg = _md_link_fixture(tmp_path)
+    r = extract_markdown(pkg / "index.md")
+    refs = [e for e in r["edges"] if e["relation"] == "references"]
+    for e in refs:
+        assert "example.com" not in e["target"]
+        assert "logo" not in e["target"]
+
+
+def test_markdown_link_edges_resolve_to_real_nodes(tmp_path):
+    """End-to-end: after extract()'s ID remap, link targets are real doc nodes,
+    so the hub doc gains edges into existing nodes instead of ghost nodes (#1376)."""
+    from graphify.extract import extract
+    pkg = _md_link_fixture(tmp_path)
+    paths = sorted(pkg.glob("*.md"))
+    res = extract(paths, cache_root=tmp_path, parallel=False)
+    node_ids = {n["id"] for n in res["nodes"]}
+    refs = [e for e in res["edges"] if e["relation"] == "references"]
+    assert refs, "expected reference edges after full extract"
+    for e in refs:
+        assert e["target"] in node_ids, f"link target is a ghost node: {e}"
+    # index.md must connect to all three sibling docs.
+    index_id = next(n["id"] for n in res["nodes"] if n["label"] == "index.md")
+    index_refs = {e["target"] for e in refs if e["source"] == index_id}
+    assert len(index_refs) == 3, f"hub doc under-connected: {index_refs}"
 
 
 # ── Groovy ───────────────────────────────────────────────────────────────────

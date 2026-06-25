@@ -106,6 +106,7 @@ class Neighbors:
 class CommunityRecord:
     cid: int
     members: list[NodeRecord]
+    name: str | None = None
 
 
 @dataclass
@@ -290,7 +291,8 @@ class JsonBackend(GraphBackend):
                        source_file=str(self.G.nodes[n].get("source_file", "")))
             for n in members
         ]
-        return CommunityRecord(cid=int(community_id), members=recs)
+        name = self.G.nodes[members[0]].get("community_name")
+        return CommunityRecord(cid=int(community_id), members=recs, name=name)
 
     def god_nodes(self, top_n=10) -> list[GodNode]:
         from graphify.analyze import god_nodes as _god
@@ -439,7 +441,16 @@ def render_neighbors(n: Neighbors | None, label: str) -> str:
 def render_community(c: CommunityRecord | None, cid: int) -> str:
     if c is None:
         return f"Community {cid} not found."
-    lines = [f"Community {c.cid} ({len(c.members)} nodes):"]
+    # Header "Community N — Name" (#1448); skip the name when it is just the
+    # "Community N" placeholder written for unnamed communities, and fall back
+    # to the bare id when there is no name. Name is sanitised (F-010).
+    base = f"Community {c.cid}"
+    header = base
+    if c.name:
+        clean = sanitize_label(str(c.name))
+        if clean and clean != base:
+            header = f"{base} — {clean}"
+    lines = [f"{header} ({len(c.members)} nodes):"]
     for m in c.members:
         lines.append(f"  {sanitize_label(m.label)} [{sanitize_label(m.source_file)}]")
     return "\n".join(lines)
@@ -915,13 +926,14 @@ class ArcadeDBBackend(GraphBackend):
         return Neighbors(label=node.get("label", nid), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:
-        rows = self._run("SELECT id, label, source_file FROM Node WHERE community = :c ORDER BY id",
+        rows = self._run("SELECT id, label, source_file, community_name FROM Node WHERE community = :c ORDER BY id",
                         params={"c": int(community_id)})
         if not rows:
             return None
         return CommunityRecord(cid=int(community_id),
                                members=[NodeRecord(label=r.get("label", r["id"]),
-                                                   source_file=str(r.get("source_file", "") or "")) for r in rows])
+                                                   source_file=str(r.get("source_file", "") or "")) for r in rows],
+                               name=rows[0].get("community_name"))
 
     def god_nodes(self, top_n=10) -> list[GodNode]:
         rows = self._run("SELECT value FROM Meta WHERE key = 'god_nodes' LIMIT 1")

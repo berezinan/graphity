@@ -398,8 +398,10 @@ Edge direction rule — source is always the ACTOR, target is the ACTED-UPON:
 - imports/references: source = the file/entity that imports or references; target = the thing imported or referenced.
 - implements/inherits: source = the subclass/implementor; target = the base class/interface.
 
+Hyperedges: if 3 or more nodes clearly participate together in a shared concept, flow, or pattern that is not captured by pairwise edges alone, add a hyperedge to the top-level `hyperedges` array (e.g. all classes implementing one protocol, all functions in one auth flow even if they don't all call each other, all concepts from a paper section forming one coherent idea). Use sparingly — only when the group relationship adds information beyond the pairwise edges. Maximum 3 hyperedges per chunk.
+
 Output exactly this schema:
-{"nodes":[{"id":"stem_entity","label":"Human Readable Name","file_type":"code|document|paper|image|rationale|concept","source_file":"relative/path","source_location":null,"source_url":null,"captured_at":null,"author":null,"contributor":null}],"edges":[{"source":"node_id","target":"node_id","relation":"calls|implements|references|cites|conceptually_related_to|shares_data_with|semantically_similar_to","confidence":"EXTRACTED|INFERRED|AMBIGUOUS","confidence_score":1.0,"source_file":"relative/path","source_location":null,"weight":1.0}],"hyperedges":[],"input_tokens":0,"output_tokens":0}
+{"nodes":[{"id":"stem_entity","label":"Human Readable Name","file_type":"code|document|paper|image|rationale|concept","source_file":"relative/path","source_location":null,"source_url":null,"captured_at":null,"author":null,"contributor":null}],"edges":[{"source":"node_id","target":"node_id","relation":"calls|implements|references|cites|conceptually_related_to|shares_data_with|semantically_similar_to","confidence":"EXTRACTED|INFERRED|AMBIGUOUS","confidence_score":1.0,"source_file":"relative/path","source_location":null,"weight":1.0}],"hyperedges":[{"id":"snake_case_id","label":"Human Readable Label","nodes":["node_id1","node_id2","node_id3"],"relation":"participate_in|implement|form","confidence":"EXTRACTED|INFERRED","confidence_score":0.75,"source_file":"relative/path"}],"input_tokens":0,"output_tokens":0}
 """
 
 _DEEP_EXTRACTION_SUFFIX = """\
@@ -1326,7 +1328,14 @@ def extract_files_direct(
     Returns dict with nodes, edges, hyperedges, input_tokens, output_tokens.
     Raises ValueError for unknown backends or when no API key is configured.
     Raises ImportError if SDK missing.
+
+    Accepts ``str`` paths as well as ``Path``; string entries are coerced up
+    front so downstream helpers (``_partition_semantic_files``, ``_read_files``,
+    ``_build_image_refs``) can rely on ``Path`` semantics (#1386). FileSlice units
+    (from extract_corpus_parallel's oversized-doc slicing, #1369) pass through
+    untouched — Path(FileSlice) would raise (#1397/#1399).
     """
+    files = [f if isinstance(f, (Path, FileSlice)) else Path(f) for f in files]
     if backend is None:
         backend = detect_backend()
         if backend is None:
@@ -1765,7 +1774,11 @@ def extract_corpus_parallel(
     Returns merged dict with nodes, edges, hyperedges, input_tokens,
     output_tokens. Failed chunks are logged to stderr and skipped — one bad
     chunk does not abort the run.
+
+    Accepts ``str`` paths as well as ``Path``; string entries are coerced up
+    front so packing/slicing helpers can rely on ``Path`` semantics (#1386).
     """
+    files = [f if isinstance(f, (Path, FileSlice)) else Path(f) for f in files]
     # Split oversized sliceable documents (text + PDF) into slices that cover
     # the whole file before packing, so content past `_TEXT_SLICE_CHARS` is
     # extracted instead of silently dropped (#1369). Files at/under the cap (and
@@ -2182,6 +2195,69 @@ def _parse_label_response(text: str, labeled_cids: list[int]) -> dict[int, str]:
     return out
 
 
+def _label_batch_with_retry(
+    batch_cids: list[int],
+    batch_lines: list[str],
+    *,
+    backend: str,
+    model: str | None,
+    depth: int = 0,
+    max_depth: int = 3,
+) -> dict[int, str]:
+    """Label a batch of communities, splitting in half and retrying on parse failure.
+
+    Mirrors `_extract_with_adaptive_retry`'s recovery shape for the labeling path
+    (#1278). When the LLM returns malformed JSON or a non-object payload, the
+    batch is split at the midpoint and each half is retried recursively. Recursion
+    is capped at ``max_depth`` to bound cost.
+
+    Returns ``{cid: name}`` for everything that could be labeled. When a batch
+    can't be split further (a single community, or ``depth >= max_depth``) and
+    still won't parse, the parse error is **re-raised**: ``label_communities``
+    catches it per batch and skips that batch (its communities stay unlabeled),
+    re-raising only if every batch fails. Any non-parse exception (network,
+    missing config, programming bug) propagates unchanged — those are never
+    split-retried.
+    """
+    prompt = (
+        "You are naming clusters in a knowledge graph. For each community below, "
+        "return a concise 2-5 word plain-language name describing what it is about "
+        "(e.g. \"Order Management\", \"Payment Flow\", \"Auth Middleware\"). "
+        "Respond ONLY with a JSON object mapping the community id (as a string) to "
+        "its name - no prose, no markdown fences.\n\n" + "\n".join(batch_lines)
+    )
+    max_tokens = _resolve_max_tokens(min(64 + 24 * len(batch_cids), 8192))
+    call_kwargs: dict = {"backend": backend, "max_tokens": max_tokens}
+    if model is not None:
+        call_kwargs["model"] = model
+
+    try:
+        text = _call_llm(prompt, **call_kwargs)
+        return _parse_label_response(text, batch_cids)
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Parse failure. If we can still split, retry each half on a smaller
+        # prompt (smaller output → less likely to truncate/mangle). At the base
+        # case (single community or max depth) re-raise so the caller skips it.
+        if len(batch_cids) <= 1 or depth >= max_depth:
+            print(
+                f"[graphify label] batch of {len(batch_cids)} still unparseable "
+                f"at depth {depth} (cids={batch_cids[:5]}"
+                f"{'...' if len(batch_cids) > 5 else ''}): {exc}",
+                file=sys.stderr,
+            )
+            raise
+        mid = len(batch_cids) // 2
+        left = _label_batch_with_retry(
+            batch_cids[:mid], batch_lines[:mid],
+            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
+        )
+        right = _label_batch_with_retry(
+            batch_cids[mid:], batch_lines[mid:],
+            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
+        )
+        return left | right
+
+
 def label_communities(
     G,
     communities,
@@ -2192,6 +2268,7 @@ def label_communities(
     max_communities: int | None = None,
     top_k: int = _LABEL_TOP_K,
     batch_size: int = _LABEL_BATCH_SIZE,
+    max_concurrency: int = 4,
 ) -> dict[int, str]:
     """Return a complete ``{cid: name}`` map using ``backend`` for naming.
 
@@ -2219,46 +2296,62 @@ def label_communities(
         return labels
 
     n_batches = (len(labeled_cids) + batch_size - 1) // batch_size
-    written = 0
-    first_error: Exception | None = None
-    for batch_idx in range(n_batches):
+
+    # Mirror extract_corpus_parallel's backend guards: Ollama serves one request at
+    # a time per loaded model (parallel batches cause VRAM pressure and hollow
+    # replies, #798) and claude-cli shells out to a single Claude Code session that
+    # parallel subprocesses corrupt. Force serial for these unless the user opts in
+    # via the same env switches.
+    if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    workers = max(1, min(max_concurrency, n_batches))
+
+    def _run_batch(batch_idx: int):
         start = batch_idx * batch_size
         end = min(start + batch_size, len(labeled_cids))
-        batch_lines = lines[start:end]
-        batch_cids = labeled_cids[start:end]
-
-        prompt = (
-            "You are naming clusters in a knowledge graph. For each community below, "
-            "return a concise 2-5 word plain-language name describing what it is about "
-            "(e.g. \"Order Management\", \"Payment Flow\", \"Auth Middleware\"). "
-            "Respond ONLY with a JSON object mapping the community id (as a string) to "
-            "its name - no prose, no markdown fences.\n\n" + "\n".join(batch_lines)
-        )
-        # 24 tok/community covers 2-5 word JSON entries including id, quotes,
-        # and punctuation. Cap at 8192 for 16k-context models. Wrapped in
-        # _resolve_max_tokens so GRAPHIFY_MAX_OUTPUT_TOKENS applies here too (#1200).
-        max_tokens = _resolve_max_tokens(min(64 + 24 * len(batch_cids), 8192))
         try:
-            call_kwargs = {"backend": backend, "max_tokens": max_tokens}
-            if model is not None:
-                call_kwargs["model"] = model
-            text = _call_llm(prompt, **call_kwargs)
-            parsed = _parse_label_response(text, batch_cids)
-            labels.update(parsed)
-            written += len(parsed)
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
+            parsed = _label_batch_with_retry(
+                labeled_cids[start:end], lines[start:end], backend=backend, model=model,
+            )
+            return batch_idx, parsed, None
+        except Exception as exc:  # noqa: BLE001 - reported per-batch; surfaced below
+            return batch_idx, None, exc
+
+    written = 0
+    errors: dict[int, Exception] = {}
+
+    def _merge(batch_idx: int, parsed, exc) -> None:
+        nonlocal written
+        if exc is not None:
+            errors[batch_idx] = exc
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(labeled_cids))
             print(
                 f"[graphify label] batch {batch_idx + 1}/{n_batches} "
-                f"({len(batch_cids)} communities) failed: {exc}",
+                f"({end - start} communities) failed: {exc}",
                 file=sys.stderr,
             )
-            continue
+            return
+        labels.update(parsed)
+        written += len(parsed)
 
-    if written == 0 and first_error is not None:
-        # Every batch failed; propagate so generate_community_labels degrades cleanly.
-        raise first_error
+    # Fan out batches; merge on the main thread so `labels` is never mutated
+    # concurrently. workers == 1 keeps the original sequential path verbatim.
+    if workers == 1:
+        for batch_idx in range(n_batches):
+            _merge(*_run_batch(batch_idx))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_run_batch, b) for b in range(n_batches)]
+            for future in as_completed(futures):
+                _merge(*future.result())
+
+    if written == 0 and errors:
+        # Every batch failed; propagate the lowest-index error so the message is
+        # deterministic and generate_community_labels degrades cleanly.
+        raise errors[min(errors)]
     return labels
 
 
@@ -2270,6 +2363,8 @@ def generate_community_labels(
     model: str | None = None,
     gods=None,
     quiet: bool = False,
+    max_concurrency: int = 4,
+    batch_size: int = _LABEL_BATCH_SIZE,
 ) -> tuple[dict[int, str], str]:
     """CLI entry point: resolve a backend, name communities, and degrade to
     ``Community N`` placeholders on any failure (no backend, API error, malformed
@@ -2289,7 +2384,10 @@ def generate_community_labels(
             )
         return _placeholder_community_labels(communities), "placeholder"
     try:
-        labels = label_communities(G, communities, backend=backend, model=model, gods=gods)
+        labels = label_communities(
+            G, communities, backend=backend, model=model, gods=gods,
+            max_concurrency=max_concurrency, batch_size=batch_size,
+        )
         return labels, "llm"
     except Exception as exc:
         if not quiet:

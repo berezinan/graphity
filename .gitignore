@@ -45,3 +45,6 @@ spikes/arcade/*.out
 spikes/arcade/*.err
 # .NET build output generated from the sample.csproj language fixture.
 tests/fixtures/obj/
+
+# macOS Finder metadata
+.DS_Store
