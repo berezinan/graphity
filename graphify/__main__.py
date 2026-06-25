@@ -3151,8 +3151,35 @@ def main() -> None:
             print(f"Installing ArcadeDB to {_arc.arcade_home()} ...")
             _arc.download()
             print("ArcadeDB installed.")
+        elif sub == "reload":
+            # Drop + full reload of one project's ArcadeDB database from its
+            # graph.json. Recovers a database left inconsistent by a failed
+            # incremental sync without re-running extraction (no API cost).
+            from graphify.query_backend import resolve_backend_config, open_backend
+            arg = sys.argv[3] if len(sys.argv) > 3 else None
+            if not arg:
+                print("Usage: graphify arcade reload <project-dir|graph.json>", file=sys.stderr)
+                sys.exit(2)
+            p = Path(arg)
+            if p.is_dir():
+                cand = p / "graphify-out" / "graph.json"
+                gj = cand if cand.exists() else p / "graph.json"
+            else:
+                gj = p
+            if not gj.exists():
+                print(f"graph.json not found: {gj}", file=sys.stderr)
+                sys.exit(1)
+            cfg = resolve_backend_config(str(gj))
+            if cfg.get("kind") != "arcadedb":
+                print("set GRAPHIFY_BACKEND=arcadedb to reload an ArcadeDB database", file=sys.stderr)
+                sys.exit(2)
+            be = open_backend(config=cfg)
+            print(f"reloading ArcadeDB '{cfg['database']}' from {gj} (drop + full load)...")
+            be.ensure_database(drop=True)
+            st = be.load_from_graph_json(str(gj))
+            print(f"reloaded: {st['nodes']} nodes, {st['edges']} edges")
         else:
-            print("Usage: graphify arcade <start|stop|status|download>", file=sys.stderr)
+            print("Usage: graphify arcade <start|stop|status|download|reload>", file=sys.stderr)
             sys.exit(2)
 
     elif cmd == "diagnose":
