@@ -670,6 +670,15 @@ class ArcadeDBBackend(GraphBackend):
         degree = dict(G.degree())
         changed_ids = [n for n, d in G.nodes(data=True) if d.get("source_file") in changed]
         changed_set = set(changed_ids)
+        # A node id is global to the project, but the dirty-source DELETE above only
+        # removes nodes whose stored source_file is dirty. A shared node whose
+        # representative source_file drifted to a changed file across runs still
+        # lives in the DB under its old (unchanged) source_file, so re-inserting it
+        # by id would hit the UNIQUE Node(id) index (DuplicatedKeyException). Delete
+        # the changed ids directly first; their incident edges are rebuilt below.
+        for i in range(0, len(changed_ids), batch):
+            self._run("DELETE VERTEX FROM Node WHERE id IN :ids",
+                      params={"ids": changed_ids[i:i + batch]})
         keep_n = ("id", "label", "source_file", "source_location", "file_type", "community")
         for i in range(0, len(changed_ids), batch):
             stmts = []

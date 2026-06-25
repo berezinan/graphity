@@ -176,3 +176,33 @@ def test_open_backend_arcadedb_constructs_without_connecting(monkeypatch):
     be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
                               "database": "proj_x", "user": "root", "password": "x"})
     assert isinstance(be, ArcadeDBBackend) and be.db == "proj_x"
+
+
+def test_sync_graph_deletes_changed_ids_before_reinsert(monkeypatch):
+    # Regression: a node id is global to the project, but the dirty-source DELETE
+    # only removes nodes whose stored source_file is dirty. A shared node whose
+    # representative source_file drifted to a changed file across runs still lives
+    # in the DB under its old (unchanged) source, so re-INSERT by id would hit the
+    # UNIQUE Node(id) index (ArcadeDB 409 DuplicatedKeyException). sync_graph must
+    # delete the changed ids directly, before re-inserting them.
+    be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
+                              "database": "proj_x", "user": "root", "password": "x"})
+    calls = []
+    monkeypatch.setattr(be, "_run", lambda q, **kw: calls.append((q, kw)) or [])
+
+    G = nx.DiGraph()
+    G.add_node("shared_id", label="x", source_file="changed.py")
+    G.add_node("n2", label="y", source_file="changed.py")
+    G.add_edge("shared_id", "n2", relation="calls", confidence="EXTRACTED")
+    be.sync_graph(G, changed_sources={"changed.py"}, pruned_sources=set())
+
+    id_deletes = [(i, kw["params"]["ids"]) for i, (q, kw) in enumerate(calls)
+                  if q.startswith("DELETE VERTEX FROM Node WHERE id IN")]
+    assert id_deletes, "sync_graph must delete the changed node ids by id"
+    assert {x for _, ids in id_deletes for x in ids} == {"shared_id", "n2"}
+
+    first_insert = next((i for i, (q, _) in enumerate(calls)
+                         if q.startswith("INSERT INTO Node")), None)
+    assert first_insert is not None, "expected an INSERT INTO Node for the changed nodes"
+    assert all(i < first_insert for i, _ in id_deletes), \
+        "id-delete must precede the re-insert"
