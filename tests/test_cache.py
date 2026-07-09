@@ -420,3 +420,123 @@ def test_save_cached_in_root_symlink_keeps_symlink_name(tmp_path):
         f"cache must store symlink name, not resolved target; got "
         f"{on_disk['nodes'][0]['source_file']!r}"
     )
+
+
+def test_semantic_prune_removes_orphan_entries(tmp_path):
+    """Changing a file's content leaves the old content-hash entry orphaned;
+    pruning against the new live hash removes the stale entry and keeps the
+    current one."""
+    from graphify.cache import prune_semantic_cache
+
+    f = tmp_path / "doc.md"
+    f.write_text("# A\n\nContent A.\n")
+    h_a = file_hash(f, tmp_path)
+    save_cached(f, {"nodes": [{"id": "a"}], "edges": []}, root=tmp_path, kind="semantic")
+
+    f.write_text("# B\n\nContent B.\n")
+    h_b = file_hash(f, tmp_path)
+    save_cached(f, {"nodes": [{"id": "b"}], "edges": []}, root=tmp_path, kind="semantic")
+
+    semantic_dir = cache_dir(tmp_path, "semantic")
+    assert (semantic_dir / f"{h_a}.json").exists()
+    assert (semantic_dir / f"{h_b}.json").exists()
+
+    pruned = prune_semantic_cache(tmp_path, {h_b})
+    assert pruned == 1
+    assert not (semantic_dir / f"{h_a}.json").exists()
+    assert (semantic_dir / f"{h_b}.json").exists()
+
+
+def test_semantic_prune_keeps_live_unchanged_entries(tmp_path):
+    """Pruning against the FULL live set must keep every live entry — guards
+    the trap of pruning against an incremental changed-subset, which would
+    delete all unchanged docs' valid entries."""
+    from graphify.cache import prune_semantic_cache
+
+    live_hashes = set()
+    for i in range(5):
+        f = tmp_path / f"doc{i}.md"
+        f.write_text(f"# Doc {i}\n\nBody {i}.\n")
+        save_cached(f, {"nodes": [{"id": str(i)}], "edges": []}, root=tmp_path, kind="semantic")
+        live_hashes.add(file_hash(f, tmp_path))
+
+    semantic_dir = cache_dir(tmp_path, "semantic")
+    assert len(list(semantic_dir.glob("*.json"))) == 5
+
+    pruned = prune_semantic_cache(tmp_path, live_hashes)
+    assert pruned == 0
+    assert len(list(semantic_dir.glob("*.json"))) == 5
+
+
+def test_semantic_prune_handles_deleted_file(tmp_path):
+    """An entry for a file that no longer exists (dropped from the live set) is
+    pruned."""
+    from graphify.cache import prune_semantic_cache
+
+    f = tmp_path / "gone.md"
+    f.write_text("# Gone\n\nWill be deleted.\n")
+    h = file_hash(f, tmp_path)
+    save_cached(f, {"nodes": [{"id": "g"}], "edges": []}, root=tmp_path, kind="semantic")
+    semantic_dir = cache_dir(tmp_path, "semantic")
+    assert (semantic_dir / f"{h}.json").exists()
+
+    f.unlink()
+    # Live set is empty: the file is gone, so its entry must be pruned.
+    pruned = prune_semantic_cache(tmp_path, set())
+    assert pruned == 1
+    assert not (semantic_dir / f"{h}.json").exists()
+
+
+def test_semantic_prune_ignores_ast_and_tmp(tmp_path):
+    """Prune touches only cache/semantic/*.json: AST entries and atomic-write
+    *.tmp temporaries are left untouched."""
+    from graphify.cache import prune_semantic_cache
+
+    f = tmp_path / "doc.md"
+    f.write_text("# Doc\n\nBody.\n")
+    # AST entry (different subtree) must survive.
+    save_cached(f, {"nodes": [{"id": "ast"}], "edges": []}, root=tmp_path, kind="ast")
+    ast_dir = cache_dir(tmp_path, "ast")
+    assert len(list(ast_dir.glob("*.json"))) == 1
+
+    # A semantic orphan .json (to be pruned) plus a .tmp temporary (to survive).
+    semantic_dir = cache_dir(tmp_path, "semantic")
+    (semantic_dir / "deadbeef.json").write_text('{"nodes": [], "edges": []}')
+    tmp_entry = semantic_dir / "deadbeef.tmp"
+    tmp_entry.write_text("partial")
+
+    pruned = prune_semantic_cache(tmp_path, set())
+    assert pruned == 1
+    assert not (semantic_dir / "deadbeef.json").exists()
+    assert tmp_entry.exists(), "*.tmp temporaries must not be swept"
+    assert len(list(ast_dir.glob("*.json"))) == 1, "AST entries must not be touched"
+
+
+def test_save_semantic_cache_overwrites_by_default(tmp_path):
+    """Default save_semantic_cache replaces a file's cached entry (the final,
+    authoritative write in the extract pipeline)."""
+    from graphify.cache import save_semantic_cache
+    f = tmp_path / "doc.md"; f.write_text("# Doc\n")
+    save_semantic_cache([{"id": "a", "source_file": "doc.md"}], [], root=tmp_path)
+    save_semantic_cache([{"id": "b", "source_file": "doc.md"}], [], root=tmp_path)
+    cached = load_cached(f, root=tmp_path, kind="semantic")
+    ids = {n["id"] for n in cached["nodes"]}
+    assert ids == {"b"}, "default must overwrite, not accumulate"
+
+
+def test_save_semantic_cache_merge_existing_unions(tmp_path):
+    """#1715: merge_existing=True unions with the prior entry so a file split
+    across chunks (checkpointed per chunk) keeps every slice."""
+    from graphify.cache import save_semantic_cache
+    f = tmp_path / "big.md"; f.write_text("# Big\n")
+    # chunk 1 slice
+    save_semantic_cache([{"id": "a", "source_file": "big.md"}],
+                        [{"source": "a", "target": "x", "source_file": "big.md"}],
+                        root=tmp_path, merge_existing=True)
+    # chunk 2 slice for the same file
+    save_semantic_cache([{"id": "b", "source_file": "big.md"}], [],
+                        root=tmp_path, merge_existing=True)
+    cached = load_cached(f, root=tmp_path, kind="semantic")
+    ids = {n["id"] for n in cached["nodes"]}
+    assert ids == {"a", "b"}, "merge_existing must union both chunk slices"
+    assert len(cached["edges"]) == 1

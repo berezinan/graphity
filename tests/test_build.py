@@ -484,7 +484,8 @@ def test_build_from_json_relativizes_absolute_source_file(tmp_path):
         ],
     }
     G = build_from_json(extraction, root=root)
-    sf = G.nodes["overview_intro"]["source_file"]
+    # The id-stem migration (#1504) re-keys the old short id to the full-path form.
+    sf = G.nodes["docs_overview_intro"]["source_file"]
     assert not sf.startswith("/"), f"source_file still absolute: {sf}"
     assert sf == "docs/overview.md"
 
@@ -499,8 +500,102 @@ def test_build_relativizes_absolute_source_file(tmp_path):
         "edges": [],
     }
     G = build([extraction], root=root)
-    sf = G.nodes["main_fn"]["source_file"]
+    # #1504 re-keys main_fn (old stem "main") to the full-path form "src_main".
+    sf = G.nodes["src_main_fn"]["source_file"]
     assert sf == "src/main.py"
+
+
+def test_build_from_json_ambiguous_old_stem_alias_stays_dangling(tmp_path):
+    """The #1504 old-stem alias (e.g. "ping.h" -> bare "ping") is meant to let a
+    stale-id edge from an un-re-extracted fragment still find its own file after
+    a rekey. But the old-stem form drops the extension and most of the path, so
+    two unrelated real files easily collapse onto the same bare alias (a C header
+    and a PHP script both named "ping", in different directories). A dangling
+    edge produced by an unrelated third file's own unscoped fallback id (e.g. the
+    C/C++ extractor's last-resort target for an #include it couldn't resolve to
+    a real path) must not silently ride that alias onto an arbitrary one of them
+    — it should stay dangling and get dropped, same as any other unresolvable
+    edge, rather than wire two unrelated files/languages together by accident."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    extraction = {
+        "nodes": [
+            # Ids given in their canonical (post-extract.py, extension-stripped)
+            # form, matching what a real graphify update run would already have
+            # produced before build_from_json assembles the final graph.
+            {"id": "dev_monitoring_ping", "label": "ping.h", "file_type": "code",
+             "source_file": "Dev/monitoring/ping.h"},
+            {"id": "www_pages_api_ping", "label": "ping.php", "file_type": "code",
+             "source_file": "www/pages/api/ping.php"},
+            {"id": "dev_poker_server", "label": "server.cpp", "file_type": "code",
+             "source_file": "Dev/poker/server.cpp"},
+        ],
+        "edges": [
+            # The unscoped, deliberately-unresolved fallback edge a C/C++ #include
+            # resolver leaves behind when it can't find the header on disk.
+            {"source": "dev_poker_server", "target": "ping", "relation": "imports",
+             "confidence": "EXTRACTED", "source_file": "Dev/poker/server.cpp"},
+        ],
+    }
+    G = build_from_json(extraction, root=root)
+    assert not G.has_edge("dev_poker_server", "dev_monitoring_ping")
+    assert not G.has_edge("dev_poker_server", "www_pages_api_ping")
+
+
+def test_build_from_json_ambiguous_alias_detected_despite_header_impl_salting(tmp_path):
+    """A same-directory .h/.cpp pair collides on their shared pre-extension id
+    and gets salted apart into ids like "tools_aolserver_utility_h_..." — no
+    longer a clean new_stem prefix. The ambiguity check must still recognize
+    the salted header as a legitimate claimant for the bare old-stem alias (by
+    label, not id shape), so a real collision with an unrelated same-named PHP
+    file is still caught instead of the header silently dropping out of the
+    race and leaving the PHP file as the lone "unambiguous" winner (this
+    reproduced against the real depot: Tools/aolserver/utility.h and .cpp,
+    salted apart, let wwwapi.masque.com/pages/utility.php win the bare
+    "utility" alias uncontested)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    extraction = {
+        "nodes": [
+            {"id": "tools_aolserver_utility_h_tools_aolserver_utility", "label": "utility.h",
+             "file_type": "code", "source_file": "Tools/aolserver/utility.h"},
+            {"id": "tools_aolserver_utility_cpp_tools_aolserver_utility", "label": "utility.cpp",
+             "file_type": "code", "source_file": "Tools/aolserver/utility.cpp"},
+            {"id": "wwwapi_masque_com_pages_utility", "label": "utility.php",
+             "file_type": "code", "source_file": "wwwapi.masque.com/pages/utility.php"},
+            {"id": "dev_poker_server", "label": "server.cpp", "file_type": "code",
+             "source_file": "Dev/poker/server.cpp"},
+        ],
+        "edges": [
+            {"source": "dev_poker_server", "target": "utility", "relation": "imports",
+             "confidence": "EXTRACTED", "source_file": "Dev/poker/server.cpp"},
+        ],
+    }
+    G = build_from_json(extraction, root=root)
+    assert not G.has_edge("dev_poker_server", "wwwapi_masque_com_pages_utility")
+    assert not G.has_edge("dev_poker_server", "tools_aolserver_utility_h_tools_aolserver_utility")
+
+
+def test_build_from_json_unambiguous_old_stem_alias_still_resolves(tmp_path):
+    """Companion to the ambiguous case above: when exactly one real file claims
+    an old-stem alias, a dangling edge to that bare alias should still resolve
+    to it — the #1504 migration-compat behavior this index exists for."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    extraction = {
+        "nodes": [
+            {"id": "dev_monitoring_utility", "label": "utility.h", "file_type": "code",
+             "source_file": "Dev/monitoring/utility.h"},
+            {"id": "dev_poker_server", "label": "server.cpp", "file_type": "code",
+             "source_file": "Dev/poker/server.cpp"},
+        ],
+        "edges": [
+            {"source": "dev_poker_server", "target": "utility", "relation": "imports",
+             "confidence": "EXTRACTED", "source_file": "Dev/poker/server.cpp"},
+        ],
+    }
+    G = build_from_json(extraction, root=root)
+    assert G.has_edge("dev_poker_server", "dev_monitoring_utility")
 
 
 def test_build_from_json_relative_source_file_unchanged(tmp_path):
@@ -510,7 +605,8 @@ def test_build_from_json_relative_source_file_unchanged(tmp_path):
         "edges": [],
     }
     G = build_from_json(extraction, root=tmp_path)
-    assert G.nodes["foo_bar"]["source_file"] == "src/foo.py"
+    # source_file must be untouched; the id is re-keyed to the full-path form (#1504).
+    assert G.nodes["src_foo_bar"]["source_file"] == "src/foo.py"
 
 
 def test_build_merge_prune_absolute_paths_match_relative_nodes(tmp_path):
@@ -662,8 +758,9 @@ def test_build_merge_root_collapses_convention_drift(tmp_path):
     ], "edges": []}
     G_ok = build_merge([fixed], graph_path, prune_sources=None, dedup=False, root=root)
     assert G_ok.number_of_nodes() == 1, "verbatim path + root must collapse to one node"
-    assert "wiki_overview_stale" not in G_ok, "stale node for the re-extracted file must be dropped"
-    assert G_ok.nodes["wiki_overview_overview"]["source_file"] == "docs/wiki/overview.md", \
+    # #1504 re-keys the author-chosen short ids to the canonical full-path stem.
+    assert "docs_wiki_overview_stale" not in G_ok, "stale node for the re-extracted file must be dropped"
+    assert G_ok.nodes["docs_wiki_overview_overview"]["source_file"] == "docs/wiki/overview.md", \
         "new chunk must be canonicalized to the stored relative base"
 
 
@@ -773,3 +870,34 @@ def test_build_from_json_skips_edge_with_non_hashable_endpoint():
     assert G.number_of_nodes() == 2
     assert G.number_of_edges() == 1
     assert G.has_edge("a", "b")
+
+
+# ── #1504 migration: legacy-id detection + re-key source_file contract ──────────
+
+def test_graph_has_legacy_ids_detects_old_scheme():
+    """The read-only-consumer nudge (query/serve) flags a pre-#1504 graph and
+    leaves a canonical one alone."""
+    from graphify.build import graph_has_legacy_ids
+    old = [{"id": "api_readme", "source_file": "docs/v1/api/README.md", "type": "document", "source_location": "L1"}]
+    new = [{"id": "docs_v1_api_readme", "source_file": "docs/v1/api/README.md", "type": "document", "source_location": "L1"}]
+    assert graph_has_legacy_ids(old, root=".") is True
+    assert graph_has_legacy_ids(new, root=".") is False
+    # sourceless / top-level file nodes don't false-positive
+    assert graph_has_legacy_ids([{"id": "setup", "source_file": "setup.py", "source_location": "L1"}], root=".") is False
+    assert graph_has_legacy_ids([{"id": "x", "label": "y"}], root=".") is False
+    # package/dir-scoped SYMBOL ids (Go's _make_id(pkg_dir, name) -> "sub_thing") must
+    # NOT false-positive: not file-level (no L1), so ignored even though "sub_thing"
+    # coincides with the old file-stem form of pkg/sub/thing.go.
+    go_symbol = [{"id": "sub_thing", "source_file": "pkg/sub/thing.go", "type": "code", "source_location": "L3"}]
+    assert graph_has_legacy_ids(go_symbol, root=".") is False
+
+
+def test_semantic_rekey_relative_vs_absolute_source_file():
+    """Re-key contract: a relative source_file is migrated; an absolute one is left
+    untouched (it can't be relativized, so its on-disk path must not leak into IDs)."""
+    from graphify.build import _semantic_id_remap
+    rel = [{"id": "api_readme", "source_file": "docs/v1/api/README.md", "type": "document"}]
+    assert _semantic_id_remap(rel, ".") == {"api_readme": "docs_v1_api_readme"}
+    # absolute path with no resolvable root → skipped, not remapped to an abs-path id
+    ab = [{"id": "api_readme", "source_file": "/abs/docs/v1/api/README.md", "type": "document"}]
+    assert _semantic_id_remap(ab, None) == {}

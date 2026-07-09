@@ -37,11 +37,54 @@ def _make_id(*parts: str) -> str:
 
 
 def _file_stem(path: Path) -> str:
-    parent = path.parent.name
-    if parent and parent not in (".", ""):
-        return f"{parent}.{path.stem}"
-    return path.stem
+    """Stem used as the node-ID prefix for a file and its symbols.
+
+    The full path (extension dropped) is preserved as path segments; ``make_id``
+    later collapses the separators to underscores. Using every segment — not just
+    the immediate parent dir (#1504) — means same-named files in different
+    directories get distinct IDs instead of colliding into one
+    last-writer-wins node:
+
+        docs/v1/api/README.md -> docs/v1/api/README -> docs_v1_api_readme
+        docs/v2/api/README.md -> docs/v2/api/README -> docs_v2_api_readme
+
+    Top-level files keep a bare stem (``setup.py`` -> ``setup``). When passed an
+    absolute path the whole path is encoded; the extract() id-remap post-pass
+    re-derives the canonical repo-relative form from ``source_file`` so the on-disk
+    location can't leak into the persisted IDs (#502).
+
+    Returns "" for a path with no name (``Path('.')`` — a source_file that equals
+    the scan root, so it has no per-file stem). Guarding here keeps
+    ``path.with_suffix("")`` from raising ``ValueError: '.' has an empty name`` and
+    protects every caller, not just ``_semantic_id_remap`` (#1618)."""
+    if not path.name:
+        return ""
+    return path.with_suffix("").as_posix()
 
 
 def _read_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+
+# Size cap for project XML files we parse with stdlib ElementTree.
+# Real .csproj/.fsproj/.vbproj/.lpk files are well under 2 MiB; anything
+# larger is either malformed or hostile.
+_PROJECT_XML_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _project_xml_is_safe(src: bytes) -> bool:
+    """Reject XML that declares DTDs or entities.
+
+    Stdlib ``xml.etree.ElementTree`` does not cap entity expansion, so a
+    crafted project file could trigger a billion-laughs style DoS. External
+    entity resolution is already disabled by pyexpat defaults, but rejecting
+    ``<!DOCTYPE`` / ``<!ENTITY`` outright is defense in depth.
+
+    Legitimate MSBuild and Lazarus package files never contain a DOCTYPE
+    or ENTITY declaration, so this is a zero-false-positive screen.
+    """
+    # Only the prolog can hold a DTD/internal subset, but be conservative
+    # and scan the full byte range -- these formats use ASCII tags so a
+    # case-insensitive substring match is sufficient.
+    lowered = src.lower()
+    return b"<!doctype" not in lowered and b"<!entity" not in lowered
