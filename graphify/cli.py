@@ -861,7 +861,9 @@ def dispatch_command(cmd: str) -> None:
             token_budget=budget,
             duration_ms=(_time.perf_counter() - _t0) * 1000,
         )
-        _touch_query_stamp(gp)
+        # graph_path, not gp: the arcadedb branch never binds gp, and the stamp
+        # lives next to the project's graph.json either way.
+        _touch_query_stamp(Path(graph_path))
         print(_result)
     elif cmd == "affected":
         if len(sys.argv) < 3:
@@ -1086,7 +1088,9 @@ def dispatch_command(cmd: str) -> None:
             corpus=_corpus,
             nodes_returned=result.hops,
         )
-        _touch_query_stamp(gp)
+        # graph_path, not gp: the arcadedb branch never binds gp, and the stamp
+        # lives next to the project's graph.json either way.
+        _touch_query_stamp(Path(graph_path))
 
     elif cmd == "explain":
         if len(sys.argv) < 3:
@@ -1158,7 +1162,9 @@ def dispatch_command(cmd: str) -> None:
             corpus=_corpus,
             nodes_returned=len(result.connections),
         )
-        _touch_query_stamp(gp)
+        # graph_path, not gp: the arcadedb branch never binds gp, and the stamp
+        # lives next to the project's graph.json either way.
+        _touch_query_stamp(Path(graph_path))
 
     elif cmd == "arcade":
         from graphify import arcade_server as _arc
