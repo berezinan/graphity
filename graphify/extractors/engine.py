@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
+from graphify.ids import normalize_id
 from graphify.extractors.models import LanguageConfig
 from graphify.extractors.resolution import _resolve_js_import_target
 from graphify.security import sanitize_metadata
@@ -381,6 +382,158 @@ def _java_collect_type_refs(
             if c.is_named:
                 _java_collect_type_refs(c, source, generic, out, skip)
 
+
+def _java_receiver_type_name(type_node, source: bytes) -> str | None:
+    """Return the concrete declared type usable for Java receiver resolution."""
+    if type_node is None:
+        return None
+    t = type_node.type
+    if t == "type_identifier":
+        name = _read_text(type_node, source)
+    elif t == "scoped_type_identifier":
+        name = _read_text(type_node, source).rsplit(".", 1)[-1]
+    elif t == "generic_type":
+        base = next(
+            (
+                child
+                for child in type_node.children
+                if child.type in ("type_identifier", "scoped_type_identifier")
+            ),
+            None,
+        )
+        return _java_receiver_type_name(base, source)
+    else:
+        return None
+    if (
+        not name
+        or name in _JAVA_BUILTIN_TYPES
+        or name in _java_type_parameters_in_scope(type_node, source)
+    ):
+        return None
+    return name
+
+
+def _java_declarator_names(declaration_node, source: bytes) -> list[str]:
+    names: list[str] = []
+    for child in declaration_node.children:
+        if child.type != "variable_declarator":
+            continue
+        name_node = child.child_by_field_name("name")
+        if name_node is not None:
+            name = _read_text(name_node, source)
+            if name:
+                names.append(name)
+    return names
+
+
+def _java_lambda_parameters(
+    lambda_node,
+    source: bytes,
+) -> list[tuple[str, str | None]]:
+    parameters = lambda_node.child_by_field_name("parameters")
+    if parameters is None:
+        return []
+    if parameters.type == "identifier":
+        return [(_read_text(parameters, source), None)]
+    if parameters.type == "inferred_parameters":
+        return [
+            (_read_text(child, source), None)
+            for child in parameters.children
+            if child.type == "identifier"
+        ]
+    bindings: list[tuple[str, str | None]] = []
+    for parameter in parameters.children:
+        if parameter.type not in ("formal_parameter", "spread_parameter"):
+            continue
+        name_node = parameter.child_by_field_name("name")
+        if name_node is not None:
+            bindings.append((
+                _read_text(name_node, source),
+                _java_receiver_type_name(
+                    parameter.child_by_field_name("type"), source
+                ),
+            ))
+    return bindings
+
+
+def _java_method_receiver_types(
+    method_node,
+    source: bytes,
+    field_types: dict[str, str],
+) -> dict[str, str]:
+    """Build the receiver type table visible to one Java method.
+
+    Current-class fields are the base scope, and parameters shadow them for the
+    full method. Conflicting local declarations are omitted because raw call
+    facts do not retain lexical scope.
+    """
+    method_types: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def bind(name: str, type_name: str | None) -> None:
+        if not name or not type_name or name in ambiguous:
+            return
+        previous = method_types.get(name)
+        if previous is not None and previous != type_name:
+            method_types.pop(name, None)
+            ambiguous.add(name)
+        else:
+            method_types[name] = type_name
+
+    params = method_node.child_by_field_name("parameters")
+    if params is not None:
+        for param in params.children:
+            if param.type not in ("formal_parameter", "spread_parameter"):
+                continue
+            type_name = _java_receiver_type_name(
+                param.child_by_field_name("type"), source
+            )
+            name_node = param.child_by_field_name("name")
+            if name_node is not None:
+                bind(_read_text(name_node, source), type_name)
+
+    body = method_node.child_by_field_name("body")
+    stack = list(body.children) if body is not None else []
+    while stack:
+        node = stack.pop()
+        if node.type in (
+            "class_declaration",
+            "class_body",
+            "interface_declaration",
+            "record_declaration",
+            "enum_declaration",
+            "annotation_type_declaration",
+        ):
+            continue
+        if node.type == "lambda_expression":
+            # Raw calls are method-scoped, so a lambda-local binding cannot be
+            # distinguished from an enclosing binding with the same name.
+            for name, type_name in _java_lambda_parameters(node, source):
+                if type_name is None or field_types.get(name) not in (None, type_name):
+                    method_types.pop(name, None)
+                    ambiguous.add(name)
+                else:
+                    bind(name, type_name)
+        if node.type == "local_variable_declaration":
+            type_name = _java_receiver_type_name(
+                node.child_by_field_name("type"), source
+            )
+            for name in _java_declarator_names(node, source):
+                if field_types.get(name) not in (None, type_name):
+                    method_types.pop(name, None)
+                    ambiguous.add(name)
+                else:
+                    bind(name, type_name)
+        stack.extend(node.children)
+
+    table = dict(field_types)
+    table.update(method_types)
+    for name in ambiguous:
+        table.pop(name, None)
+    table.update({f"this.{name}": type_name for name, type_name in field_types.items()})
+    return table
+
+
 def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
     """Collect annotation names from a Java declaration's `modifiers` child."""
     names: list[str] = []
@@ -455,6 +608,35 @@ def _php_method_return_type_node(method_node):
                 return c
     return None
 
+# Kotlin stdlib scalar/collection/core types that appear constantly as type
+# annotations but carry no useful semantic meaning as graph nodes (mirrors
+# _JAVA_BUILTIN_TYPES / _PYTHON_ANNOTATION_NOISE / _GO_PREDECLARED_TYPES).
+# Kotlin compiles to the JVM and freely references java.* types too, so this
+# is combined with _JAVA_BUILTIN_TYPES at the call site rather than duplicated.
+_KOTLIN_BUILTIN_TYPES = frozenset({
+    # kotlin — scalars & core
+    "Any", "Unit", "Nothing", "Boolean", "Byte", "Short", "Int", "Long",
+    "Float", "Double", "Char", "String", "CharSequence", "Number",
+    "Comparable", "Enum", "Annotation", "Pair", "Triple", "Lazy",
+    "Function",
+    # kotlin — throwables
+    "Throwable", "Exception", "RuntimeException", "Error",
+    "IllegalArgumentException", "IllegalStateException", "NullPointerException",
+    "IndexOutOfBoundsException", "ClassCastException", "NumberFormatException",
+    "ArithmeticException", "UnsupportedOperationException",
+    "NoSuchElementException", "ConcurrentModificationException",
+    "StackOverflowError", "OutOfMemoryError", "AssertionError",
+    "InterruptedException",
+    # kotlin.collections
+    "Array", "List", "MutableList", "ArrayList", "Set", "MutableSet",
+    "HashSet", "LinkedHashSet", "Map", "MutableMap", "HashMap",
+    "LinkedHashMap", "Collection", "MutableCollection", "Iterable",
+    "MutableIterable", "Iterator", "MutableIterator", "ListIterator",
+    "MutableListIterator", "Sequence", "Comparator",
+    # kotlin.text
+    "Regex", "MatchResult", "StringBuilder",
+})
+
 def _kotlin_user_type_name(user_type_node, source: bytes) -> str | None:
     """Return the head identifier text from a Kotlin user_type node (without generics)."""
     if user_type_node is None:
@@ -484,14 +666,14 @@ def _kotlin_collect_type_refs(node, source: bytes, generic: bool, out: list[tupl
         for c in node.children:
             if c.type in ("identifier", "type_identifier"):
                 text = _read_text(c, source)
-                if text:
+                if text and text not in _KOTLIN_BUILTIN_TYPES and text not in _JAVA_BUILTIN_TYPES:
                     out.append((text, "generic_arg" if generic else "type"))
                 break
             if c.type == "simple_user_type":
                 for sub in c.children:
                     if sub.type in ("identifier", "type_identifier"):
                         text = _read_text(sub, source)
-                        if text:
+                        if text and text not in _KOTLIN_BUILTIN_TYPES and text not in _JAVA_BUILTIN_TYPES:
                             out.append((text, "generic_arg" if generic else "type"))
                         break
                 break
@@ -507,7 +689,7 @@ def _kotlin_collect_type_refs(node, source: bytes, generic: bool, out: list[tupl
         return
     if t in ("identifier", "type_identifier"):
         text = _read_text(node, source)
-        if text:
+        if text and text not in _KOTLIN_BUILTIN_TYPES and text not in _JAVA_BUILTIN_TYPES:
             out.append((text, "generic_arg" if generic else "type"))
         return
     if t in ("nullable_type", "parenthesized_type", "type_reference"):
@@ -1076,11 +1258,11 @@ def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edge
         resolved = _resolve_js_import_target(raw, str_path)
         if resolved is None:
             break
-        tgt_nid, _ = resolved
+        tgt_nid, resolved_path = resolved
         pair = (caller_nid, tgt_nid)
         if pair not in seen_dyn_pairs:
             seen_dyn_pairs.add(pair)
-            edges.append({
+            edge = {
                 "source": caller_nid,
                 "target": tgt_nid,
                 # A deferred `import(...)` is a real dependency, so keep it as an
@@ -1094,7 +1276,12 @@ def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edge
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
                 "weight": 1.0,
-            })
+            }
+            # Key the target salt by the resolved target file so a same-basename
+            # cross-extension sibling isn't mis-salted onto the importer (#1814).
+            if resolved_path is not None:
+                edge["target_file"] = str(resolved_path)
+            edges.append(edge)
         break
     return True
 
@@ -1388,7 +1575,7 @@ def _require_imports_js(node, source: bytes, file_nid: str, stem: str, edges: li
             continue
         tgt_nid, resolved_path = resolved
         line = node.start_point[0] + 1
-        edges.append({
+        edge = {
             "source": file_nid,
             "target": tgt_nid,
             "relation": "imports_from",
@@ -1397,7 +1584,12 @@ def _require_imports_js(node, source: bytes, file_nid: str, stem: str, edges: li
             "source_file": str_path,
             "source_location": f"L{line}",
             "weight": 1.0,
-        })
+        }
+        # Key the target salt by the resolved target file so a same-basename
+        # cross-extension sibling isn't mis-salted onto the importer (#1814).
+        if resolved_path is not None:
+            edge["target_file"] = str(resolved_path)
+        edges.append(edge)
         found = True
 
         # Symbol-level edges for destructured / accessor binders.
@@ -1579,6 +1771,11 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                         if name_node:
                             func_name = _read_text(name_node, source)
                             line = child.start_point[0] + 1
+                            # A name that normalizes to nothing (e.g. minified `$`)
+                            # would collapse the id to the absolute file-stem and
+                            # leak the scan path (#1899); skip it (no graph signal).
+                            if not normalize_id(func_name):
+                                continue
                             func_nid = _make_id(stem, func_name)
                             add_node_fn(func_nid, f"{func_name}()", line)
                             add_edge_fn(file_nid, func_nid, "contains", line)
@@ -2034,6 +2231,10 @@ def _extract_generic(
     # threaded out as `swift_type_table` so member calls (`vm.update()`) can be
     # resolved to the receiver's real definition in _resolve_swift_member_calls.
     type_table: dict[str, str] = {}
+    # Java receiver typing is method-scoped: current-class fields are shared,
+    # while parameters and locals belong only to their declaring method.
+    java_field_types: dict[str, dict[str, str]] = {}
+    java_method_scopes: dict[int, tuple[object, str]] = {}
 
     csharp_interface_names: set[str] = set()
     if config.ts_module == "tree_sitter_c_sharp":
@@ -2768,6 +2969,11 @@ def _extract_generic(
                 and parent_class_nid):
             type_node = node.child_by_field_name("type")
             if type_node is not None:
+                receiver_type = _java_receiver_type_name(type_node, source)
+                if receiver_type:
+                    fields = java_field_types.setdefault(parent_class_nid, {})
+                    for field_name in _java_declarator_names(node, source):
+                        fields[field_name] = receiver_type
                 line = node.start_point[0] + 1
                 refs: list[tuple[str, str]] = []
                 _java_collect_type_refs(type_node, source, False, refs)
@@ -2933,6 +3139,11 @@ def _extract_generic(
                 func_name = _read_text(name_node, source) if name_node else None
 
             if not func_name:
+                return
+            # A name that normalizes to nothing collapses `_make_id(prefix, name)`
+            # onto the (absolute-path-derived) prefix, leaking the scan path and
+            # colliding with the file/class node (#1899). No graph signal; skip.
+            if not normalize_id(func_name):
                 return
 
             line = node.start_point[0] + 1
@@ -3288,6 +3499,8 @@ def _extract_generic(
                     if m_body:
                         function_bodies.append((m_nid, m_body))
             if body:
+                if config.ts_module == "tree_sitter_java" and parent_class_nid:
+                    java_method_scopes[id(body)] = (node, parent_class_nid)
                 function_bodies.append((func_nid, body))
             return
 
@@ -3387,6 +3600,14 @@ def _extract_generic(
     # populated before walk_calls runs. Lets member-call raw_calls carry a
     # receiver_type so the cross-file pass resolves `var.method` by type (#ruby).
     ruby_var_types: dict[str, dict[str, str | None]] = {}
+    java_receiver_types = {
+        body_id: _java_method_receiver_types(
+            method_node,
+            source,
+            java_field_types.get(class_nid, {}),
+        )
+        for body_id, (method_node, class_nid) in java_method_scopes.items()
+    }
 
     def _emit_indirect_by_name(ident_name: str, loc_node, scope_nid: str,
                                context: str) -> None:
@@ -3529,7 +3750,11 @@ def _extract_generic(
     _tracked_body_ids: set[int] = set()
     _JS_CLOSURE_TYPES = ("arrow_function", "function_expression")
 
-    def walk_calls(node, caller_nid: str) -> None:
+    def walk_calls(
+        node,
+        caller_nid: str,
+        java_types: dict[str, str] | None = None,
+    ) -> None:
         if node.type in config.function_boundary_types:
             # JS/TS: an inline/returned closure not separately tracked in
             # function_bodies would otherwise drop its calls at this boundary.
@@ -3542,7 +3767,7 @@ def _extract_generic(
                 body = node.child_by_field_name("body")
                 if body is not None and id(body) not in _tracked_body_ids:
                     for child in node.children:
-                        walk_calls(child, caller_nid)
+                        walk_calls(child, caller_nid, java_types)
             return
 
         if node.type in config.call_types:
@@ -3552,7 +3777,7 @@ def _extract_generic(
                                       edges, seen_dyn_import_pairs):
                     # Still recurse into children (import().then(...) may have calls)
                     for child in node.children:
-                        walk_calls(child, caller_nid)
+                        walk_calls(child, caller_nid, java_types)
                     return
 
             callee_name: str | None = None
@@ -3699,16 +3924,32 @@ def _extract_generic(
                         scope = func_node.child_by_field_name("scope")
                         if scope is not None:
                             member_receiver = _read_text(scope, source)
-            elif config.ts_module == "tree_sitter_java" and node.type == "object_creation_expression":
-                # `new Foo(...)` — the constructed type is in the `type` field, not
-                # `name`, so the generic path misses it (#1373). Reduce a qualified
-                # / generic type to its simple name (com.a.Foo<Bar> -> Foo). Java
-                # method_invocation still flows through the generic branch below.
-                type_node = node.child_by_field_name("type")
-                if type_node is not None:
-                    raw = _read_text(type_node, source).split("<", 1)[0].strip()
-                    if raw:
-                        callee_name = raw.rsplit(".", 1)[-1]
+            elif config.ts_module == "tree_sitter_java":
+                if node.type == "object_creation_expression":
+                    # `new Foo(...)` — the constructed type is in the `type` field,
+                    # not `name`, so the generic path misses it (#1373).
+                    type_node = node.child_by_field_name("type")
+                    if type_node is not None:
+                        raw = _read_text(type_node, source).split("<", 1)[0].strip()
+                        if raw:
+                            callee_name = raw.rsplit(".", 1)[-1]
+                elif node.type == "method_invocation":
+                    name_node = node.child_by_field_name("name")
+                    if name_node is not None:
+                        callee_name = _read_text(name_node, source)
+                    receiver = node.child_by_field_name("object")
+                    if receiver is not None:
+                        is_member_call = True
+                        if receiver.type == "identifier":
+                            member_receiver = _read_text(receiver, source)
+                        elif receiver.type == "this":
+                            member_receiver = "this"
+                        elif receiver.type == "field_access":
+                            owner = receiver.child_by_field_name("object")
+                            field = receiver.child_by_field_name("field")
+                            if owner is not None and owner.type == "this" and field is not None:
+                                member_receiver = f"this.{_read_text(field, source)}"
+                                is_this_field_call = True
             elif config.ts_module == "tree_sitter_ruby":
                 # Ruby's `call` node carries `receiver` and `method` as direct
                 # fields (no intermediate accessor node), so the generic accessor
@@ -3778,8 +4019,17 @@ def _extract_generic(
                     config.ts_module == "tree_sitter_c_sharp"
                     and is_member_call and member_receiver
                 )
-                if is_member_call and member_receiver and (
-                    member_receiver[:1].isupper() or is_this_field_call or _csharp_defer
+                _java_defer = (
+                    config.ts_module == "tree_sitter_java" and is_member_call
+                )
+                if _java_defer or (
+                    is_member_call
+                    and member_receiver
+                    and (
+                        member_receiver[:1].isupper()
+                        or is_this_field_call
+                        or _csharp_defer
+                    )
                 ):
                     tgt_nid = None
                 else:
@@ -3826,6 +4076,11 @@ def _extract_generic(
                     # type table (#1609).
                     if config.ts_module == "tree_sitter_c_sharp":
                         rc_entry["lang"] = "csharp"
+                    if config.ts_module == "tree_sitter_java":
+                        rc_entry["lang"] = "java"
+                        receiver_type = (java_types or {}).get(member_receiver or "")
+                        if receiver_type:
+                            rc_entry["receiver_type"] = receiver_type
                     raw_calls.append(rc_entry)
 
             # Indirect dispatch: a function passed BY NAME as a call argument
@@ -4032,7 +4287,7 @@ def _extract_generic(
                 _emit_indirect_ref(ident, caller_nid, enclosing_locals, "return")
 
         for child in node.children:
-            walk_calls(child, caller_nid)
+            walk_calls(child, caller_nid, java_types)
 
     if config.ts_module == "tree_sitter_ruby":
         for caller_nid, body_node in function_bodies:
@@ -4062,7 +4317,11 @@ def _extract_generic(
     _tracked_body_ids.update(id(b) for _, b in function_bodies)
 
     for caller_nid, body_node in function_bodies:
-        walk_calls(body_node, caller_nid)
+        walk_calls(
+            body_node,
+            caller_nid,
+            java_receiver_types.get(id(body_node)),
+        )
 
     # #1356: walk property/field initializers (collected above). walk_calls
     # self-guards against re-entering function bodies and dedups via

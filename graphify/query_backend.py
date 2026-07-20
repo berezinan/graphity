@@ -34,6 +34,7 @@ from graphify.serve import (
     _find_node,
     _hub_threshold,
     _idf_value,
+    _pick_scored_endpoint,
     _pick_seeds,
     _query_terms,
     _resolve_context_filters,
@@ -317,12 +318,16 @@ class JsonBackend(GraphBackend):
             return PathResult(found=False, reason=f"no-source")
         if not tgt_scored:
             return PathResult(found=False, reason=f"no-target")
-        s_id, t_id = src_scored[0][1], tgt_scored[0][1]
+        # Full-token label matches win over the raw score head (#1785).
+        s_id = _pick_scored_endpoint(G, src_scored, source)
+        t_id = _pick_scored_endpoint(G, tgt_scored, target)
         if s_id == t_id:
             return PathResult(found=False, reason="same-node", start_label=s_id)
         warnings: list[str] = []
-        for name, scored in (("source", src_scored), ("target", tgt_scored)):
-            if len(scored) >= 2:
+        for name, scored, nid in (("source", src_scored, s_id), ("target", tgt_scored, t_id)):
+            # Only meaningful when the raw score head is what got picked — a
+            # full-token override was chosen on token coverage, not score.
+            if len(scored) >= 2 and nid == scored[0][1]:
                 top, runner = scored[0][0], scored[1][0]
                 if top > 0 and (top - runner) / top < 0.10:
                     warnings.append(f"warning: {name} match was ambiguous (top score {top:g}, runner-up {runner:g})")

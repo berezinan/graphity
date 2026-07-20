@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from graphify.extractors.base import _file_stem, _make_id, _read_text
+from graphify.ids import normalize_id
 
 
 _CONFIG_JSON_NAMES = frozenset({
@@ -90,10 +91,10 @@ def extract_json(path: Path) -> dict:
         "optionalDependencies", "bundleDependencies", "bundledDependencies",
     })
 
-    def add_node(nid: str, label: str, line: int) -> None:
+    def add_node(nid: str, label: str, line: int, file_type: str = "code") -> None:
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({"id": nid, "label": label, "file_type": "code",
+            nodes.append({"id": nid, "label": label, "file_type": file_type,
                           "source_file": str_path, "source_location": f"L{line}"})
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -140,6 +141,12 @@ def extract_json(path: Path) -> dict:
             key = _key_text(child)
             if not key:
                 continue
+            # A key that normalizes to nothing (a JSONC `"//"` comment key, say)
+            # would collapse `_make_id(stem, key)` down to the bare file-stem id,
+            # which is absolute-path-derived and leaks the scan path (#1899). Such
+            # keys carry no graph signal, so drop them.
+            if not normalize_id(key):
+                continue
             key_nid = _make_id(stem, *(([parent_key] if parent_key else []) + [key]))
             if not key_nid:
                 continue
@@ -165,6 +172,7 @@ def extract_json(path: Path) -> dict:
                         if ref:
                             ref_nid = _make_id("ref", ref)
                             if ref_nid:
+                                add_node(ref_nid, ref, line, file_type="concept")
                                 add_edge(key_nid, ref_nid, "extends", line, context="import")
 
             elif val.type == "string":
@@ -175,6 +183,7 @@ def extract_json(path: Path) -> dict:
                     # Namespace external refs to avoid ID collision with file nodes (J-4)
                     ref_nid = _make_id("ref", val_text)
                     if ref_nid:
+                        add_node(ref_nid, val_text, line, file_type="concept")
                         add_edge(file_nid, ref_nid, "extends", line, context="import")
 
                 elif key == "$ref" and val_text:
@@ -186,6 +195,7 @@ def extract_json(path: Path) -> dict:
                 elif parent_key in _DEP_KEYS and val_text:
                     dep_nid = _make_id(key)
                     if dep_nid:
+                        add_node(dep_nid, key, line, file_type="concept")
                         add_edge(key_nid, dep_nid, "imports", line, context="import")
 
     # Entry: find root document → object

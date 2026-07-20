@@ -58,6 +58,48 @@ def test_build_from_json_edge_count():
     G = build_from_json(load_extraction())
     assert G.number_of_edges() == 4
 
+def test_null_weight_edge_builds_and_clusters(tmp_path):
+    """#1960: an explicit ``"weight": null`` (JSON null -> None) used to survive
+    ``.get("weight", 1.0)`` and crash Louvain/Leiden modularity with a TypeError.
+    It must now coerce to the 1.0 default, build, and cluster without raising."""
+    from graphify.cluster import cluster
+    extraction = {
+        "nodes": [
+            {"id": "a", "label": "A", "file_type": "code", "source_file": "a.py"},
+            {"id": "b", "label": "B", "file_type": "code", "source_file": "b.py"},
+            {"id": "c", "label": "C", "file_type": "code", "source_file": "c.py"},
+        ],
+        "edges": [
+            {"source": "a", "target": "b", "relation": "references", "weight": None,
+             "confidence_score": None},
+            {"source": "b", "target": "c", "relation": "references", "weight": 2.5},
+        ],
+    }
+    G = build_from_json(extraction)
+    assert G["a"]["b"]["weight"] == 1.0            # null coerced to default
+    assert G["a"]["b"]["confidence_score"] == 1.0  # null confidence_score too
+    assert G["b"]["c"]["weight"] == 2.5            # a valid weight is preserved
+    cluster(G)  # must not raise (Louvain/Leiden modularity)
+
+
+def test_malformed_weights_normalize():
+    """Non-numeric / NaN / inf / negative weights fall back to 1.0 (the backends
+    reject them); a missing weight key is left absent (backends default it)."""
+    extraction = {
+        "nodes": [{"id": f"n{i}", "label": str(i), "file_type": "code",
+                   "source_file": f"{i}.py"} for i in range(4)],
+        "edges": [
+            {"source": "n0", "target": "n1", "relation": "references", "weight": "3.5"},
+            {"source": "n1", "target": "n2", "relation": "references", "weight": float("nan")},
+            {"source": "n2", "target": "n3", "relation": "references", "weight": -4},
+        ],
+    }
+    G = build_from_json(extraction)
+    assert G["n0"]["n1"]["weight"] == 3.5     # numeric string coerces
+    assert G["n1"]["n2"]["weight"] == 1.0     # NaN -> default
+    assert G["n2"]["n3"]["weight"] == 1.0     # negative -> default
+
+
 def test_nodes_have_label():
     G = build_from_json(load_extraction())
     assert G.nodes["n_transformer"]["label"] == "Transformer"
@@ -255,6 +297,41 @@ def test_ghost_merge_skipped_on_basename_collision():
     assert G.has_edge("caller", "ghost_render")
     assert not G.has_edge("caller", "a_render")
     assert not G.has_edge("caller", "b_render")
+
+
+def test_ghost_merge_non_ast_different_files_both_survive():
+    """#1753: two NON-AST (semantic) nodes sharing (basename, label) but from
+    DIFFERENT files are distinct concepts with no AST canonical twin. They must
+    not be merged into an arbitrary survivor (which flipped run-to-run with the
+    hash seed); both survive, mirroring the AST/AST guard (#1257)."""
+    ext = {
+        "nodes": [
+            {"id": "dir_a_update_build_merge", "label": "build_merge() function",
+             "file_type": "concept", "source_file": "dir_a/update.md", "source_location": "L10"},
+            {"id": "dir_b_update_build_merge", "label": "build_merge() function",
+             "file_type": "concept", "source_file": "dir_b/update.md", "source_location": "L12"},
+        ],
+        "edges": [],
+    }
+    G = build_from_json(ext, directed=False)
+    assert sorted(G.nodes()) == ["dir_a_update_build_merge", "dir_b_update_build_merge"]
+
+
+def test_ghost_merge_non_ast_same_file_still_merges():
+    """A genuine duplicate — two non-AST nodes with the SAME source_file and
+    label — is a real ghost and still collapses to one node (deterministically),
+    so #1753's fix doesn't leave same-file LLM duplicates behind."""
+    ext = {
+        "nodes": [
+            {"id": "a_foo", "label": "Foo", "file_type": "concept",
+             "source_file": "x/doc.md", "source_location": "L1"},
+            {"id": "b_foo", "label": "Foo", "file_type": "concept",
+             "source_file": "x/doc.md", "source_location": "L2"},
+        ],
+        "edges": [],
+    }
+    G = build_from_json(ext, directed=False)
+    assert G.number_of_nodes() == 1
 
 
 def test_build_merge_preserves_call_edge_direction(tmp_path):
@@ -901,3 +978,120 @@ def test_semantic_rekey_relative_vs_absolute_source_file():
     # absolute path with no resolvable root → skipped, not remapped to an abs-path id
     ab = [{"id": "api_readme", "source_file": "/abs/docs/v1/api/README.md", "type": "document"}]
     assert _semantic_id_remap(ab, None) == {}
+
+
+def test_cross_language_imports_references_are_dropped():
+    """#1749: an `imports`/`references` edge must not bind across a language
+    family. A Python `import time` that resolved by bare stem onto a `time.ts`
+    file node welds the two language halves together at a phantom edge; the spec
+    forbids this for `calls` and it is equally invalid here."""
+    ext = {
+        "nodes": [
+            {"id": "backend_worker_py", "label": "worker.py", "file_type": "code",
+             "source_file": "backend/worker.py", "source_location": "L1", "_origin": "ast"},
+            {"id": "src_time_ts", "label": "time.ts", "file_type": "code",
+             "source_file": "src/time.ts", "source_location": "L1", "_origin": "ast"},
+            {"id": "src_util_ts", "label": "util.ts", "file_type": "code",
+             "source_file": "src/util.ts", "source_location": "L1", "_origin": "ast"},
+        ],
+        "edges": [
+            # phantom: Python file importing a TS file (cross-language)
+            {"source": "backend_worker_py", "target": "src_time_ts", "relation": "imports",
+             "confidence": "EXTRACTED", "source_file": "backend/worker.py", "weight": 1.0},
+            # legit: TS importing TS (same family) must survive
+            {"source": "src_time_ts", "target": "src_util_ts", "relation": "imports",
+             "confidence": "EXTRACTED", "source_file": "src/time.ts", "weight": 1.0},
+        ],
+    }
+    G = build_from_json(ext, directed=False)
+    assert not G.has_edge("backend_worker_py", "src_time_ts"), "cross-language import must be dropped"
+    assert G.has_edge("src_time_ts", "src_util_ts"), "same-family (TS->TS) import must survive"
+
+
+def test_cross_family_reference_to_unknown_ext_is_kept():
+    """The #1749 guard only drops when BOTH endpoints are known code languages,
+    so a reference from a config/manifest (unknown ext) to a code file is kept."""
+    ext = {
+        "nodes": [
+            {"id": "pkg_json", "label": "package.json", "file_type": "code",
+             "source_file": "package.json", "source_location": "L1", "_origin": "ast"},
+            {"id": "src_app_ts", "label": "app.ts", "file_type": "code",
+             "source_file": "src/app.ts", "source_location": "L1", "_origin": "ast"},
+        ],
+        "edges": [
+            {"source": "pkg_json", "target": "src_app_ts", "relation": "references",
+             "confidence": "EXTRACTED", "source_file": "package.json", "weight": 1.0},
+        ],
+    }
+    G = build_from_json(ext, directed=False)
+    assert G.has_edge("pkg_json", "src_app_ts"), "config->code reference (unknown ext) must be kept"
+
+
+def test_markdown_doc_twin_merges_into_semantic_doc_node():
+    """#1799: the markdown quick-scan's bare `<slug>` doc node and the semantic
+    `<slug>_doc` node for the same file must collapse to one node, with edges
+    consolidated — otherwise a document is two disconnected halves and traversals
+    dead-end on the wrong twin."""
+    ext = {
+        "nodes": [
+            {"id": "docs_readme_doc", "label": "README", "file_type": "document",
+             "source_file": "docs/readme.md", "source_location": "L1"},
+            {"id": "docs_readme", "label": "readme.md", "file_type": "document",
+             "source_file": "docs/readme.md", "source_location": "L1"},
+            {"id": "code_auth", "label": "auth", "file_type": "code",
+             "source_file": "auth.py", "source_location": "L1"},
+            {"id": "docs_guide", "label": "guide.md", "file_type": "document",
+             "source_file": "docs/guide.md", "source_location": "L1"},
+        ],
+        "edges": [
+            {"source": "docs_readme_doc", "target": "code_auth", "relation": "references",
+             "source_file": "docs/readme.md", "confidence": "INFERRED", "weight": 1.0},
+            {"source": "docs_guide", "target": "docs_readme", "relation": "references",
+             "source_file": "docs/guide.md", "confidence": "EXTRACTED", "weight": 1.0},
+        ],
+    }
+    G = build_from_json(ext, directed=False)
+    assert "docs_readme" not in G.nodes()          # bare twin merged away
+    assert "docs_readme_doc" in G.nodes()           # semantic node is canonical
+    assert G.has_edge("docs_guide", "docs_readme_doc")   # quick-scan edge repointed
+    assert G.has_edge("docs_readme_doc", "code_auth")    # semantic edge kept
+
+
+def test_doc_twin_merge_does_not_touch_code_symbols():
+    """#1799 guard: a code symbol `foo` and an unrelated `foo_doc` (not
+    file_type=document) must NOT merge, even sharing a source_file."""
+    ext = {
+        "nodes": [
+            {"id": "m_foo", "label": "foo", "file_type": "code",
+             "source_file": "m.py", "source_location": "L1"},
+            {"id": "m_foo_doc", "label": "foo rationale", "file_type": "rationale",
+             "source_file": "m.py", "source_location": "L2"},
+        ],
+        "edges": [],
+    }
+    G = build_from_json(ext, directed=False)
+    assert {"m_foo", "m_foo_doc"} <= set(G.nodes())
+
+
+def test_build_from_json_prunes_dangling_hyperedge_members(capsys):
+    """#1916: build_from_json used to copy hyperedges into G.graph["hyperedges"]
+    verbatim without validating members, so a dangling member reached graph.json
+    even from a live (non-cache) extraction. Members absent from the built node
+    set are pruned — matching how dangling pairwise edges are skipped — and a
+    hyperedge with no surviving member is dropped whole."""
+    ext = {
+        "nodes": [
+            {"id": "alpha", "label": "alpha", "file_type": "code", "source_file": "a.py"},
+            {"id": "beta", "label": "beta", "file_type": "code", "source_file": "a.py"},
+        ],
+        "edges": [],
+        "hyperedges": [
+            {"id": "he_partial", "nodes": ["alpha", "beta", "ghost_member"], "source_file": "a.py"},
+            {"id": "he_all_ghost", "nodes": ["ghost1", "ghost2"], "source_file": "a.py"},
+        ],
+    }
+    G = build_from_json(ext)
+    hes = {h["id"]: h for h in G.graph.get("hyperedges", [])}
+    assert set(hes) == {"he_partial"}, "an all-dangling hyperedge must be dropped"
+    assert hes["he_partial"]["nodes"] == ["alpha", "beta"]
+    assert "he_all_ghost" in capsys.readouterr().err
