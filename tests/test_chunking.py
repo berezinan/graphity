@@ -518,8 +518,10 @@ def test_checkpoint_caches_sliced_document_chunks(tmp_path, capsys):
     split into FileSlice units; before the fix each sliced chunk leaked the
     FileSlice object into the allowlist, so save_semantic_cache raised TypeError,
     the best-effort except swallowed it, and the slice was never checkpointed."""
+    # Fork: tiered caps replaced upstream's flat _FILE_CHAR_CAP; the slice
+    # threshold for splittable text is _TEXT_SLICE_CHARS (same 20k value).
     from graphify.llm import (
-        extract_corpus_parallel, expand_oversized_files, _FILE_CHAR_CAP, _extraction_system,
+        extract_corpus_parallel, expand_oversized_files, _TEXT_SLICE_CHARS, _extraction_system,
     )
     from graphify.file_slice import FileSlice
     from graphify.cache import load_cached
@@ -527,7 +529,7 @@ def test_checkpoint_caches_sliced_document_chunks(tmp_path, capsys):
     doc = tmp_path / "big.md"
     doc.write_text("# Title\n" + ("word " * 12000) + "\n## Section\n" + ("more " * 12000))
     # sanity: the doc really does slice into FileSlice units
-    units = expand_oversized_files([doc], _FILE_CHAR_CAP)
+    units = expand_oversized_files([doc], _TEXT_SLICE_CHARS)
     assert len(units) > 1 and all(isinstance(u, FileSlice) for u in units)
 
     def sliced(chunk, **kwargs):

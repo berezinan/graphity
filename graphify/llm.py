@@ -629,7 +629,10 @@ def _dispatched_source_text(units: "list[Path | FileSlice]", root: Path) -> dict
             content = read_slice_text(u) if isinstance(u, FileSlice) else _file_to_text(safe)
         except Exception:  # noqa: BLE001 — one unreadable file (e.g. a malformed PDF) must not disable binding for the whole chunk
             continue
-        by_path[safe] = by_path.get(safe, "") + content[:_FILE_CHAR_CAP].lower()
+        # Mirror _read_files's truncation: per-category cap (fork's tiered caps
+        # replaced upstream's flat _FILE_CHAR_CAP), so binding sees the same
+        # bytes the model saw.
+        by_path[safe] = by_path.get(safe, "") + content[:_char_cap_for(p)].lower()
     return by_path
 
 
