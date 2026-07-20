@@ -3301,11 +3301,11 @@ def dispatch_command(cmd: str) -> None:
         # Sync the configured graph database (connect-only), if any. JSON is the
         # default, so this is a no-op for existing users. Incremental updates
         # touch only the changed/deleted files; a first/full build loads fresh.
-        from graphify.query_backend import resolve_backend_config, open_backend
+        from graphify.query_backend import resolve_backend_config, open_backend_for_sync
         _db_cfg = resolve_backend_config(str(graph_json_path))
         if _db_cfg["kind"] == "arcadedb":
             try:
-                _db = open_backend(config=_db_cfg)
+                _db = open_backend_for_sync(_db_cfg)
                 _db.ensure_database()
                 if incremental_mode and _db.is_populated():
                     from graphify.build import _norm_source_file

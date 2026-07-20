@@ -1299,10 +1299,10 @@ def _rebuild_code(
             # Sync the configured graph database (connect-only). No-op unless
             # GRAPHIFY_BACKEND=arcadedb; a failure never fails the rebuild.
             try:
-                from graphify.query_backend import resolve_backend_config, open_backend
+                from graphify.query_backend import resolve_backend_config, open_backend_for_sync
                 _cfg = resolve_backend_config(str(out / "graph.json"))
                 if _cfg["kind"] == "arcadedb":
-                    _db = open_backend(config=_cfg)
+                    _db = open_backend_for_sync(_cfg)
                     _db.ensure_database()
                     if changed_paths is not None and _db.is_populated():
                         _changed = {_nsf(str(p), str(project_root)) for p in extract_targets}

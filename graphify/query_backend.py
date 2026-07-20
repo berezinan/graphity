@@ -1135,3 +1135,17 @@ def open_backend(*, config: dict | None = None, graph=None, graph_path: str | No
         from graphify.serve import _load_graph
         graph = _load_graph(cfg.get("graph_path") or graph_path)
     return JsonBackend(graph)
+
+
+def open_backend_for_sync(config: dict) -> GraphBackend:
+    """`open_backend` for the extract/update SYNC path only.
+
+    Honors the opt-in ArcadeDB auto-start (GRAPHIFY_ARCADE_AUTOSTART, see
+    `arcade_server.maybe_autostart`) before connecting; queries stay
+    connect-only. Lives in this fork-owned file so the churn-file call sites
+    (cli.py extract sync, watch.py rebuild sync) stay one-line thin.
+    """
+    if config.get("kind") == "arcadedb":
+        from graphify import arcade_server
+        arcade_server.maybe_autostart(config)
+    return open_backend(config=config)

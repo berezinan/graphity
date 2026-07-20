@@ -190,6 +190,52 @@ def start(password: str = "playwithdata", *, host: str = "127.0.0.1", port: int 
             "url": f"http://{host}:{port}"}
 
 
+_AUTOSTART_READY_TIMEOUT = 60.0  # seconds to wait for the launched server's /ready
+
+
+def autostart_enabled() -> bool:
+    """True when GRAPHIFY_ARCADE_AUTOSTART is truthy (opt-in, off by default)."""
+    return os.environ.get("GRAPHIFY_ARCADE_AUTOSTART", "").strip().lower() in ("1", "true", "yes")
+
+
+def maybe_autostart(cfg: dict) -> None:
+    """Opt-in auto-start of the local server before an extract/update sync.
+
+    No-op unless GRAPHIFY_ARCADE_AUTOSTART is truthy. Reuses the resolved
+    backend config (host/port/password from GRAPHIFY_ARCADE_URL /
+    GRAPHIFY_ARCADE_PASSWORD) so auto-start and connect-only point at the same
+    server. Any failure (no Java, download error, ready-timeout) is swallowed
+    with a warning — the pipeline then degrades to the JSON graph exactly as
+    connect-only would.
+
+    Lives here, NOT in the CLI dispatch, so upstream merges over churn files
+    can only sever a one-line call site — a loss the tracked guard test makes
+    visible (see openspec spec `arcadedb-backend`).
+    """
+    if not autostart_enabled():
+        return
+    host = cfg.get("host") or "127.0.0.1"
+    port = int(cfg.get("port") or 2480)
+    password = cfg.get("password") or os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or "playwithdata"
+    try:
+        if status(host, port, password).get("ready"):
+            return
+        start(password, host=host, port=port)
+        import time
+        deadline = time.monotonic() + _AUTOSTART_READY_TIMEOUT
+        while True:
+            if status(host, port, password).get("ready"):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"server not ready within {_AUTOSTART_READY_TIMEOUT:.0f}s "
+                    f"(see {log_file()})"
+                )
+            time.sleep(1.0)
+    except Exception as exc:
+        print(f"[graphify db] warning: ArcadeDB auto-start failed: {exc}", file=sys.stderr)
+
+
 def stop(home: Path | None = None) -> bool:
     """Terminate the tracked server process. Returns True if a PID was signalled."""
     pid = _read_pid(home)
