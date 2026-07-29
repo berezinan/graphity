@@ -89,3 +89,39 @@ def test_status_not_running(monkeypatch, tmp_path):
     assert st["ready"] is False
     assert st["pid"] is None
     assert st["installed"] is False
+
+
+def test_default_heap_falls_back_when_unset(monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_ARCADE_HEAP", raising=False)
+    assert a.default_heap() == "2G"
+
+
+def test_default_heap_env_override(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HEAP", "8G")
+    assert a.default_heap() == "8G"
+
+
+@pytest.mark.parametrize("bad", ["8 GB", "8gb", "; rm -rf /", "-XX:+Evil", "big", ""])
+def test_default_heap_rejects_non_heap_values(monkeypatch, bad):
+    """The value is interpolated straight into the java argv, so anything that is
+    not a JVM heap size must be refused rather than passed through. An empty/
+    whitespace value is treated as unset (the documented way to opt out)."""
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HEAP", bad)
+    if bad.strip() == "":
+        assert a.default_heap() == "2G"
+    else:
+        with pytest.raises(ValueError, match="GRAPHIFY_ARCADE_HEAP"):
+            a.default_heap()
+
+
+def test_server_command_reads_heap_env_at_call_time(monkeypatch):
+    """Resolved per call, not at import: a heap set in-process must still apply."""
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HEAP", "12G")
+    assert "-Xmx12G" in a.server_command("s3cret")
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HEAP", "6G")
+    assert "-Xmx6G" in a.server_command("s3cret")
+
+
+def test_explicit_heap_argument_still_wins(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HEAP", "8G")
+    assert "-Xmx4G" in a.server_command("s3cret", heap="4G")

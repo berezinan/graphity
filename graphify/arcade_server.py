@@ -12,6 +12,7 @@ install to skip the download.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -21,6 +22,32 @@ from pathlib import Path
 ARCADE_VERSION = "26.6.1"
 _DEFAULT_HEAP = "2G"
 _MIN_JAVA = 21  # ArcadeDB 26.x class files are Java 21
+# JVM -Xmx grammar: digits with an optional K/M/G unit. Enforced because the value
+# is interpolated straight into the java argv.
+_HEAP_RE = re.compile(r"^[0-9]+[KkMmGg]?$")
+
+
+def default_heap() -> str:
+    """Heap for the ArcadeDB JVM — ``GRAPHIFY_ARCADE_HEAP``, else 2G.
+
+    The 2G default is sized for ordinary corpora. A graph in the million-node
+    range does not fit, and ArcadeDB does not fail loudly when it doesn't: the
+    server keeps answering from memory while bucket files stay empty on disk and
+    index lookups silently miss, so the database looks alive and is neither
+    complete nor persisted. Raising the heap is the fix, hence the override.
+
+    Read at call time, not import time, so setting the variable in-process (or
+    after the module is imported) takes effect.
+    """
+    raw = (os.environ.get("GRAPHIFY_ARCADE_HEAP") or "").strip()
+    if not raw:
+        return _DEFAULT_HEAP
+    if not _HEAP_RE.match(raw):
+        raise ValueError(
+            f"GRAPHIFY_ARCADE_HEAP={raw!r} is not a JVM heap size — expected digits "
+            "with an optional K/M/G unit (e.g. 8G, 512M). Refusing to pass it to java."
+        )
+    return raw
 
 
 def arcade_home() -> Path:
@@ -91,7 +118,7 @@ def pick_java() -> str:
     )
 
 
-def server_command(password: str, *, java_exe: str | None = None, heap: str = _DEFAULT_HEAP,
+def server_command(password: str, *, java_exe: str | None = None, heap: str | None = None,
                    port: int = 2480) -> list[str]:
     """The java argv to launch ArcadeDB. Run with cwd = dist_dir so the relative
     ``lib/*`` classpath (Java expands the wildcard itself, sidestepping the
@@ -100,7 +127,7 @@ def server_command(password: str, *, java_exe: str | None = None, heap: str = _D
     actually takes effect."""
     return [
         java_exe or java_executable(),
-        f"-Xms512M", f"-Xmx{heap}",
+        f"-Xms512M", f"-Xmx{heap or default_heap()}",
         "--add-opens", "java.base/java.util.concurrent.atomic=ALL-UNNAMED",
         "--add-opens", "java.base/java.nio.channels.spi=ALL-UNNAMED",
         "--add-opens", "java.base/java.lang=ALL-UNNAMED",
@@ -164,7 +191,7 @@ def download(home: Path | None = None) -> Path:
 
 
 def start(password: str = "playwithdata", *, host: str = "127.0.0.1", port: int = 2480,
-          heap: str = _DEFAULT_HEAP, home: Path | None = None) -> dict:
+          heap: str | None = None, home: Path | None = None) -> dict:
     """Download if needed, then launch a detached server. No-op if already up."""
     home = home or arcade_home()
     st = status(host, port, password, home)
