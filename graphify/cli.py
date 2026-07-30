@@ -1221,11 +1221,14 @@ def dispatch_command(cmd: str) -> None:
             if cfg.get("kind") != "arcadedb":
                 print("set GRAPHIFY_BACKEND=arcadedb to reload an ArcadeDB database", file=sys.stderr)
                 sys.exit(2)
+            from graphify.query_backend import shortfall_warning
             be = open_backend(config=cfg)
             print(f"reloading ArcadeDB '{cfg['database']}' from {gj} (drop + full load)...")
             be.ensure_database(drop=True)
             st = be.load_from_graph_json(str(gj))
             print(f"reloaded: {st['nodes']} nodes, {st['edges']} edges")
+            if (_warn := shortfall_warning(st)):
+                print(f"warning: {_warn}", file=sys.stderr)
         else:
             print("Usage: graphify arcade <start|stop|status|download|reload>", file=sys.stderr)
             sys.exit(2)
@@ -3301,7 +3304,7 @@ def dispatch_command(cmd: str) -> None:
         # Sync the configured graph database (connect-only), if any. JSON is the
         # default, so this is a no-op for existing users. Incremental updates
         # touch only the changed/deleted files; a first/full build loads fresh.
-        from graphify.query_backend import resolve_backend_config, open_backend_for_sync
+        from graphify.query_backend import resolve_backend_config, open_backend_for_sync, shortfall_warning
         _db_cfg = resolve_backend_config(str(graph_json_path))
         if _db_cfg["kind"] == "arcadedb":
             try:
@@ -3324,6 +3327,8 @@ def dispatch_command(cmd: str) -> None:
                     _st = _db.load_from_graph_json(str(graph_json_path))
                     print(f"[graphify db] loaded ArcadeDB '{_db_cfg['database']}' "
                           f"({_st['nodes']} nodes, {_st['edges']} edges).")
+                if (_warn := shortfall_warning(_st)):
+                    print(f"[graphify db] warning: {_warn}", file=sys.stderr)
             except Exception as exc:
                 print(f"[graphify db] warning: ArcadeDB sync failed: {exc}", file=sys.stderr)
         if merged.get("output_tokens", 0) > 0:

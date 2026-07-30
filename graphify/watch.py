@@ -1299,7 +1299,7 @@ def _rebuild_code(
             # Sync the configured graph database (connect-only). No-op unless
             # GRAPHIFY_BACKEND=arcadedb; a failure never fails the rebuild.
             try:
-                from graphify.query_backend import resolve_backend_config, open_backend_for_sync
+                from graphify.query_backend import resolve_backend_config, open_backend_for_sync, shortfall_warning
                 _cfg = resolve_backend_config(str(out / "graph.json"))
                 if _cfg["kind"] == "arcadedb":
                     _db = open_backend_for_sync(_cfg)
@@ -1315,6 +1315,8 @@ def _rebuild_code(
                         _st = _db.load_from_graph_json(str(out / "graph.json"))
                         print(f"[graphify db] loaded ArcadeDB '{_cfg['database']}' "
                               f"({_st['nodes']} nodes, {_st['edges']} edges).")
+                    if (_warn := shortfall_warning(_st)):
+                        print(f"[graphify db] warning: {_warn}")
             except Exception as _db_exc:
                 print(f"[graphify db] warning: ArcadeDB sync skipped: {_db_exc}")
         return True

@@ -12,6 +12,7 @@ from graphify.serve import _query_graph_text
 from graphify.query_backend import (
     ArcadeDBBackend,
     JsonBackend,
+    _id_key,
     derive_db_name,
     open_backend,
     resolve_backend_config,
@@ -183,12 +184,21 @@ def test_sync_graph_deletes_changed_ids_before_reinsert(monkeypatch):
     # only removes nodes whose stored source_file is dirty. A shared node whose
     # representative source_file drifted to a changed file across runs still lives
     # in the DB under its old (unchanged) source, so re-INSERT by id would hit the
-    # UNIQUE Node(id) index (ArcadeDB 409 DuplicatedKeyException). sync_graph must
-    # delete the changed ids directly, before re-inserting them.
+    # UNIQUE Node(id_key) index (ArcadeDB 409 DuplicatedKeyException). sync_graph
+    # must delete the changed ids directly, before re-inserting them.
     be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
                               "database": "proj_x", "user": "root", "password": "x"})
     calls = []
-    monkeypatch.setattr(be, "_run", lambda q, **kw: calls.append((q, kw)) or [])
+
+    def fake_run(q, **kw):
+        calls.append((q, kw))
+        # sync_graph refuses a database that predates the ASCII index key, so the
+        # schema probe has to answer the way a current-schema database would.
+        if "schema:types" in q:
+            return [{"properties": [{"name": "id_key"}]}]
+        return []
+
+    monkeypatch.setattr(be, "_run", fake_run)
 
     G = nx.DiGraph()
     G.add_node("shared_id", label="x", source_file="changed.py")
@@ -197,9 +207,9 @@ def test_sync_graph_deletes_changed_ids_before_reinsert(monkeypatch):
     be.sync_graph(G, changed_sources={"changed.py"}, pruned_sources=set())
 
     id_deletes = [(i, kw["params"]["ids"]) for i, (q, kw) in enumerate(calls)
-                  if q.startswith("DELETE VERTEX FROM Node WHERE id IN")]
-    assert id_deletes, "sync_graph must delete the changed node ids by id"
-    assert {x for _, ids in id_deletes for x in ids} == {"shared_id", "n2"}
+                  if q.startswith("DELETE VERTEX FROM Node WHERE id_key IN")]
+    assert id_deletes, "sync_graph must delete the changed node ids by their index key"
+    assert {x for _, ids in id_deletes for x in ids} == {_id_key("shared_id"), _id_key("n2")}
 
     first_insert = next((i for i, (q, _) in enumerate(calls)
                          if q.startswith("INSERT INTO Node")), None)

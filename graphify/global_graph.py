@@ -89,7 +89,7 @@ def _sync_global_db() -> None:
     if os.environ.get("GRAPHIFY_BACKEND", "").strip().lower() not in ("arcadedb", "arcade"):
         return
     try:
-        from graphify.query_backend import resolve_backend_config, open_backend
+        from graphify.query_backend import resolve_backend_config, open_backend, shortfall_warning
         cfg = resolve_backend_config(None)
         cfg["database"] = os.environ.get("GRAPHIFY_ARCADE_GLOBAL_DB", "graphify_global")
         be = open_backend(config=cfg)
@@ -97,6 +97,8 @@ def _sync_global_db() -> None:
         st = be.load_from_graph_json(str(_GLOBAL_GRAPH))
         print(f"[graphify global] synced ArcadeDB '{cfg['database']}' "
               f"({st['nodes']} nodes, {st['edges']} edges).")
+        if (warn := shortfall_warning(st)):
+            print(f"[graphify global] warning: {warn}", file=sys.stderr)
     except Exception as exc:
         print(f"[graphify global] warning: ArcadeDB global sync failed: {exc}", file=sys.stderr)
 

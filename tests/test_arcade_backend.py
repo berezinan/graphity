@@ -23,6 +23,7 @@ from graphify.query_backend import (
     render_neighbors,
     render_path,
     render_stats,
+    shortfall_warning,
 )
 
 _URL = os.environ.get("GRAPHIFY_ARCADE_URL", "http://127.0.0.1:2480")
@@ -236,5 +237,230 @@ def test_sync_graph_incremental(tmp_path_factory):
     finally:
         try:
             arc._server("drop database graphify_sync_test")
+        except Exception:
+            pass
+
+
+def _make_mixed_alphabet_graph() -> nx.DiGraph:
+    """Ids that mix ASCII with bytes >= 0x80 at the first differing position.
+
+    This is what any non-English project produces, and it is the exact shape
+    that desynchronizes ArcadeDB's LSM string index (see _id_key).
+    """
+    G = nx.DiGraph()
+    G.add_node("doc_zakaz_klienta", label="ЗаказКлиента", source_file="a.bsl",
+               source_location="L1", community=0)
+    G.add_node("Справочники.Номенклатура", label="Номенклатура", source_file="b.bsl",
+               source_location="L2", community=0)
+    G.add_node("ЯдроОбработки", label="ЯдроОбработки", source_file="c.bsl",
+               source_location="L3", community=1)
+    G.add_node("zzz_tail_ascii", label="tail", source_file="d.bsl",
+               source_location="L4", community=1)
+    G.add_edge("doc_zakaz_klienta", "Справочники.Номенклатура", relation="uses",
+               confidence="EXTRACTED", context="call")
+    G.add_edge("Справочники.Номенклатура", "ЯдроОбработки", relation="calls",
+               confidence="EXTRACTED", context="call")
+    G.add_edge("ЯдроОбработки", "zzz_tail_ascii", relation="imports", confidence="INFERRED")
+    return G
+
+
+def test_mixed_alphabet_ids_resolve(tmp_path_factory):
+    """Every point lookup still finds its node when ids mix alphabets.
+
+    Regression for the shortfall measured on ERP2: with the unique index built
+    over `id`, 23.35% of nodes stopped resolving after compaction and took 30.1%
+    of the edges with them, because CREATE EDGE silently creates nothing when its
+    endpoint subquery is empty.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_mixed_key_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    G = _make_mixed_alphabet_graph()
+    p = tmp_path_factory.mktemp("mixed") / "g.json"
+    p.write_text(json.dumps(json_graph.node_link_data(G, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        jb = JsonBackend(G)
+        # No edge was silently dropped: the endpoint subqueries all resolved.
+        assert render_stats(jb.graph_stats()) == render_stats(arc.graph_stats())
+        for label in ("ЗаказКлиента", "Номенклатура", "ЯдроОбработки", "tail"):
+            assert render_node(arc.get_node(label), label) == render_node(jb.get_node(label), label)
+            assert render_explain(arc.explain(label), label) == render_explain(jb.explain(label), label)
+        assert render_path(arc.shortest_path("ЗаказКлиента", "tail"), "ЗаказКлиента", "tail") == \
+            render_path(jb.shortest_path("ЗаказКлиента", "tail"), "ЗаказКлиента", "tail")
+    finally:
+        try:
+            arc._server("drop database graphify_mixed_key_test")
+        except Exception:
+            pass
+
+
+def test_duplicate_index_key_fails_loudly(tmp_path_factory, monkeypatch):
+    """Two ids colliding on the index key must fail, never merge two nodes.
+
+    blake2b-128 makes a real collision practically unreachable, so the guard is
+    forced here: the point is that the UNIQUE index -- not luck -- is what stops
+    two distinct nodes from becoming one.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_collision_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    monkeypatch.setattr("graphify.query_backend._id_key", lambda _id: "collide")
+    G = nx.DiGraph()
+    G.add_node("first", label="first", source_file="a.py", source_location="L1", community=0)
+    G.add_node("second", label="second", source_file="b.py", source_location="L2", community=0)
+    p = tmp_path_factory.mktemp("collide") / "g.json"
+    p.write_text(json.dumps(json_graph.node_link_data(G, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    try:
+        with pytest.raises(RuntimeError):
+            arc.load_from_graph_json(str(p))
+    finally:
+        try:
+            arc._server("drop database graphify_collision_test")
+        except Exception:
+            pass
+
+
+def test_load_reports_shortfall(tmp_path_factory):
+    """A load that does not fully arrive says so in its result, not just a log.
+
+    The shortfall is produced the way the real one was: an edge whose endpoint
+    the loader cannot resolve. CREATE EDGE builds each end from a subquery and an
+    empty one makes it a silent no-op (CreateEdgesStep), which is how 30.1% of
+    ERP2's edges vanished while the loader reported success. Here the endpoint is
+    simply absent from the node list, so the case is reproduced without depending
+    on the engine defect that first exposed it.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_shortfall_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    raw = json_graph.node_link_data(_make_digraph(), edges="links")
+    raw["links"].append({"source": "n1", "target": "phantom_never_inserted",
+                         "relation": "calls", "confidence": "INFERRED"})
+    p = tmp_path_factory.mktemp("short") / "g.json"
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    try:
+        st = arc.load_from_graph_json(str(p))
+        assert st["expected_edges"] == len(raw["links"])
+        assert st["edges"] == len(raw["links"]) - 1, "the dangling edge must not be counted as written"
+        assert st["missing_edges"] == 1
+        assert st["missing_nodes"] == 0, "the nodes themselves all landed"
+        assert st["unresolved_endpoint_edges"] == 1, \
+            "the loss must be attributed to the unresolvable endpoint"
+        warn = shortfall_warning(st)
+        assert warn is not None and "1 of 4 edges" in warn and "endpoint" in warn
+    finally:
+        try:
+            arc._server("drop database graphify_shortfall_test")
+        except Exception:
+            pass
+
+
+def test_full_load_reports_no_shortfall(backends):
+    """A load that fully arrives must not raise a false alarm."""
+    _, arc = backends
+    G = _make_digraph()
+    st = arc._reconcile(G.number_of_nodes(), G.number_of_edges(),
+                        node_ids=list(G.nodes()),
+                        edges=[(u, v) for u, v in G.edges()])
+    assert st["missing_nodes"] == 0 and st["missing_edges"] == 0
+    assert st["nodes"] == G.number_of_nodes() and st["edges"] == G.number_of_edges()
+    assert "unresolved_endpoint_edges" not in st, "attribution must not run when nothing is missing"
+    assert shortfall_warning(st) is None
+
+
+def test_sync_graph_reports_shortfall_the_same_way(tmp_path_factory):
+    """sync_graph reconciles against G exactly as a full load does."""
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_sync_short_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g1 = _make_digraph()
+    p = tmp_path_factory.mktemp("syncshort") / "g1.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g1, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        g2 = _make_digraph()
+        g2.add_node("n6", label="helper", source_file="extract.py", source_location="L99", community=0)
+        g2.add_edge("n6", "n2", relation="calls", confidence="INFERRED")
+        st = arc.sync_graph(g2, changed_sources={"extract.py"}, pruned_sources=set())
+        # the incremental keys the callers print stay in place
+        assert {"deleted_sources", "upserted_nodes", "upserted_edges"} <= set(st)
+        # and the reconciliation is present and clean for a sync that fully applied
+        assert st["expected_nodes"] == g2.number_of_nodes()
+        assert st["expected_edges"] == g2.number_of_edges()
+        assert st["missing_nodes"] == 0 and st["missing_edges"] == 0
+        assert shortfall_warning(st) is None
+    finally:
+        try:
+            arc._server("drop database graphify_sync_short_test")
+        except Exception:
+            pass
+
+
+def test_sync_refuses_a_database_predating_the_index_key(tmp_path_factory):
+    """An incremental pass into an old-schema database must not run.
+
+    Such a DB has no id_key, so sync would DELETE nodes by one key and INSERT
+    them under another and leave the database half-converted - the shape that
+    does not self-heal, because is_populated() stays true and the next run only
+    patches the newly-changed files.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_oldschema_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    arc.ensure_database(drop=True)
+    try:
+        # The schema exactly as it was written before this change.
+        for ddl in ("CREATE VERTEX TYPE Node", "CREATE EDGE TYPE Rel",
+                    "CREATE PROPERTY Node.id STRING", "CREATE PROPERTY Node.norm_label STRING",
+                    "CREATE PROPERTY Node.degree INTEGER", "CREATE INDEX ON Node (id) UNIQUE"):
+            arc._run(ddl)
+        arc._run("INSERT INTO Node CONTENT " + json.dumps(
+            {"id": "n1", "label": "extract", "source_file": "extract.py", "degree": 0}))
+
+        assert arc.schema_has_id_key() is False
+        assert arc.is_populated() is True, "the old DB looks populated, which is why sync would run"
+
+        with pytest.raises(RuntimeError) as exc:
+            arc.sync_graph(_make_digraph(), changed_sources={"extract.py"}, pruned_sources=set())
+        assert "arcade reload" in str(exc.value), "the message must name the way out"
+    finally:
+        try:
+            arc._server("drop database graphify_oldschema_test")
+        except Exception:
+            pass
+
+
+def test_current_schema_database_syncs_normally(tmp_path_factory):
+    """A database written by this backend reports the key and syncs as before."""
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_newschema_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g1 = _make_digraph()
+    p = tmp_path_factory.mktemp("newschema") / "g.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g1, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        assert arc.schema_has_id_key() is True
+        g2 = _make_digraph()
+        g2.nodes["n1"]["label"] = "extractor"
+        st = arc.sync_graph(g2, changed_sources={"extract.py"}, pruned_sources=set())
+        assert st["missing_nodes"] == 0 and st["missing_edges"] == 0
+        assert render_node(arc.get_node("extractor"), "extractor") == \
+            render_node(JsonBackend(g2).get_node("extractor"), "extractor")
+    finally:
+        try:
+            arc._server("drop database graphify_newschema_test")
         except Exception:
             pass

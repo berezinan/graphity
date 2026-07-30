@@ -534,6 +534,80 @@ def _sql_str(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def shortfall_warning(stats: dict) -> str | None:
+    """One line naming a load that did not fully arrive, or None when it did.
+
+    ``load_from_graph_json``/``sync_graph`` used to report the counts they
+    *intended* to write, so a load that silently dropped 30% of the edges still
+    printed success. Callers pass their stats through here instead of restating
+    them.
+    """
+    if stats.get("reconciled") is False:
+        return "ArcadeDB load could not be verified: the count query returned nothing"
+    missing_n, missing_e = stats.get("missing_nodes", 0), stats.get("missing_edges", 0)
+    if not (missing_n or missing_e):
+        return None
+    parts = []
+    if missing_n:
+        parts.append(f"{missing_n} of {stats.get('expected_nodes', '?')} nodes")
+    if missing_e:
+        parts.append(f"{missing_e} of {stats.get('expected_edges', '?')} edges")
+    msg = "ArcadeDB load incomplete: " + " and ".join(parts) + " did not arrive"
+    unresolved = stats.get("unresolved_endpoint_edges")
+    if missing_e and unresolved:
+        msg += (f"; {unresolved} of the missing edges had an endpoint that does not "
+                f"resolve through the index")
+    return msg
+
+
+def _by_id(row: dict) -> str:
+    """Sort key standing in for a dropped ``ORDER BY id``.
+
+    Dropping the unique index on ``id`` changes what ``ORDER BY id`` costs. With
+    the index the planner did not sort at all: it walked ``FETCH FROM INDEX
+    VALUES ASC Node[id]`` and filtered afterwards, reading every entry in the
+    index. Measured on 1.18M nodes, that plan ran 10.9s against 1.5s for the
+    same query without the clause - so the clause was the expensive part and
+    losing the index makes these queries faster, not slower.
+
+    Without the index the sort lands in the heap, and that is a hard ceiling
+    rather than a slowdown: on this server it refuses at 500 000 elements
+    ("Limit of allowed elements for in-heap ORDER BY in a single query
+    exceeded"). Broad terms on a real corpus are well past it - ``module``
+    matches 868 649 rows, ``_`` matches 1 180 620. Today the HTTP default limit
+    of 20 000 rows bounds the sort and hides this, so the failure is latent and
+    rides on a server default the client never states.
+
+    Sorting here removes that dependency for nothing: every one of these call
+    sites already pulls the whole result set into the client. Python compares
+    str by code point and UTF-8 preserves that order, so the sequence matches
+    what a correct ORDER BY would produce.
+    """
+    return str(row.get("id") or "")
+
+
+def _id_key(node_id: str) -> str:
+    """ASCII index key for a node id.
+
+    The unique index is built over this, never over ``id`` itself. ArcadeDB's
+    LSM index writes a compacted series with an unsigned byte comparison
+    (``LSMTreeIndexAbstract.compareKeys``) but seeks it with a signed one
+    (``compareKey`` -> ``BinaryComparator.compareBytes``), so on a keyspace that
+    mixes ASCII with bytes >= 0x80 the two orders disagree and a point lookup
+    silently misses - measured at 68% of probes on a mixed keyspace after
+    compaction, and 0% both on pure ASCII and before compaction. Node ids of any
+    non-English project are mixed by construction, so the digest keeps the key
+    inside the range where both comparisons agree. Upstream fixed the engine in
+    02d5800e (#5321), which no release carries yet; this does not depend on it.
+
+    Not reversible on purpose: nothing needs it. ``id`` stays on the record as a
+    plain property, so a scan, a LIKE or a manual look in Studio still work.
+    """
+    from hashlib import blake2b
+
+    return blake2b(str(node_id).encode("utf-8"), digest_size=16).hexdigest()
+
+
 class ArcadeDBBackend(GraphBackend):
     """Reads from a per-project ArcadeDB database over HTTP.
 
@@ -584,6 +658,23 @@ class ArcadeDBBackend(GraphBackend):
         except Exception:
             return False
 
+    def schema_has_id_key(self) -> bool:
+        """Whether ``Node`` carries the ASCII index key this backend writes by.
+
+        Read from the schema, not from the data: a database can be empty and
+        still be on the current schema, and a full one can predate it. An
+        unreadable schema counts as absent, so the caller is told to reload
+        rather than allowed to write into something unknown.
+        """
+        try:
+            rows = self._run("SELECT properties FROM schema:types WHERE name = 'Node'",
+                             kind="query")
+        except Exception:
+            return False
+        if not rows:
+            return False
+        return any(p.get("name") == "id_key" for p in (rows[0].get("properties") or []))
+
     # ---- load (graph.json -> ArcadeDB; one-off materialized view) -----------
     def ensure_database(self, *, drop=False) -> None:
         names = self._server("list databases").get("result", []) or []
@@ -592,6 +683,62 @@ class ArcadeDBBackend(GraphBackend):
             names = []
         if self.db not in names:
             self._server(f"create database {self.db}")
+
+    def _reconcile(self, expected_nodes: int, expected_edges: int, *,
+                   node_ids, edges, batch=1000) -> dict:
+        """What the DB actually holds, against the graph that was just written.
+
+        ``count()`` and not ``count(*)``: the latter answers from a cached
+        counter (``cachedRecordCount``, persisted in statistics.json) plus the
+        transaction delta rather than from a scan, so it is able to confirm
+        itself and is the wrong tool for checking correctness.
+
+        Attribution runs only when something IS missing. Resolving every id
+        costs one query per ``batch`` ids - worth paying to name the cause,
+        not worth paying to restate a load that already adds up.
+        """
+        rows_n = self._run("SELECT count() AS c FROM Node")
+        rows_e = self._run("SELECT count() AS c FROM Rel")
+        if not (rows_n and rows_e):
+            # No count came back, so nothing can be compared. Say that instead of
+            # crashing the load or, worse, inventing either a shortfall or a
+            # clean bill of health.
+            return {"nodes": expected_nodes, "edges": expected_edges,
+                    "expected_nodes": expected_nodes, "expected_edges": expected_edges,
+                    "reconciled": False}
+        got_n = int(rows_n[0]["c"] or 0)
+        got_e = int(rows_e[0]["c"] or 0)
+        out = {"nodes": got_n, "edges": got_e,
+               "expected_nodes": expected_nodes, "expected_edges": expected_edges,
+               "missing_nodes": max(0, expected_nodes - got_n),
+               "missing_edges": max(0, expected_edges - got_e)}
+        if not (out["missing_nodes"] or out["missing_edges"]):
+            return out
+
+        # Endpoints, not just the node list: an edge may name an id that was
+        # never among the nodes at all, and that end is exactly the one that
+        # made CREATE EDGE do nothing. Accumulated in a loop rather than with
+        # zip(*edges), which would unpack one argument per edge - 2.4M of them
+        # on a graph this size.
+        seen = set(node_ids)
+        for src, tgt in edges:
+            seen.add(src)
+            seen.add(tgt)
+        ids = list(seen)
+        unresolved = set()
+        for i in range(0, len(ids), batch):
+            chunk = ids[i:i + batch]
+            found = {r["id"] for r in self._run(
+                "SELECT id FROM Node WHERE id_key IN :k",
+                params={"k": [_id_key(x) for x in chunk]})}
+            unresolved.update(x for x in chunk if x not in found)
+        out["unresolved_nodes"] = len(unresolved)
+        # An edge is created from a subquery per endpoint; an empty one makes
+        # CREATE EDGE a silent no-op (CreateEdgesStep), so these are the edges
+        # the loader could not have written whatever else went wrong.
+        out["unresolved_endpoint_edges"] = sum(
+            1 for s, t in edges if s in unresolved or t in unresolved)
+        return out
 
     def load_from_graph_json(self, path: str, *, batch=2000) -> dict:
         import json
@@ -621,8 +768,9 @@ class ArcadeDBBackend(GraphBackend):
 
         for cmd in ("CREATE VERTEX TYPE Node", "CREATE EDGE TYPE Rel", "CREATE VERTEX TYPE Meta",
                     "CREATE PROPERTY Node.id STRING", "CREATE PROPERTY Node.norm_label STRING",
-                    "CREATE PROPERTY Node.degree INTEGER",
-                    "CREATE INDEX ON Node (id) UNIQUE", "CREATE INDEX ON Node (norm_label) FULL_TEXT",
+                    "CREATE PROPERTY Node.degree INTEGER", "CREATE PROPERTY Node.id_key STRING",
+                    # Unique over the ASCII digest, never over `id` itself - see _id_key.
+                    "CREATE INDEX ON Node (id_key) UNIQUE", "CREATE INDEX ON Node (norm_label) FULL_TEXT",
                     # Indexed so the p99 hub threshold (ORDER BY degree) avoids the
                     # in-heap sort cap on large graphs.
                     "CREATE INDEX ON Node (degree) NOTUNIQUE"):
@@ -635,6 +783,7 @@ class ArcadeDBBackend(GraphBackend):
                 doc = {k: n[k] for k in keep_n if k in n and isinstance(n[k], (str, int, float, bool))}
                 doc["norm_label"] = (n.get("norm_label") or _strip_diacritics(str(n.get("label", "")))).lower()
                 doc["degree"] = int(degree.get(n["id"], 0))
+                doc["id_key"] = _id_key(n["id"])
                 stmts.append("INSERT INTO Node CONTENT " + json.dumps(doc, ensure_ascii=False))
             self._run(";".join(stmts), language="sqlscript")
 
@@ -644,13 +793,15 @@ class ArcadeDBBackend(GraphBackend):
             for e in edges[i:i + batch]:
                 doc = {k: e[k] for k in keep_e if k in e and isinstance(e[k], (str, int, float, bool))}
                 stmts.append(
-                    f"CREATE EDGE Rel FROM (SELECT FROM Node WHERE id={_sql_str(e['source'])}) "
-                    f"TO (SELECT FROM Node WHERE id={_sql_str(e['target'])}) CONTENT {json.dumps(doc, ensure_ascii=False)}"
+                    f"CREATE EDGE Rel FROM (SELECT FROM Node WHERE id_key={_sql_str(_id_key(e['source']))}) "
+                    f"TO (SELECT FROM Node WHERE id_key={_sql_str(_id_key(e['target']))}) CONTENT {json.dumps(doc, ensure_ascii=False)}"
                 )
             self._run(";".join(stmts), language="sqlscript")
 
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
-        return {"nodes": len(nodes), "edges": len(edges)}
+        return self._reconcile(len(nodes), len(edges),
+                               node_ids=[n["id"] for n in nodes],
+                               edges=[(e["source"], e["target"]) for e in edges])
 
     def sync_graph(self, G, *, changed_sources, pruned_sources, batch=2000) -> dict:
         """Incrementally sync the DB to the updated graph ``G``.
@@ -663,6 +814,17 @@ class ArcadeDBBackend(GraphBackend):
         from the `_src`/`_tgt` attrs export uses, falling back to (u, v))."""
         import json
         from graphify.analyze import god_nodes as _god
+
+        # A database written before the ASCII index key has no id_key at all, so
+        # an incremental pass would delete nodes under one key and re-insert them
+        # under another, leaving the DB half-converted. That is the failure mode
+        # that does not self-heal: is_populated() stays true, so the next run
+        # patches only the newly-changed files and the damage compounds.
+        if not self.schema_has_id_key():
+            raise RuntimeError(
+                f"ArcadeDB database '{self.db}' predates the ASCII index key: Node.id_key is "
+                f"absent from its schema, so an incremental sync would leave it half-converted. "
+                f"Rebuild it with: graphify arcade reload <project-dir|graph.json>")
 
         changed = {s for s in changed_sources if s}
         pruned = {s for s in pruned_sources if s}
@@ -679,11 +841,11 @@ class ArcadeDBBackend(GraphBackend):
         # removes nodes whose stored source_file is dirty. A shared node whose
         # representative source_file drifted to a changed file across runs still
         # lives in the DB under its old (unchanged) source_file, so re-inserting it
-        # by id would hit the UNIQUE Node(id) index (DuplicatedKeyException). Delete
-        # the changed ids directly first; their incident edges are rebuilt below.
+        # by id would hit the UNIQUE Node(id_key) index (DuplicatedKeyException).
+        # Delete the changed ids directly first; their incident edges are rebuilt below.
         for i in range(0, len(changed_ids), batch):
-            self._run("DELETE VERTEX FROM Node WHERE id IN :ids",
-                      params={"ids": changed_ids[i:i + batch]})
+            self._run("DELETE VERTEX FROM Node WHERE id_key IN :ids",
+                      params={"ids": [_id_key(n) for n in changed_ids[i:i + batch]]})
         keep_n = ("id", "label", "source_file", "source_location", "file_type", "community")
         for i in range(0, len(changed_ids), batch):
             stmts = []
@@ -693,6 +855,7 @@ class ArcadeDBBackend(GraphBackend):
                 doc["id"] = nid
                 doc["norm_label"] = (data.get("norm_label") or _strip_diacritics(str(data.get("label", "")))).lower()
                 doc["degree"] = int(degree.get(nid, 0))
+                doc["id_key"] = _id_key(nid)
                 stmts.append("INSERT INTO Node CONTENT " + json.dumps(doc, ensure_ascii=False))
             if stmts:
                 self._run(";".join(stmts), language="sqlscript")
@@ -709,8 +872,8 @@ class ArcadeDBBackend(GraphBackend):
             for src, tgt, d in new_edges[i:i + batch]:
                 doc = {k: d[k] for k in keep_e if k in d and isinstance(d[k], (str, int, float, bool))}
                 stmts.append(
-                    f"CREATE EDGE Rel FROM (SELECT FROM Node WHERE id={_sql_str(src)}) "
-                    f"TO (SELECT FROM Node WHERE id={_sql_str(tgt)}) CONTENT {json.dumps(doc, ensure_ascii=False)}"
+                    f"CREATE EDGE Rel FROM (SELECT FROM Node WHERE id_key={_sql_str(_id_key(src))}) "
+                    f"TO (SELECT FROM Node WHERE id_key={_sql_str(_id_key(tgt))}) CONTENT {json.dumps(doc, ensure_ascii=False)}"
                 )
             if stmts:
                 self._run(";".join(stmts), language="sqlscript")
@@ -718,14 +881,23 @@ class ArcadeDBBackend(GraphBackend):
         # Refresh stored degree on unchanged neighbours (their edge count moved).
         stale = [n for n in (neighbors - changed_set) if n in degree]
         for i in range(0, len(stale), batch):
-            stmts = [f"UPDATE Node SET degree={int(degree.get(n, 0))} WHERE id={_sql_str(n)}" for n in stale[i:i + batch]]
+            stmts = [f"UPDATE Node SET degree={int(degree.get(n, 0))} WHERE id_key={_sql_str(_id_key(n))}"
+                     for n in stale[i:i + batch]]
             if stmts:
                 self._run(";".join(stmts), language="sqlscript")
 
         gods = _god(G, top_n=64)
         self._run("DELETE FROM Meta WHERE key = 'god_nodes'")
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
-        return {"deleted_sources": len(dirty), "upserted_nodes": len(changed_ids), "upserted_edges": len(new_edges)}
+        stats = {"deleted_sources": len(dirty), "upserted_nodes": len(changed_ids),
+                 "upserted_edges": len(new_edges)}
+        # sync_graph's contract is that the DB ends up equal to G, so G is the
+        # yardstick here exactly as graph.json is for a full load.
+        stats.update(self._reconcile(
+            G.number_of_nodes(), G.number_of_edges(),
+            node_ids=list(G.nodes()),
+            edges=[(d.get("_src") or u, d.get("_tgt") or v) for u, v, d in G.edges(data=True)]))
+        return stats
 
     # ---- scoring / seed resolution (exact parity via shared kernel) ---------
     def _idf(self, norm_terms: list[str]) -> dict[str, float]:
@@ -770,17 +942,17 @@ class ArcadeDBBackend(GraphBackend):
     def _neighborhood(self, seeds: list[str], depth: int):
         rows = self._run(
             "SELECT id, label, source_file, source_location, community, degree FROM "
-            f"(TRAVERSE out('Rel') FROM (SELECT FROM Node WHERE id IN :s) MAXDEPTH {depth}) WHERE @type = 'Node'",
-            params={"s": seeds},
+            f"(TRAVERSE out('Rel') FROM (SELECT FROM Node WHERE id_key IN :s) MAXDEPTH {depth}) WHERE @type = 'Node'",
+            params={"s": [_id_key(s) for s in seeds]},
         )
         vids = {r["id"] for r in rows}
         node_attrs = {r["id"]: r for r in rows}
         # Edge-endpoint access only works via Cypher on ArcadeDB (SQL `out.id`
         # projects null); MATCH binds both endpoints and the edge props.
         erows = self._run(
-            "MATCH (a:Node)-[r:Rel]->(b:Node) WHERE a.id IN $v AND b.id IN $v "
+            "MATCH (a:Node)-[r:Rel]->(b:Node) WHERE a.id_key IN $v AND b.id_key IN $v "
             "RETURN a.id AS s, b.id AS t, r.relation AS relation, r.confidence AS confidence, r.context AS context",
-            kind="query", language="cypher", params={"v": list(vids)},
+            kind="query", language="cypher", params={"v": [_id_key(v) for v in vids]},
         )
         return node_attrs, erows
 
@@ -879,9 +1051,10 @@ class ArcadeDBBackend(GraphBackend):
         needle = label.lower()
         rows = self._run(
             "SELECT id, label, source_file, source_location, file_type, community, degree FROM Node "
-            "WHERE norm_label LIKE :p OR id = :id ORDER BY id",
-            params={"p": f"%{needle}%", "id": label},
+            "WHERE norm_label LIKE :p OR id_key = :idk",
+            params={"p": f"%{needle}%", "idk": _id_key(label)},
         )
+        rows.sort(key=_by_id)
         for r in rows:
             if needle in (r.get("label") or "").lower() or needle == r["id"].lower():
                 return NodeDetail(label=r.get("label", r["id"]), id=r["id"],
@@ -897,8 +1070,9 @@ class ArcadeDBBackend(GraphBackend):
         term = " ".join(_search_tokens(label))
         if not term:
             return None
-        rows = self._run("SELECT id, label, norm_label FROM Node WHERE norm_label LIKE :p OR id LIKE :p ORDER BY id",
+        rows = self._run("SELECT id, label, norm_label FROM Node WHERE norm_label LIKE :p OR id LIKE :p",
                          params={"p": f"%{term}%"})
+        rows.sort(key=_by_id)
         tiers: list[list[dict]] = [[], [], []]
         for r in rows:
             nl = (r.get("norm_label") or _strip_diacritics(str(r.get("label", "")))).lower()
@@ -921,13 +1095,13 @@ class ArcadeDBBackend(GraphBackend):
         nid = node["id"]
         rf = relation_filter.lower()
         out = self._run(
-            "MATCH (a:Node {id:$id})-[r:Rel]->(b:Node) "
+            "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
             "RETURN b.id AS nb, b.label AS lbl, r.relation AS relation, r.confidence AS confidence",
-            kind="query", language="cypher", params={"id": nid})
+            kind="query", language="cypher", params={"id": _id_key(nid)})
         inc = self._run(
-            "MATCH (a:Node)-[r:Rel]->(b:Node {id:$id}) "
+            "MATCH (a:Node)-[r:Rel]->(b:Node {id_key:$id}) "
             "RETURN a.id AS nb, a.label AS lbl, r.relation AS relation, r.confidence AS confidence",
-            kind="query", language="cypher", params={"id": nid})
+            kind="query", language="cypher", params={"id": _id_key(nid)})
         recs = []
         for r in out:
             if rf and rf not in (r.get("relation") or "").lower():
@@ -940,10 +1114,11 @@ class ArcadeDBBackend(GraphBackend):
         return Neighbors(label=node.get("label", nid), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:
-        rows = self._run("SELECT id, label, source_file, community_name FROM Node WHERE community = :c ORDER BY id",
+        rows = self._run("SELECT id, label, source_file, community_name FROM Node WHERE community = :c",
                         params={"c": int(community_id)})
         if not rows:
             return None
+        rows.sort(key=_by_id)
         return CommunityRecord(cid=int(community_id),
                                members=[NodeRecord(label=r.get("label", r["id"]),
                                                    source_file=str(r.get("source_file", "") or "")) for r in rows],
@@ -985,9 +1160,9 @@ class ArcadeDBBackend(GraphBackend):
         # ArcadeDB for a pathological `*..1000000000` expansion.
         bound = min(max(max_hops, 1), 64)
         rows = self._run(
-            f"MATCH (a:Node {{id:$s}}),(b:Node {{id:$t}}), p=shortestPath((a)-[:Rel*..{bound}]-(b)) "
+            f"MATCH (a:Node {{id_key:$s}}),(b:Node {{id_key:$t}}), p=shortestPath((a)-[:Rel*..{bound}]-(b)) "
             "RETURN [n IN nodes(p) | n.id] AS ids",
-            kind="query", language="cypher", params={"s": s_id, "t": t_id})
+            kind="query", language="cypher", params={"s": _id_key(s_id), "t": _id_key(t_id)})
         ids = rows[0]["ids"] if rows and rows[0].get("ids") else None
         if not ids:
             return PathResult(found=False, reason="no-path", start_label=s_label,
@@ -1000,21 +1175,21 @@ class ArcadeDBBackend(GraphBackend):
         for i in range(len(ids) - 1):
             u, v = ids[i], ids[i + 1]
             fwd = self._run(
-                "MATCH (a:Node {id:$u})-[r:Rel]->(b:Node {id:$v}) RETURN r.relation AS relation, r.confidence AS confidence",
-                kind="query", language="cypher", params={"u": u, "v": v})
+                "MATCH (a:Node {id_key:$u})-[r:Rel]->(b:Node {id_key:$v}) RETURN r.relation AS relation, r.confidence AS confidence",
+                kind="query", language="cypher", params={"u": _id_key(u), "v": _id_key(v)})
             if fwd:
                 d, outgoing = fwd[0], True
             else:
                 back = self._run(
-                    "MATCH (a:Node {id:$v})-[r:Rel]->(b:Node {id:$u}) RETURN r.relation AS relation, r.confidence AS confidence",
-                    kind="query", language="cypher", params={"u": u, "v": v})
+                    "MATCH (a:Node {id_key:$v})-[r:Rel]->(b:Node {id_key:$u}) RETURN r.relation AS relation, r.confidence AS confidence",
+                    kind="query", language="cypher", params={"u": _id_key(u), "v": _id_key(v)})
                 d, outgoing = (back[0] if back else {}), False
             segments.append(PathSegment(outgoing=outgoing, relation=d.get("relation", ""),
                                         confidence=d.get("confidence", ""), label=labels[v]))
         return PathResult(found=True, start_label=s_label, hops=hops, segments=segments, warnings=warnings)
 
     def _label_of(self, nid: str) -> str:
-        rows = self._run("SELECT label FROM Node WHERE id = :id LIMIT 1", params={"id": nid})
+        rows = self._run("SELECT label FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})
         return rows[0]["label"] if rows and rows[0].get("label") else nid
 
     def explain(self, label) -> ExplainResult | None:
@@ -1023,7 +1198,7 @@ class ArcadeDBBackend(GraphBackend):
             return None
         nid = node["id"]
         rows = self._run("SELECT id, label, source_file, source_location, file_type, community, degree "
-                        "FROM Node WHERE id = :id LIMIT 1", params={"id": nid})
+                        "FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})
         if not rows:
             return None
         r = rows[0]
@@ -1035,13 +1210,13 @@ class ArcadeDBBackend(GraphBackend):
             degree=int(r.get("degree") or 0),
         )
         out = self._run(
-            "MATCH (a:Node {id:$id})-[r:Rel]->(b:Node) "
+            "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
             "RETURN b.label AS lbl, b.degree AS deg, r.relation AS relation, r.confidence AS confidence",
-            kind="query", language="cypher", params={"id": nid})
+            kind="query", language="cypher", params={"id": _id_key(nid)})
         inc = self._run(
-            "MATCH (a:Node)-[r:Rel]->(b:Node {id:$id}) "
+            "MATCH (a:Node)-[r:Rel]->(b:Node {id_key:$id}) "
             "RETURN a.label AS lbl, a.degree AS deg, r.relation AS relation, r.confidence AS confidence",
-            kind="query", language="cypher", params={"id": nid})
+            kind="query", language="cypher", params={"id": _id_key(nid)})
         conns = [Connection(True, x.get("lbl", ""), str(x.get("relation", "")), str(x.get("confidence", "")),
                             int(x.get("deg") or 0)) for x in out]
         conns += [Connection(False, x.get("lbl", ""), str(x.get("relation", "")), str(x.get("confidence", "")),
