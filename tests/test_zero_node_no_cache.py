@@ -52,3 +52,13 @@ def test_no_warning_when_all_files_produce_nodes(tmp_path, capsys):
     ex.extract([f], cache_root=tmp_path / "out", parallel=False)
     err = capsys.readouterr().err
     assert "zero nodes" not in err
+
+
+def test_no_warning_for_deliberately_skipped_data_json(tmp_path, capsys):
+    # Data JSON is skipped by design (#1224) — a "skipped" result is not an
+    # anomaly and must not trigger the #1666 zero-node warning.
+    f = tmp_path / "fixture.json"
+    f.write_text('{"rows": [1, 2, 3]}\n')
+    ex.extract([f], cache_root=tmp_path / "out", parallel=False)
+    err = capsys.readouterr().err
+    assert "zero nodes" not in err

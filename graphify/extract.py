@@ -4400,10 +4400,12 @@ def extract(
     # #1666: surface any source file an extractor accepted but that produced zero
     # nodes (not even a file node). Such a file is silently absent from the graph,
     # so affected/explain are blind to and through it with no other signal.
+    # Deliberately skipped files ("skipped", e.g. data JSON per #1224) are not
+    # anomalies and must not be reported as such.
     _empty_sources: list[str] = []
     for i, _p in enumerate(paths):
         _res = per_file[i] or {}
-        if _res.get("nodes") or _res.get("error"):
+        if _res.get("nodes") or _res.get("error") or _res.get("skipped"):
             continue
         if _get_extractor(_p) is not None:
             _empty_sources.append(str(_p))
