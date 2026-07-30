@@ -562,9 +562,12 @@ def _read_files(units: "list[Path | FileSlice]", root: Path) -> str:
             print(f"[graphify] skipping {p}: symlink target outside corpus root", file=sys.stderr)
             continue
         try:
-            rel = str(p.relative_to(root))
+            # POSIX form: the schema example says "relative/path", and a Windows
+            # backslash rel invites the model to "normalize" the path its own way
+            # (dropping the corpus prefix), breaking attribution (#1991).
+            rel = p.relative_to(root).as_posix()
         except ValueError:
-            rel = str(p)
+            rel = p.as_posix()
         try:
             if isinstance(u, FileSlice):
                 content = read_slice_text(u)
@@ -797,9 +800,10 @@ def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool =
             print(f"[graphify] skipping image {p}: symlink target outside corpus root", file=sys.stderr)
             continue
         try:
-            rel = str(p.relative_to(root))
+            # POSIX form for the same reason as _read_files (#1991).
+            rel = p.relative_to(root).as_posix()
         except ValueError:
-            rel = str(p)
+            rel = p.as_posix()
         media = _IMAGE_MEDIA_TYPES.get(p.suffix.lower(), "image/png")
         raw: bytes | None = None
         if read_bytes:
@@ -2069,6 +2073,71 @@ def _extract_with_adaptive_retry(
     }
 
 
+def _repair_source_attribution(
+    result: dict, chunk: "list[Path | FileSlice]", root: Path
+) -> int:
+    """Rewrite model-mangled ``source_file`` values back to dispatched files (#1991).
+
+    With a nested-repo corpus the model often attributes items to paths as they
+    are written INSIDE the documents (relative to the inner repo root, e.g.
+    ``native/pom.xml``) instead of the corpus-relative path it was shown
+    (``arcadedb/native/pom.xml``). Such a path resolves to nothing under
+    ``root``, so the checkpoint cache write skips the whole group (#1991), the
+    dispatch/return reconciliation counts the file as "produced no nodes" and
+    re-dispatches it forever (#1890), and the item lands in graph.json with a
+    dangling source_file.
+
+    Heal deterministically: a relative source_file that does not resolve to a
+    real file under ``root`` but is a UNIQUE path-suffix match of one file
+    dispatched in this chunk is rewritten to that file's corpus-relative POSIX
+    form. Ambiguous or unmatched values (concepts, model-invented anchors) are
+    left untouched. Returns the number of rewritten items.
+    """
+    rels: list[str] = []
+    for u in chunk:
+        p = unit_path(u)
+        try:
+            rels.append(p.relative_to(root).as_posix())
+        except ValueError:
+            rels.append(p.as_posix())
+
+    fixes: dict[str, str | None] = {}
+
+    def _fix(sf: str) -> str | None:
+        if sf in fixes:
+            return fixes[sf]
+        fixed: str | None = None
+        p = Path(sf)
+        if not p.is_absolute():
+            try:
+                exists = (root / p).is_file()
+            except OSError:
+                exists = False
+            if not exists:
+                cand = sf.replace("\\", "/")
+                if cand.startswith("./"):
+                    cand = cand[2:]
+                matches = {r for r in rels if r == cand or r.endswith("/" + cand)}
+                if len(matches) == 1:
+                    fixed = next(iter(matches))
+        fixes[sf] = fixed
+        return fixed
+
+    repaired = 0
+    for bucket in ("nodes", "edges", "hyperedges"):
+        for item in result.get(bucket, []) or []:
+            if not isinstance(item, dict):
+                continue
+            sf = item.get("source_file")
+            if not sf or not isinstance(sf, str):
+                continue
+            fixed = _fix(sf)
+            if fixed is not None and fixed != sf:
+                item["source_file"] = fixed
+                repaired += 1
+    return repaired
+
+
 def extract_corpus_parallel(
     files: list[Path],
     backend: str = "kimi",
@@ -2161,6 +2230,17 @@ def extract_corpus_parallel(
                 max_depth=max_retry_depth,
                 deep_mode=deep_mode,
             )
+            # Heal model-mangled attributions BEFORE the checkpoint cache write
+            # and the merge, so the cache is written and the #1890/#1895 passes
+            # see repaired paths (#1991).
+            repaired = _repair_source_attribution(result, chunk, root)
+            if repaired:
+                print(
+                    f"[graphify] repaired source_file attribution on {repaired} "
+                    f"item(s) in chunk {idx + 1}: the model returned paths "
+                    f"without their corpus-relative prefix (#1991).",
+                    file=sys.stderr,
+                )
             result["elapsed_seconds"] = round(time.time() - t0, 2)
             return idx, result, None
         except Exception as exc:  # noqa: BLE001 — caller-facing surface, log + continue

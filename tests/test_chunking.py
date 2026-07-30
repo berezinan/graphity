@@ -864,3 +864,85 @@ def test_pack_chunks_with_special_token_doc_does_not_crash(tmp_path):
     code = tmp_path / "code.py"; code.write_text("def f():\n    return 1\n")
     chunks = _pack_chunks_by_tokens([doc, code], token_budget=60_000)
     assert chunks  # produced at least one chunk, no exception
+
+
+# ---- #1991: model-mangled source_file attribution is repaired per chunk ----
+
+def test_prefix_dropped_source_files_are_repaired(tmp_path, capsys):
+    """#1991 (nested-repo cause): the model attributes items to paths as written
+    INSIDE the documents (relative to the inner repo root, e.g. `docs/guide.md`)
+    instead of the corpus-relative path it was shown (`arcadedb/docs/guide.md`).
+    A unique path-suffix match against the chunk's dispatched files must be
+    rewritten; unmatched values (concepts, undispatched refs) stay untouched."""
+    from graphify.llm import extract_corpus_parallel
+
+    repo = tmp_path / "arcadedb"
+    guide = repo / "docs" / "guide.md"
+    conf = repo / ".github" / "config.yml"
+    pom = repo / "native" / "pom.xml"  # exists but NOT dispatched
+    for f, text in ((guide, "# guide\n"), (conf, "key: v\n"), (pom, "<project/>\n")):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+
+    def mangle(chunk, **kwargs):
+        return {
+            "nodes": [
+                # prefix dropped by the model — must be repaired
+                {"id": "g", "source_file": "docs/guide.md", "file_type": "document"},
+                {"id": "c", "source_file": ".github/config.yml", "file_type": "document"},
+                # undispatched real file — no suffix match, stays untouched
+                {"id": "pom", "source_file": "native/pom.xml", "file_type": "code"},
+                # concept anchor — stays untouched
+                {"id": "flow", "source_file": "auth flow", "file_type": "concept"},
+            ],
+            "edges": [
+                {"source": "g", "target": "c", "source_file": "docs/guide.md"},
+            ],
+            "hyperedges": [],
+            "input_tokens": 1, "output_tokens": 1,
+        }
+
+    with patch("graphify.llm.extract_files_direct", side_effect=mangle):
+        result = extract_corpus_parallel(
+            [guide, conf], backend="kimi", root=tmp_path,
+            token_budget=None, chunk_size=2, max_concurrency=1,
+        )
+
+    by_id = {n["id"]: n["source_file"] for n in result["nodes"]}
+    assert by_id["g"] == "arcadedb/docs/guide.md"
+    assert by_id["c"] == "arcadedb/.github/config.yml"
+    assert by_id["pom"] == "native/pom.xml"
+    assert by_id["flow"] == "auth flow"
+    assert result["edges"][0]["source_file"] == "arcadedb/docs/guide.md"
+    # both dispatched files are covered — no #1890 re-dispatch loop
+    assert result.get("uncovered_files", []) == []
+    err = capsys.readouterr().err
+    assert "repaired source_file attribution" in err and "#1991" in err
+
+
+def test_ambiguous_suffix_match_is_not_repaired(tmp_path, capsys):
+    """A bare name matching MORE than one dispatched file is ambiguous — the
+    repair must not guess, so the value stays as the model returned it."""
+    from graphify.llm import extract_corpus_parallel
+
+    a = tmp_path / "a" / "readme.md"
+    b = tmp_path / "b" / "readme.md"
+    for f in (a, b):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("# r\n", encoding="utf-8")
+
+    def bare(chunk, **kwargs):
+        return {
+            "nodes": [{"id": "r", "source_file": "readme.md", "file_type": "document"}],
+            "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1,
+        }
+
+    with patch("graphify.llm.extract_files_direct", side_effect=bare):
+        result = extract_corpus_parallel(
+            [a, b], backend="kimi", root=tmp_path,
+            token_budget=None, chunk_size=2, max_concurrency=1,
+        )
+
+    assert result["nodes"][0]["source_file"] == "readme.md"
+    err = capsys.readouterr().err
+    assert "repaired source_file attribution" not in err
