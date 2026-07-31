@@ -770,7 +770,13 @@ class ArcadeDBBackend(GraphBackend):
                     "CREATE PROPERTY Node.id STRING", "CREATE PROPERTY Node.norm_label STRING",
                     "CREATE PROPERTY Node.degree INTEGER", "CREATE PROPERTY Node.id_key STRING",
                     # Unique over the ASCII digest, never over `id` itself - see _id_key.
-                    "CREATE INDEX ON Node (id_key) UNIQUE", "CREATE INDEX ON Node (norm_label) FULL_TEXT",
+                    "CREATE INDEX ON Node (id_key) UNIQUE",
+                    # No index on norm_label on purpose. Every label search here is
+                    # `norm_label LIKE '%term%'`, and a leading wildcard cannot use an
+                    # index of any kind - EXPLAIN on 1.18M nodes confirms a plain
+                    # SCAN WITH FILTER. The FULL_TEXT index that used to sit here was
+                    # never queried by anything (full-text needs its own operators, LIKE
+                    # does not reach it) and cost 40MB on a real project.
                     # Indexed so the p99 hub threshold (ORDER BY degree) avoids the
                     # in-heap sort cap on large graphs.
                     "CREATE INDEX ON Node (degree) NOTUNIQUE"):
