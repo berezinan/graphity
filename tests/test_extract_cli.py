@@ -80,6 +80,47 @@ def test_extract_exits_nonzero_when_all_semantic_chunks_fail(
     )
 
 
+def test_extract_exits_nonzero_when_chunks_were_refused(
+    monkeypatch, tmp_path, capsys
+):
+    """A chunk refused as too large for the model's context window returns
+    normally, so it reports as done and leaves `failed_chunks` at 0.
+
+    Measured before this guard: a corpus lost in full still exited 0 with a
+    short graph — a green CI run over a graph missing every document.
+    """
+    corpus = _make_corpus(tmp_path)
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+
+    def _chunk_refused(paths, **kwargs):
+        on_chunk = kwargs.get("on_chunk_done")
+        if on_chunk:
+            on_chunk(0, 1, {"nodes": [], "edges": [], "hyperedges": []})
+        return {
+            "nodes": [], "edges": [], "hyperedges": [],
+            "input_tokens": 0, "output_tokens": 0,
+            "context_lost_chunks": 1,
+            "context_lost_files": [str(corpus / "README.md")],
+        }
+
+    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _chunk_refused)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "extract", str(corpus), "--backend", "claude",
+         "--out", str(out_dir)],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        mainmod.main()
+
+    assert exc_info.value.code == 1, (
+        f"a refused chunk must not exit clean; got {exc_info.value.code}"
+    )
+
+
 def test_extract_succeeds_when_at_least_one_chunk_completes(
     monkeypatch, tmp_path
 ):

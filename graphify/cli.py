@@ -334,6 +334,14 @@ def _enforce_graph_size_cap_or_exit(gp: Path) -> None:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
+def _extract_exit_code(context_lost_chunks: int) -> int:
+    """Exit code for ``graphify extract``: non-zero when chunks were refused.
+
+    Keyed on the refusal tally, not on "some file produced no nodes" — a model
+    may legitimately find nothing in a file, and failing on that would make the
+    signal useless. A refusal means the model never saw the file at all.
+    """
+    return 1 if context_lost_chunks else 0
 def _hook_strict_enabled(flag: bool) -> bool:
     """Resolve strict mode: GRAPHIFY_HOOK_STRICT env overrides the baked-in flag
     (truthy forces on without a reinstall, falsy is the kill switch); unset defers
@@ -2811,6 +2819,10 @@ def dispatch_command(cmd: str) -> None:
         # be force-written over a good complete graph — the final write falls back
         # to the #479 shrink guard unless --allow-partial is set.
         _extraction_incomplete = False
+        # Chunks the model never answered for because the request was refused as
+        # too large. These return normally, so without their own tally the run
+        # writes a short graph and exits 0 — green in CI.
+        _context_lost_chunks = 0
         # A walk that couldn't fully enumerate the corpus (permission-denied
         # subtree, I/O error) yields a legitimately smaller graph that must not
         # be force-written over a complete one — same failure class as a crashed
@@ -2948,6 +2960,12 @@ def dispatch_command(cmd: str) -> None:
                 # from the failed chunks, so it must not clobber a larger complete
                 # graph without an explicit --allow-partial override.
                 if _chunk_stats["total"] and _chunk_stats["succeeded"] < _chunk_stats["total"]:
+                    _extraction_incomplete = True
+                # A refused chunk reports as succeeded (it returned), so the check
+                # above misses it. The graph is short by whatever it covered, which
+                # is the same class of incompleteness.
+                _context_lost_chunks = fresh.get("context_lost_chunks", 0) or 0
+                if _context_lost_chunks:
                     _extraction_incomplete = True
                 # Which files truncated this run (item markers + the empty-parse
                 # _partial_files set). Computed BEFORE the save so it can be passed
@@ -3208,7 +3226,7 @@ def dispatch_command(cmd: str) -> None:
                 except Exception as exc:
                     print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
             stages.total()
-            sys.exit(0)
+            sys.exit(_extract_exit_code(_context_lost_chunks))
 
         # Build graph + cluster + score + write.
         from graphify.build import (
@@ -3397,6 +3415,8 @@ def dispatch_command(cmd: str) -> None:
             "to generate GRAPH_REPORT.md and name communities"
         )
         stages.total()
+        if _context_lost_chunks:
+            sys.exit(_extract_exit_code(_context_lost_chunks))
 
     elif cmd == "cache-check":
         # graphify cache-check <files_from> [--root <dir>] [--mode <m> | --deep]

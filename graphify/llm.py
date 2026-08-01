@@ -1570,6 +1570,7 @@ def extract_files_direct(
     root: Path = Path("."),
     *,
     deep_mode: bool = False,
+    max_output_tokens: int | None = None,
 ) -> dict:
     """Extract semantic nodes/edges from a list of files using the given backend.
 
@@ -1582,6 +1583,11 @@ def extract_files_direct(
     ``_build_image_refs``) can rely on ``Path`` semantics (#1386). FileSlice units
     (from extract_corpus_parallel's oversized-doc slicing, #1369) pass through
     untouched — Path(FileSlice) would raise (#1397/#1399).
+
+    ``max_output_tokens`` overrides the backend's output cap for this call only.
+    The adaptive-retry layer uses it to shrink the requested output after a
+    context-window refusal: the server rejects on ``input + requested output``,
+    so a retry that only shrinks the input cannot converge.
     """
     files = [f if isinstance(f, (Path, FileSlice)) else Path(f) for f in files]
     if backend is None:
@@ -1629,7 +1635,7 @@ def extract_files_direct(
     image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
     if image_refs and not vision:
         image_refs = _strip_pixels(image_refs)
-    max_out = _resolve_max_tokens(cfg.get("max_tokens", 8192))
+    max_out = max_output_tokens or _resolve_max_tokens(cfg.get("max_tokens", 8192))
 
     if backend == "claude":
         result = _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
@@ -1665,7 +1671,7 @@ def extract_files_direct(
             # (ollama/deepseek/kimi/openai) -- most openai-compat configs define the
             # latter, so reading only max_completion_tokens silently capped their
             # output at the 8192 fallback and truncated deep-mode JSON (#1365).
-            max_completion_tokens=_resolve_max_tokens(
+            max_completion_tokens=max_output_tokens or _resolve_max_tokens(
                 cfg.get("max_completion_tokens") or cfg.get("max_tokens", 8192)
             ),
             backend=backend,
@@ -1810,6 +1816,28 @@ def _looks_like_context_exceeded(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CONTEXT_EXCEEDED_MARKERS)
 
 
+# Floor for the shrinking retry below, measured rather than assumed: one slice
+# of `_TEXT_SLICE_CHARS` (5 815 prompt tokens) needed 3 712-4 150 output tokens
+# to answer at all. Below that the response is not a smaller graph, it is no
+# graph — every run under the needed length parsed to zero nodes, because the
+# JSON is all-or-nothing. 4 096 straddled the boundary (1 of 3 runs truncated),
+# so it is the lowest budget with any chance for an indivisible unit; shrinking
+# past it buys full-price generations that cannot succeed.
+_MIN_OUTPUT_TOKENS = 4096
+
+
+def _backend_max_output_tokens(backend: str) -> int:
+    """The output cap `extract_files_direct` would use for `backend` by default.
+
+    The retry layer needs a concrete starting value to shrink from; resolving it
+    here keeps that logic from duplicating the per-backend key fallback.
+    """
+    cfg = BACKENDS.get(backend) or {}
+    return _resolve_max_tokens(
+        cfg.get("max_completion_tokens") or cfg.get("max_tokens", 8192)
+    )
+
+
 def _mark_partial(result: dict) -> None:
     """Tag every node/edge/hyperedge in a truncated chunk result with an internal
     ``_partial`` marker.
@@ -1846,6 +1874,20 @@ def _merged_partial_files(*results: dict) -> list[str]:
     return sorted(out)
 
 
+def _merged_context_lost_files(*results: dict) -> list[str]:
+    """Union of the ``_context_lost_files`` carried by each result.
+
+    A chunk abandoned because the model refused the request has no items to
+    carry a marker, so the files it covered are recorded by path instead —
+    the same device ``_partial_files`` uses for an empty-parse truncation.
+    Without it the loss reaches the caller as an ordinary empty result.
+    """
+    out: set[str] = set()
+    for r in results:
+        out.update(r.get("_context_lost_files", []) or [])
+    return sorted(out)
+
+
 def _partial_source_files(result: dict) -> list[str]:
     """Source files known partial: those carrying a ``_partial`` item marker, plus
     any recorded in ``_partial_files`` (a chunk that truncated to an empty parse
@@ -1873,6 +1915,23 @@ def _strip_partial_markers(result: dict) -> None:
                 item.pop("_partial", None)
 
 
+def _context_lost_result(chunk, model: str | None) -> dict:
+    """Empty result for a chunk abandoned after a context refusal.
+
+    ``finish_reason`` is deliberately NOT ``"stop"``: an empty result labelled
+    as a normal completion reads as "the model answered and found nothing", so
+    the chunk was reported done, ``failed_chunks`` stayed 0 and the process
+    exited 0 with the corpus missing from the graph.
+    """
+    return {
+        "nodes": [], "edges": [], "hyperedges": [],
+        "input_tokens": 0, "output_tokens": 0,
+        "model": model,
+        "finish_reason": "context_exceeded",
+        "_context_lost_files": _chunk_partial_files(chunk),
+    }
+
+
 def _extract_with_adaptive_retry(
     chunk: list[Path],
     backend: str,
@@ -1883,6 +1942,7 @@ def _extract_with_adaptive_retry(
     _depth: int = 0,
     *,
     deep_mode: bool = False,
+    max_output_tokens: int | None = None,
 ) -> dict:
     """Extract a chunk; if the response is truncated (`finish_reason="length"`)
     or the API rejects the prompt as too large for the model's context window,
@@ -1917,13 +1977,24 @@ def _extract_with_adaptive_retry(
     (e.g. one huge code file) is emergency-sliced as a last resort so a
     god-module degrades into a complete-but-fragmented graph instead of a silent
     partial result (A-hybrid). Only a file too small to split is kept partial.
+
+    The two signals shrink DIFFERENT things, because they fail for opposite
+    reasons. A truncation means the output did not fit, so only the input may
+    shrink. A context refusal is on `input + requested output`, so both shrink:
+    with the requested output fixed, the refusal condition holds at every depth
+    and the recursion cannot converge — measured against a 16 384 window with
+    32 768 requested, the input fell 22x (18 131 -> 816 tokens) and all 15
+    requests were still refused. `max_output_tokens` carries the shrunken budget
+    down one branch; it never leaks to a sibling chunk.
     """
-    def _merge_two(left_units, right_units) -> dict:
+    def _merge_two(left_units, right_units, out_budget=None) -> dict:
         left = _extract_with_adaptive_retry(
-            left_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+            left_units, backend, api_key, model, root, max_depth, _depth + 1,
+            deep_mode=deep_mode, max_output_tokens=out_budget or max_output_tokens
         )
         right = _extract_with_adaptive_retry(
-            right_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+            right_units, backend, api_key, model, root, max_depth, _depth + 1,
+            deep_mode=deep_mode, max_output_tokens=out_budget or max_output_tokens
         )
         return {
             "nodes": left.get("nodes", []) + right.get("nodes", []),
@@ -1934,6 +2005,7 @@ def _extract_with_adaptive_retry(
             "model": model,
             "finish_reason": "stop",
             "_partial_files": _merged_partial_files(left, right),
+            "_context_lost_files": _merged_context_lost_files(left, right),
         }
 
     def _split_lone_slice() -> "tuple[FileSlice, FileSlice] | None":
@@ -1950,12 +2022,24 @@ def _extract_with_adaptive_retry(
         return bisect_path(unit)
 
     try:
+        # Only pass the budget once there is one. The first attempt of every
+        # chunk then calls exactly as it did before, so a caller or test double
+        # that wraps `extract_files_direct` with a fixed signature keeps working
+        # unless a shrunken budget is actually in play.
+        budget_kw = {"max_output_tokens": max_output_tokens} if max_output_tokens else {}
         result = extract_files_direct(
-            chunk, backend=backend, api_key=api_key, model=model, root=root, deep_mode=deep_mode
+            chunk, backend=backend, api_key=api_key, model=model, root=root,
+            deep_mode=deep_mode, **budget_kw,
         )
     except Exception as exc:  # noqa: BLE001 — re-raise unless it's a known context overflow
         if not _looks_like_context_exceeded(exc):
             raise
+        # The server refuses on `input + requested output`. Halving the chunk
+        # moves only the first term, so the retry must move the second one too.
+        current_out = max_output_tokens or _backend_max_output_tokens(backend)
+        smaller_out = current_out // 2
+        if smaller_out < _MIN_OUTPUT_TOKENS:
+            smaller_out = None
         if len(chunk) <= 1:
             halves = _split_lone_slice()
             if halves is not None:
@@ -1964,42 +2048,42 @@ def _extract_with_adaptive_retry(
                     f"depth {_depth}; splitting the slice and retrying",
                     file=sys.stderr,
                 )
-                return _merge_two([halves[0]], [halves[1]])
+                return _merge_two([halves[0]], [halves[1]], smaller_out)
+            if smaller_out is not None and _depth < max_depth:
+                # Nothing left to split, but the output budget can still move —
+                # without this a lone unit gives up while the request is still
+                # dominated by the output we asked for.
+                print(
+                    f"[graphify] single-file chunk {unit_path(chunk[0])} exceeded context "
+                    f"at depth {_depth} and cannot be split; retrying with an output "
+                    f"budget of {smaller_out} (was {current_out})",
+                    file=sys.stderr,
+                )
+                return _extract_with_adaptive_retry(
+                    chunk, backend, api_key, model, root, max_depth, _depth + 1,
+                    deep_mode=deep_mode, max_output_tokens=smaller_out,
+                )
             print(
                 f"[graphify] single-file chunk {unit_path(chunk[0])} exceeds model context "
                 f"and cannot be split further: {exc}",
                 file=sys.stderr,
             )
-            return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
+            return _context_lost_result(chunk, model)
         if _depth >= max_depth:
             print(
                 f"[graphify] chunk of {len(chunk)} still overflows context at "
                 f"recursion depth {_depth} (max {max_depth}) — dropping",
                 file=sys.stderr,
             )
-            return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
+            return _context_lost_result(chunk, model)
+        budget_note = f" and an output budget of {smaller_out}" if smaller_out else ""
         print(
             f"[graphify] chunk of {len(chunk)} exceeded context at depth "
-            f"{_depth} ({type(exc).__name__}); splitting in half and retrying",
+            f"{_depth} ({type(exc).__name__}); retrying on halves{budget_note}",
             file=sys.stderr,
         )
         mid = len(chunk) // 2
-        left = _extract_with_adaptive_retry(
-            chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
-        )
-        right = _extract_with_adaptive_retry(
-            chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
-        )
-        return {
-            "nodes": left.get("nodes", []) + right.get("nodes", []),
-            "edges": left.get("edges", []) + right.get("edges", []),
-            "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-            "model": model,
-            "finish_reason": "stop",
-            "_partial_files": _merged_partial_files(left, right),
-        }
+        return _merge_two(chunk[:mid], chunk[mid:], smaller_out)
 
     if result.get("finish_reason") != "length":
         return result
@@ -2051,11 +2135,15 @@ def _extract_with_adaptive_retry(
         file=sys.stderr,
     )
     mid = len(chunk) // 2
+    # Truncation means the output did not fit, so the budget stays as it is and
+    # only the input shrinks — it is carried down unchanged, not reset.
     left = _extract_with_adaptive_retry(
-        chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1,
+        deep_mode=deep_mode, max_output_tokens=max_output_tokens
     )
     right = _extract_with_adaptive_retry(
-        chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1,
+        deep_mode=deep_mode, max_output_tokens=max_output_tokens
     )
 
     return {
@@ -2070,6 +2158,7 @@ def _extract_with_adaptive_retry(
         # logical unit.
         "finish_reason": "stop",
         "_partial_files": _merged_partial_files(left, right),
+        "_context_lost_files": _merged_context_lost_files(left, right),
     }
 
 
@@ -2215,6 +2304,11 @@ def extract_corpus_parallel(
         "nodes": [], "edges": [], "hyperedges": [],
         "input_tokens": 0, "output_tokens": 0,
         "failed_chunks": 0,  # count of chunks that raised — loud failure on chunk errors
+        # Chunks the model never answered for: the request was refused as too
+        # large and recovery ran out of room. Not a raised failure, so it needs
+        # its own counter or it disappears into a clean exit.
+        "context_lost_chunks": 0,
+        "context_lost_files": [],
     }
     total = len(chunks)
 
@@ -2352,6 +2446,17 @@ def extract_corpus_parallel(
             " — see errors above. Partial results returned.",
             file=sys.stderr,
         )
+    if merged["context_lost_chunks"] > 0:
+        lost = merged["context_lost_files"]
+        shown = ", ".join(Path(p).name for p in lost[:5])
+        more = f" (+{len(lost) - 5} more)" if len(lost) > 5 else ""
+        print(
+            f"[graphify] WARNING: {merged['context_lost_chunks']}/{total} semantic chunk(s) "
+            f"were refused as too large for the model's context window and are missing from "
+            f"the graph ({len(lost)} file(s): {shown}{more}). Lower --token-budget or "
+            f"GRAPHIFY_MAX_OUTPUT_TOKENS, or use a model with a larger window.",
+            file=sys.stderr,
+        )
 
     # Dispatch/return reconciliation (#1890). A chunk can return a clean, non-empty
     # response that simply omits some of the documents it was given; those docs then
@@ -2437,14 +2542,33 @@ def extract_corpus_parallel(
     )
     merged["uncovered_files"] = [str(p) for p in uncovered]
     if uncovered:
-        shown = ", ".join(p.name for p in uncovered[:5])
-        more = f" (+{len(uncovered) - 5} more)" if len(uncovered) > 5 else ""
-        print(
-            f"[graphify] WARNING: {len(uncovered)}/{len(dispatched)} dispatched file(s) "
-            f"produced no nodes and are absent from the graph: {shown}{more}. The model "
-            "returned a response but omitted them; a re-run will retry them.",
-            file=sys.stderr,
-        )
+        # Two causes, two actions. "The model omitted them" sends the reader to
+        # the prompt or the model; for a refused request neither was involved —
+        # the model never saw the file, and a re-run repeats the refusal.
+        refused = {Path(p).resolve() for p in merged.get("context_lost_files", []) or []}
+        omitted = [p for p in uncovered if p.resolve() not in refused]
+        lost = [p for p in uncovered if p.resolve() in refused]
+
+        def _names(paths: list[Path]) -> str:
+            shown = ", ".join(p.name for p in paths[:5])
+            return shown + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else "")
+
+        if omitted:
+            print(
+                f"[graphify] WARNING: {len(omitted)}/{len(dispatched)} dispatched file(s) "
+                f"produced no nodes and are absent from the graph: {_names(omitted)}. The model "
+                "returned a response but omitted them; a re-run will retry them.",
+                file=sys.stderr,
+            )
+        if lost:
+            print(
+                f"[graphify] WARNING: {len(lost)}/{len(dispatched)} dispatched file(s) are "
+                f"absent from the graph because the request was refused as too large for the "
+                f"model's context window: {_names(lost)}. No response was received for them, "
+                f"and a re-run repeats the refusal until --token-budget or "
+                f"GRAPHIFY_MAX_OUTPUT_TOKENS is lowered, or a model with a larger window is used.",
+                file=sys.stderr,
+            )
     return merged
 
 
@@ -2462,6 +2586,15 @@ def _merge_into(merged: dict, result: dict) -> None:
     if incoming:
         merged["_partial_files"] = sorted(
             set(merged.get("_partial_files", []) or []) | set(incoming)
+        )
+    # Files the model never answered for, because the request was refused as too
+    # large. Distinct from a chunk that raised: nothing failed, the recovery ran
+    # out of room. Counted separately so the two need different actions.
+    lost = result.get("_context_lost_files")
+    if lost:
+        merged["context_lost_chunks"] = merged.get("context_lost_chunks", 0) + 1
+        merged["context_lost_files"] = sorted(
+            set(merged.get("context_lost_files", []) or []) | set(lost)
         )
 
 

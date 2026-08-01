@@ -279,7 +279,11 @@ def test_adaptive_retry_gives_up_on_single_file_overflow(tmp_path):
     # caller can keep going on the rest of the corpus.
     assert result["nodes"] == []
     assert result["edges"] == []
-    assert result["finish_reason"] == "stop"
+    # ...but it is not a normal completion. This assertion used to read
+    # `== "stop"`, which is what let a lost chunk report as done, leave
+    # `failed_chunks` at 0 and exit clean over a graph missing the file.
+    assert result["finish_reason"] == "context_exceeded"
+    assert result["_context_lost_files"] == [str(f)]
 
 
 def test_adaptive_retry_re_raises_unrelated_errors(tmp_path):

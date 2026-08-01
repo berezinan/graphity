@@ -839,6 +839,268 @@ def test_corpus_parallel_uses_adaptive_retry(tmp_path):
     assert len(result["nodes"]) == 4
 
 
+# ---- Adaptive retry on context overflow --------------------------------------
+
+_STUB_WINDOW = 16_384
+
+
+def _context_overflow_stub(calls, *, window=_STUB_WINDOW, tokens_per_file=4_000,
+                           default_output=32_768):
+    """Stub server that refuses when `input + requested output` exceeds `window`.
+
+    Mirrors llama.cpp / LM Studio: the request is rejected outright and the
+    refusal names the context size, so `_looks_like_context_exceeded` classifies
+    it. Input scales with chunk size; the requested output comes from the caller
+    and falls back to today's behaviour — a fixed cap that never shrinks.
+    """
+    def stub(chunk, **kwargs):
+        requested = kwargs.get("max_output_tokens") or default_output
+        input_tokens = tokens_per_file * len(chunk)
+        calls.append((len(chunk), requested))
+        if input_tokens + requested > window:
+            raise RuntimeError(
+                f"the request exceeds the available context size: prompt "
+                f"({input_tokens}) + max_tokens ({requested}) > n_ctx ({window})"
+            )
+        return _stub_with_finish(len(chunk), finish_reason="stop")
+    return stub
+
+
+def test_adaptive_retry_converges_when_output_budget_exceeds_window(tmp_path):
+    """A model whose window is smaller than the requested output must still
+    yield a graph.
+
+    Splitting the chunk shrinks the input, but the server refuses on
+    `input + requested output`. With the requested output fixed, the condition
+    holds at every depth and the recursion cannot converge — measured against a
+    16 384 window with 32 768 requested: input fell 22x (18 131 -> 816 tokens)
+    and all 15 requests were still refused, leaving an empty graph.
+    """
+    from graphify.llm import _extract_with_adaptive_retry
+
+    files = [tmp_path / f"f{i}.py" for i in range(4)]
+    for f in files:
+        f.write_text("x")
+
+    calls = []
+    with patch("graphify.llm.extract_files_direct",
+               side_effect=_context_overflow_stub(calls)):
+        result = _extract_with_adaptive_retry(
+            files, backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=3
+        )
+
+    assert len(result["nodes"]) == 4, (
+        f"extraction did not converge — {len(result['nodes'])} of 4 files covered "
+        f"after {len(calls)} calls; requested output per call: "
+        f"{sorted({req for _, req in calls})}"
+    )
+
+
+def test_shrunken_output_budget_does_not_leak_to_the_next_chunk(tmp_path):
+    """The reduced budget belongs to the branch that needed it, not the run.
+
+    A chunk that overflowed must not make the next chunk ask for less: the next
+    chunk may be small enough to answer at full length, and a leaked budget
+    would truncate it for no reason.
+    """
+    from graphify.llm import extract_corpus_parallel
+
+    heavy = tmp_path / "heavy.py"; heavy.write_text("x")
+    light = tmp_path / "light.py"; light.write_text("x")
+
+    seen = []
+
+    def stub(chunk, **kwargs):
+        requested = kwargs.get("max_output_tokens")
+        name = chunk[0].name
+        seen.append((name, requested))
+        # Only `heavy` overflows, and only while the budget is untouched.
+        if name == "heavy.py" and requested is None:
+            raise RuntimeError("the request exceeds the available context size")
+        return _stub_with_finish(len(chunk), finish_reason="stop")
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        extract_corpus_parallel(
+            [heavy, light], backend="kimi", token_budget=None, chunk_size=1,
+            max_concurrency=1,
+        )
+
+    assert ("heavy.py", None) in seen, f"first attempt should use the default budget: {seen}"
+    assert any(n == "heavy.py" and r is not None for n, r in seen), (
+        f"the overflowing chunk should have retried with a smaller budget: {seen}"
+    )
+    assert [r for n, r in seen if n == "light.py"] == [None], (
+        f"the next chunk inherited a reduced budget: {seen}"
+    )
+
+
+def test_truncation_retry_keeps_the_output_budget(tmp_path):
+    """Truncation means the output did not fit — shrinking it would make the
+    next attempt worse, so only the input shrinks."""
+    from graphify.llm import _extract_with_adaptive_retry
+
+    files = [tmp_path / f"f{i}.py" for i in range(4)]
+    for f in files:
+        f.write_text("x")
+
+    requested = []
+
+    def stub(chunk, **kwargs):
+        requested.append(kwargs.get("max_output_tokens"))
+        return _stub_with_finish(
+            len(chunk), finish_reason="length" if len(chunk) == 4 else "stop"
+        )
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        result = _extract_with_adaptive_retry(
+            files, backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=3
+        )
+
+    assert requested == [None, None, None], (
+        f"truncation must not shrink the output budget: {requested}"
+    )
+    assert len(result["nodes"]) == 4
+
+
+def test_shrunken_budget_that_truncates_is_marked_partial(tmp_path):
+    """Shrinking the output can push a chunk into truncation. That degradation
+    is acceptable — a partial result marked partial beats an empty one — but it
+    must not be cached as complete."""
+    from graphify.llm import _extract_with_adaptive_retry
+
+    f = tmp_path / "lone.py"; f.write_text("x")
+
+    def stub(chunk, **kwargs):
+        requested = kwargs.get("max_output_tokens")
+        if requested is None:
+            raise RuntimeError("the request exceeds the available context size")
+        # Fits now, but the answer no longer fits in what we asked for.
+        return _stub_with_finish(len(chunk), finish_reason="length")
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        result = _extract_with_adaptive_retry(
+            [f], backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=3
+        )
+
+    assert result["nodes"], "the partial result should still be returned"
+    assert all(n.get("_partial") for n in result["nodes"])
+
+
+def test_context_loss_is_counted_apart_from_chunk_failure(tmp_path, capsys):
+    """A chunk lost to a context refusal and a chunk that raised need different
+    actions, so they need different counters.
+
+    The loss arrives as an ordinary `return`, not an exception, so before this
+    it left `failed_chunks` at 0: the chunk reported done and the run exited
+    clean with the files missing from the graph.
+    """
+    from graphify.llm import extract_corpus_parallel
+
+    lost = tmp_path / "lost.py"; lost.write_text("x")
+    broken = tmp_path / "broken.py"; broken.write_text("x")
+
+    def stub(chunk, **kwargs):
+        if chunk[0].name == "lost.py":
+            raise RuntimeError("the request exceeds the available context size")
+        raise ValueError("backend exploded")
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        merged = extract_corpus_parallel(
+            [broken, lost], backend="kimi", token_budget=None, chunk_size=1,
+            max_concurrency=1,
+        )
+
+    assert merged["failed_chunks"] == 1, "the raised chunk should count as a failure"
+    assert merged["context_lost_chunks"] == 1, "the refused chunk should count separately"
+    assert [Path(p).name for p in merged["context_lost_files"]] == ["lost.py"]
+    err = capsys.readouterr().err
+    assert "context window" in err and "lost.py" in err
+
+
+def test_context_loss_is_not_labelled_a_normal_completion(tmp_path):
+    """An empty result marked `finish_reason="stop"` reads as "the model
+    answered and found nothing" — which is what let the loss pass as success."""
+    from graphify.llm import _extract_with_adaptive_retry
+
+    f = tmp_path / "lone.py"; f.write_text("x")
+
+    def stub(chunk, **kwargs):
+        raise RuntimeError("the request exceeds the available context size")
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        result = _extract_with_adaptive_retry(
+            [f], backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=2
+        )
+
+    assert result["nodes"] == []
+    assert result["finish_reason"] != "stop"
+    assert result["_context_lost_files"] == [str(f)]
+
+
+def test_uncovered_warning_separates_refusal_from_omission(tmp_path, capsys):
+    """The two causes need different actions, so they must not share a text.
+
+    "The model returned a response but omitted them" is false for a refusal —
+    there was no response — and "a re-run will retry them" is misleading, since
+    the refusal reproduces exactly.
+    """
+    from graphify.llm import extract_corpus_parallel
+
+    refused = tmp_path / "refused.md"; refused.write_text("x")
+    omitted = tmp_path / "omitted.md"; omitted.write_text("x")
+
+    def stub(chunk, **kwargs):
+        if chunk[0].name == "refused.md":
+            raise RuntimeError("the request exceeds the available context size")
+        # Answered, but found nothing worth extracting.
+        return _stub_with_finish(0, finish_reason="stop")
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        extract_corpus_parallel(
+            [refused, omitted], backend="kimi", token_budget=None, chunk_size=1,
+            max_concurrency=1,
+        )
+
+    err = capsys.readouterr().err
+    omission_line = next(l for l in err.splitlines() if "omitted them" in l)
+    refusal_line = next(l for l in err.splitlines() if "refused as too large" in l)
+    assert "omitted.md" in omission_line and "refused.md" not in omission_line
+    assert "refused.md" in refusal_line and "omitted.md" not in refusal_line
+    assert "GRAPHIFY_MAX_OUTPUT_TOKENS" in refusal_line
+    assert "--token-budget" in refusal_line
+    assert "a re-run will retry them" not in refusal_line
+
+
+@pytest.mark.parametrize("concurrency", [1, 4])
+def test_context_loss_accounting_survives_parallel_chunks(tmp_path, concurrency):
+    """Chunks run in a thread pool but merge on one thread. Coverage and the
+    loss tally must not depend on which."""
+    from graphify.llm import extract_corpus_parallel
+
+    files = []
+    for i in range(8):
+        f = tmp_path / f"f{i}.md"
+        f.write_text("x")
+        files.append(f)
+    refused = {f"f{i}.md" for i in (1, 4, 6)}
+
+    def stub(chunk, **kwargs):
+        if chunk[0].name in refused:
+            raise RuntimeError("the request exceeds the available context size")
+        return _stub_with_finish(len(chunk), finish_reason="stop")
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stub):
+        merged = extract_corpus_parallel(
+            files, backend="kimi", token_budget=None, chunk_size=1,
+            max_concurrency=concurrency,
+        )
+
+    assert len(merged["nodes"]) == 5, f"coverage changed at concurrency={concurrency}"
+    assert merged["context_lost_chunks"] == 3
+    assert {Path(p).name for p in merged["context_lost_files"]} == refused
+    assert merged["failed_chunks"] == 0
+
+
 # ---- #1685: special-token strings in docs must not crash token estimation ----
 
 def test_estimate_file_tokens_handles_tiktoken_special_token(tmp_path):
