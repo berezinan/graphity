@@ -1113,7 +1113,7 @@ def _build_server(graph_path: str):
     from graphify.query_backend import (
         JsonBackend, render_query, render_node, render_neighbors,
         render_community, render_god_nodes, render_stats, render_path,
-        resolve_backend_config, open_backend,
+        resolve_backend_config, require_backend,
     )
     from graphify import paths as _paths
 
@@ -1150,7 +1150,7 @@ def _build_server(graph_path: str):
                 with _ctx_lock:
                     ent = _ctx_cache.get(path)
                     if ent is None:
-                        be = open_backend(config=resolve_backend_config(path))
+                        be = require_backend(config=resolve_backend_config(path))
                         ent = {"key": None, "G": None, "communities": {}, "backend": be}
                         _ctx_cache[path] = ent
             return ent["G"], ent["communities"], ent["backend"]

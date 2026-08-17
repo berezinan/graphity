@@ -82,25 +82,27 @@ def _sync_global_db() -> None:
     No-op unless ``GRAPHIFY_BACKEND=arcadedb`` (so the default JSON model is
     untouched). The global graph is a single dedup'd merge that ``global_add``
     rewrites whole, so a full reload matches its semantics; it targets a separate
-    database (``GRAPHIFY_ARCADE_GLOBAL_DB``, default ``graphify_global``). Never
-    raises — a DB hiccup must not break the global merge.
+    database (``GRAPHIFY_ARCADE_GLOBAL_DB``, default ``graphify_global``).
+
+    Raises when the database is unreachable: the global graph lives in the DB,
+    so a merge that could not reach it did not happen, and reporting success
+    would leave the user with a global graph that is silently one merge behind.
     """
     import os
-    if os.environ.get("GRAPHIFY_BACKEND", "").strip().lower() not in ("arcadedb", "arcade"):
+    from graphify.query_backend import resolve_backend_config, require_backend, shortfall_warning
+    cfg = resolve_backend_config(None)
+    if cfg["kind"] != "arcadedb":
         return
-    try:
-        from graphify.query_backend import resolve_backend_config, open_backend, shortfall_warning
-        cfg = resolve_backend_config(None)
-        cfg["database"] = os.environ.get("GRAPHIFY_ARCADE_GLOBAL_DB", "graphify_global")
-        be = open_backend(config=cfg)
-        be.ensure_database(drop=True)
-        st = be.load_from_graph_json(str(_GLOBAL_GRAPH))
-        print(f"[graphify global] synced ArcadeDB '{cfg['database']}' "
-              f"({st['nodes']} nodes, {st['edges']} edges).")
-        if (warn := shortfall_warning(st)):
-            print(f"[graphify global] warning: {warn}", file=sys.stderr)
-    except Exception as exc:
-        print(f"[graphify global] warning: ArcadeDB global sync failed: {exc}", file=sys.stderr)
+    cfg["database"] = os.environ.get("GRAPHIFY_ARCADE_GLOBAL_DB", "graphify_global")
+    # The global database is not a project database — nothing owns it by path.
+    cfg["project_path"] = ""
+    be = require_backend(config=cfg, require_database=False)
+    be.ensure_database(drop=True)
+    st = be.load_from_graph_json(str(_GLOBAL_GRAPH))
+    print(f"[graphify global] synced ArcadeDB '{cfg['database']}' "
+          f"({st['nodes']} nodes, {st['edges']} edges).")
+    if (warn := shortfall_warning(st)):
+        print(f"[graphify global] warning: {warn}", file=sys.stderr)
 
 
 def global_add(source_path: Path, repo_tag: str) -> dict:

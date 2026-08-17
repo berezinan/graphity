@@ -17,7 +17,22 @@ def test_download_url():
 def test_arcade_home_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("GRAPHIFY_ARCADE_HOME", str(tmp_path))
     assert a.arcade_home() == tmp_path
-    assert a.dist_dir() == tmp_path / f"arcadedb-{a.ARCADE_VERSION}"
+    assert a.dist_dir() == tmp_path / "dist" / f"arcadedb-{a.ARCADE_VERSION}"
+
+
+def test_arcade_home_defaults_to_programdata(monkeypatch):
+    """Machine-wide, not a user profile: one service serves every session."""
+    monkeypatch.delenv("GRAPHIFY_ARCADE_HOME", raising=False)
+    monkeypatch.setenv("PROGRAMDATA", r"C:\ProgramData")
+    assert a.arcade_home() == Path(r"C:\ProgramData") / "graphify" / "arcadedb"
+
+
+def test_databases_live_outside_the_versioned_distribution(monkeypatch, tmp_path):
+    """A distribution upgrade must not orphan the hive."""
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HOME", str(tmp_path))
+    assert a.databases_dir() == tmp_path / "databases"
+    assert a.ARCADE_VERSION not in str(a.databases_dir())
+    assert a.databases_dir() not in a.dist_dir().parents
 
 
 def test_java_executable_respects_java_home(monkeypatch, tmp_path):
@@ -33,11 +48,13 @@ def test_java_executable_fallback(monkeypatch):
     assert a.java_executable() == "java"
 
 
-def test_server_command_has_key_flags():
+def test_server_command_has_key_flags(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRAPHIFY_ARCADE_HOME", str(tmp_path))
     cmd = a.server_command("s3cret", heap="4G", port=2490)
     assert cmd[-1] == "com.arcadedb.server.ArcadeDBServer"
     assert "-Darcadedb.server.rootPassword=s3cret" in cmd
     assert "-Darcadedb.server.httpIncomingPort=2490" in cmd
+    assert f"-Darcadedb.server.databaseDirectory={tmp_path / 'databases'}" in cmd
     assert "-Xmx4G" in cmd
     assert cmd[cmd.index("-cp") + 1] == "lib/*"
     assert "jdk.incubator.vector" in cmd
@@ -75,20 +92,12 @@ def test_is_installed(monkeypatch, tmp_path):
     assert a.is_installed() is True
 
 
-def test_read_pid_and_stop_without_pid(monkeypatch, tmp_path):
-    monkeypatch.setenv("GRAPHIFY_ARCADE_HOME", str(tmp_path))
-    assert a._read_pid() is None
-    assert a.stop() is False
-    a.pid_file().write_text("12345", encoding="utf-8")
-    assert a._read_pid() == 12345
-
-
 def test_status_not_running(monkeypatch, tmp_path):
     monkeypatch.setenv("GRAPHIFY_ARCADE_HOME", str(tmp_path))
     st = a.status(host="127.0.0.1", port=1, password="x")  # nothing listens on :1
     assert st["ready"] is False
-    assert st["pid"] is None
     assert st["installed"] is False
+    assert st["service"] in ("running", "stopped", "not installed", "unknown")
 
 
 def test_default_heap_falls_back_when_unset(monkeypatch):

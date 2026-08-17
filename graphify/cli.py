@@ -811,11 +811,11 @@ def dispatch_command(cmd: str) -> None:
             else:
                 i += 1
         from graphify.query_backend import (
-            resolve_backend_config, open_backend, JsonBackend, render_query,
+            resolve_backend_config, require_backend, JsonBackend, render_query,
         )
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] == "arcadedb":
-            backend = open_backend(config=_cfg)
+            backend = require_backend(config=_cfg)
             _corpus = _cfg["database"]
         else:
             gp = Path(graph_path).resolve()
@@ -1028,7 +1028,7 @@ def dispatch_command(cmd: str) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        from graphify.query_backend import resolve_backend_config, open_backend, JsonBackend
+        from graphify.query_backend import resolve_backend_config, require_backend, JsonBackend
         from networkx.readwrite import json_graph
         from graphify import querylog
 
@@ -1041,7 +1041,7 @@ def dispatch_command(cmd: str) -> None:
                 graph_path = args[i + 1]
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] == "arcadedb":
-            backend = open_backend(config=_cfg)
+            backend = require_backend(config=_cfg)
             _corpus = _cfg["database"]
         else:
             gp = Path(graph_path).resolve()
@@ -1104,7 +1104,7 @@ def dispatch_command(cmd: str) -> None:
         if len(sys.argv) < 3:
             print('Usage: graphify explain "<node>" [--graph path]', file=sys.stderr)
             sys.exit(1)
-        from graphify.query_backend import resolve_backend_config, open_backend, JsonBackend, render_explain
+        from graphify.query_backend import resolve_backend_config, require_backend, JsonBackend, render_explain
         from networkx.readwrite import json_graph
         from graphify import querylog
 
@@ -1116,7 +1116,7 @@ def dispatch_command(cmd: str) -> None:
                 graph_path = args[i + 1]
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] == "arcadedb":
-            backend = open_backend(config=_cfg)
+            backend = require_backend(config=_cfg)
             _corpus = _cfg["database"]
         else:
             gp = Path(graph_path).resolve()
@@ -1177,41 +1177,61 @@ def dispatch_command(cmd: str) -> None:
     elif cmd == "arcade":
         from graphify import arcade_server as _arc
         sub = sys.argv[2] if len(sys.argv) > 2 else "status"
-        pw = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or "playwithdata"
-        url = os.environ.get("GRAPHIFY_ARCADE_URL", "http://127.0.0.1:2480")
+        _machine = _arc.read_machine_config()
+        pw = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or _machine.get("password") or ""
+        url = os.environ.get("GRAPHIFY_ARCADE_URL") or _machine.get("url") or "http://127.0.0.1:2480"
         _rest = url.split("://", 1)[-1]
         _host, _, _port = _rest.partition(":")
         _host = _host or "127.0.0.1"
         _port = int(_port or 2480)
         if sub == "status":
             st = _arc.status(_host, _port, pw)
-            print(f"ArcadeDB: {'running' if st['ready'] else 'stopped'} | "
-                  f"installed={st['installed']} | pid={st['pid']} | {url}")
-        elif sub == "start":
-            res = _arc.start(pw, host=_host, port=_port)
-            if res.get("already_running"):
-                print(f"ArcadeDB already running at {url}")
+            print(f"ArcadeDB: {'answering' if st['ready'] else 'not answering'} | "
+                  f"service={st['service']} | installed={st['installed']} | {url}")
+            if not st["ready"]:
+                print(f"  layout: {st['home']}", file=sys.stderr)
+                print(f"  logs:   {_arc.log_dir()}", file=sys.stderr)
+        elif sub == "install-service":
+            _svc_port = _port
+            _svc_heap = None
+            _svc_pw = None
+            _sargs = sys.argv[3:]
+            for _i, _a in enumerate(_sargs):
+                if _a == "--port" and _i + 1 < len(_sargs):
+                    _svc_port = int(_sargs[_i + 1])
+                elif _a == "--heap" and _i + 1 < len(_sargs):
+                    _svc_heap = _sargs[_i + 1]
+                elif _a == "--password" and _i + 1 < len(_sargs):
+                    _svc_pw = _sargs[_i + 1]
+            try:
+                res = _arc.install_service(password=_svc_pw, port=_svc_port, heap=_svc_heap)
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Service '{res['service']}' installed and started.")
+            print(f"  url:       {res['url']}")
+            print(f"  layout:    {res['home']}")
+            print(f"  databases: {res['databases']}")
+            print(f"  java:      {res['java']}")
+        elif sub == "uninstall-service":
+            if _arc.uninstall_service():
+                print(f"Service '{_arc.SERVICE_NAME}' removed. Databases left in "
+                      f"{_arc.databases_dir()}.")
             else:
-                print(f"ArcadeDB starting (pid {res['pid']}, log {res['log']}) — waiting for ready...")
-                import time as _t
-                for _ in range(60):
-                    if _arc.status(_host, _port, pw)["ready"]:
-                        print(f"ArcadeDB ready at {res['url']}")
-                        break
-                    _t.sleep(1)
-                else:
-                    print("warning: ArcadeDB did not report ready within 60s; check the log.", file=sys.stderr)
-        elif sub == "stop":
-            print("ArcadeDB stopped." if _arc.stop() else "No tracked ArcadeDB server to stop.")
-        elif sub == "download":
-            print(f"Installing ArcadeDB to {_arc.arcade_home()} ...")
-            _arc.download()
-            print("ArcadeDB installed.")
+                print("No installed service found.", file=sys.stderr)
+                sys.exit(1)
+        elif sub in ("start", "stop", "download"):
+            print(f"'graphify arcade {sub}' is gone: ArcadeDB runs as the Windows service "
+                  f"'{_arc.SERVICE_NAME}'.\n"
+                  f"  install it:  graphify arcade install-service\n"
+                  f"  start/stop:  sc start {_arc.SERVICE_NAME} / sc stop {_arc.SERVICE_NAME}\n"
+                  f"  check it:    graphify arcade status", file=sys.stderr)
+            sys.exit(2)
         elif sub == "reload":
             # Drop + full reload of one project's ArcadeDB database from its
             # graph.json. Recovers a database left inconsistent by a failed
             # incremental sync without re-running extraction (no API cost).
-            from graphify.query_backend import resolve_backend_config, open_backend
+            from graphify.query_backend import resolve_backend_config, require_backend
             arg = sys.argv[3] if len(sys.argv) > 3 else None
             if not arg:
                 print("Usage: graphify arcade reload <project-dir|graph.json>", file=sys.stderr)
@@ -1230,7 +1250,7 @@ def dispatch_command(cmd: str) -> None:
                 print("set GRAPHIFY_BACKEND=arcadedb to reload an ArcadeDB database", file=sys.stderr)
                 sys.exit(2)
             from graphify.query_backend import shortfall_warning
-            be = open_backend(config=cfg)
+            be = require_backend(config=cfg, require_database=False)
             print(f"reloading ArcadeDB '{cfg['database']}' from {gj} (drop + full load)...")
             be.ensure_database(drop=True)
             st = be.load_from_graph_json(str(gj))
@@ -1238,7 +1258,8 @@ def dispatch_command(cmd: str) -> None:
             if (_warn := shortfall_warning(st)):
                 print(f"warning: {_warn}", file=sys.stderr)
         else:
-            print("Usage: graphify arcade <start|stop|status|download|reload>", file=sys.stderr)
+            print("Usage: graphify arcade <status|install-service|uninstall-service|reload>",
+                  file=sys.stderr)
             sys.exit(2)
 
     elif cmd == "diagnose":
@@ -1375,6 +1396,10 @@ def dispatch_command(cmd: str) -> None:
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
+        # A watch loop whose database is unreachable cannot complete a single
+        # rebuild, so refuse at startup instead of idling until the first edit.
+        from graphify.query_backend import require_service as _require_service
+        _require_service(str((watch_path / _GRAPHIFY_OUT / "graph.json").resolve()))
         from graphify.watch import watch as _watch
 
         try:
@@ -1722,6 +1747,10 @@ def dispatch_command(cmd: str) -> None:
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
+        # As in extract: the sync closing this rebuild is not optional, so an
+        # unreachable database costs milliseconds rather than a whole rebuild.
+        from graphify.query_backend import require_service as _require_service
+        _require_service(str((watch_path / _GRAPHIFY_OUT / "graph.json").resolve()))
         from graphify.watch import _rebuild_code
 
         print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
@@ -2547,6 +2576,11 @@ def dispatch_command(cmd: str) -> None:
         out_root = (out_dir.resolve() if out_dir else target)
         graphify_out = out_root / _GRAPHIFY_OUT
         graphify_out.mkdir(parents=True, exist_ok=True)
+        # Before anything expensive: the sync at the end of this pipeline is not
+        # optional, so an unreachable database must cost milliseconds, not an
+        # entire paid extraction.
+        from graphify.query_backend import require_service as _require_service
+        _require_service(str(graphify_out / "graph.json"))
         # Persist corpus-shaping options so later update/watch/hook rebuilds
         # use the same file set as the initial extraction (#1886).
         from graphify.watch import (
@@ -3319,36 +3353,35 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
         stages.mark("export")
 
-        # Sync the configured graph database (connect-only), if any. JSON is the
-        # default, so this is a no-op for existing users. Incremental updates
-        # touch only the changed/deleted files; a first/full build loads fresh.
-        from graphify.query_backend import resolve_backend_config, open_backend_for_sync, shortfall_warning
+        # Sync the configured graph database. Not guarded: the graph database is
+        # required, so a failed sync is a failed build — swallowing it used to
+        # end an hours-long, paid extraction with exit 0 and one line of stderr.
+        # Incremental updates touch only the changed/deleted files; a first/full
+        # build loads fresh.
+        from graphify.query_backend import resolve_backend_config, require_backend, shortfall_warning
         _db_cfg = resolve_backend_config(str(graph_json_path))
         if _db_cfg["kind"] == "arcadedb":
-            try:
-                _db = open_backend_for_sync(_db_cfg)
-                _db.ensure_database()
-                if incremental_mode and _db.is_populated():
-                    from graphify.build import _norm_source_file
-                    _root = str(target.resolve())
-                    _changed = {
-                        _norm_source_file(str(p), _root)
-                        for p in (code_files + doc_files + paper_files + image_files)
-                    }
-                    _pruned = {_norm_source_file(str(p), _root) for p in deleted_files}
-                    _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=_pruned)
-                    print(f"[graphify db] synced ArcadeDB '{_db_cfg['database']}' "
-                          f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
-                          f"{_st['deleted_sources']} dirty sources).")
-                else:
-                    _db.ensure_database(drop=True)
-                    _st = _db.load_from_graph_json(str(graph_json_path))
-                    print(f"[graphify db] loaded ArcadeDB '{_db_cfg['database']}' "
-                          f"({_st['nodes']} nodes, {_st['edges']} edges).")
-                if (_warn := shortfall_warning(_st)):
-                    print(f"[graphify db] warning: {_warn}", file=sys.stderr)
-            except Exception as exc:
-                print(f"[graphify db] warning: ArcadeDB sync failed: {exc}", file=sys.stderr)
+            _db = require_backend(config=_db_cfg, require_database=False)
+            _db.ensure_database()
+            if incremental_mode and _db.is_populated():
+                from graphify.build import _norm_source_file
+                _root = str(target.resolve())
+                _changed = {
+                    _norm_source_file(str(p), _root)
+                    for p in (code_files + doc_files + paper_files + image_files)
+                }
+                _pruned = {_norm_source_file(str(p), _root) for p in deleted_files}
+                _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=_pruned)
+                print(f"[graphify db] synced ArcadeDB '{_db_cfg['database']}' "
+                      f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
+                      f"{_st['deleted_sources']} dirty sources).")
+            else:
+                _db.ensure_database(drop=True)
+                _st = _db.load_from_graph_json(str(graph_json_path))
+                print(f"[graphify db] loaded ArcadeDB '{_db_cfg['database']}' "
+                      f"({_st['nodes']} nodes, {_st['edges']} edges).")
+            if (_warn := shortfall_warning(_st)):
+                print(f"[graphify db] warning: {_warn}", file=sys.stderr)
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
                 json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"

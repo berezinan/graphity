@@ -5,8 +5,10 @@ the same answers as the in-memory backend. Skipped entirely when no ArcadeDB is
 reachable (CI / dev machines without the server), so the suite stays green
 without the dependency.
 
-Point at a server with GRAPHIFY_ARCADE_URL=http://host:port (default
-127.0.0.1:2480) and GRAPHIFY_ARCADE_PASSWORD (default playwithdata).
+The server is found the way the product finds it: GRAPHIFY_ARCADE_URL /
+GRAPHIFY_ARCADE_PASSWORD first, then the machine config the installed service
+wrote. A fixed password here would skip every one of these tests against a
+normally installed service — a silent loss of the whole parity suite.
 """
 import json
 import os
@@ -15,6 +17,7 @@ import networkx as nx
 import pytest
 from networkx.readwrite import json_graph
 
+from graphify import arcade_server
 from graphify.query_backend import (
     ArcadeDBBackend,
     JsonBackend,
@@ -26,8 +29,9 @@ from graphify.query_backend import (
     shortfall_warning,
 )
 
-_URL = os.environ.get("GRAPHIFY_ARCADE_URL", "http://127.0.0.1:2480")
-_PW = os.environ.get("GRAPHIFY_ARCADE_PASSWORD", "playwithdata")
+_MACHINE = arcade_server.read_machine_config()
+_URL = os.environ.get("GRAPHIFY_ARCADE_URL") or _MACHINE.get("url") or "http://127.0.0.1:2480"
+_PW = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or _MACHINE.get("password") or ""
 _DB = "graphify_parity_test"
 
 

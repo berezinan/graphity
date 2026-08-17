@@ -5,6 +5,8 @@ serve._query_graph_text output byte-for-byte. That locks the abstraction so the
 later serve.py/CLI rewiring (and the ArcadeDB backend's golden parity) have a
 trustworthy oracle.
 """
+import re
+
 import networkx as nx
 import pytest
 
@@ -138,8 +140,20 @@ def test_god_nodes_renders():
 
 # --- backend selection factory --------------------------------------------- #
 
-def test_resolve_config_defaults_to_json(monkeypatch):
+def test_resolve_config_default_backend(monkeypatch):
+    """The default backend with no GRAPHIFY_BACKEND set is the graph database.
+
+    Guarded on purpose: upstream knows nothing about ArcadeDB, so a merge can
+    put ``json`` back as the default as silently as it can drop a call site —
+    and the whole point of this change is that graphify never quietly answers
+    from graph.json.
+    """
     monkeypatch.delenv("GRAPHIFY_BACKEND", raising=False)
+    assert resolve_backend_config("g.json")["kind"] == "arcadedb"
+
+
+def test_resolve_config_json_is_the_explicit_opt_out(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
     assert resolve_backend_config("g.json") == {"kind": "json", "graph_path": "g.json"}
 
 
@@ -154,22 +168,59 @@ def test_resolve_config_arcadedb_from_env(monkeypatch):
 
 
 def test_open_backend_json_from_preloaded_graph(monkeypatch):
-    monkeypatch.delenv("GRAPHIFY_BACKEND", raising=False)
+    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
     be = open_backend(graph=_make_digraph())
     assert isinstance(be, JsonBackend)
 
 
-def test_derive_db_name_from_project_root():
-    # graph at <root>/graphify-out/graph.json -> proj_<root>
-    assert derive_db_name("/home/me/My-Repo/graphify-out/graph.json") == "proj_My_Repo"
+def _graph_json(tmp_path, name):
+    root = tmp_path / name
+    (root / "graphify-out").mkdir(parents=True)
+    return root / "graphify-out" / "graph.json"
+
+
+def test_derive_db_name_from_project_root(tmp_path):
+    # graph at <root>/graphify-out/graph.json -> proj_<root>_<hash8>
+    name = derive_db_name(str(_graph_json(tmp_path, "My-Repo")))
+    assert re.fullmatch(r"proj_my_repo_[0-9a-f]{8}", name), name
     assert derive_db_name(None) == "graphify"
 
 
-def test_resolve_config_arcadedb_derives_db_when_unset(monkeypatch):
+def test_derive_db_name_same_project_from_different_cwd(tmp_path, monkeypatch):
+    """One project addressed relatively and absolutely -> one database."""
+    gj = _graph_json(tmp_path, "Hotel")
+    monkeypatch.chdir(gj.parent.parent)
+    relative = derive_db_name("graphify-out/graph.json")
+    monkeypatch.chdir(tmp_path)
+    absolute = derive_db_name(str(gj))
+    assert relative == absolute
+
+
+def test_derive_db_name_ignores_path_case(tmp_path):
+    """Same directory, different spelling of the path -> one database."""
+    gj = _graph_json(tmp_path, "Hotel")
+    assert derive_db_name(str(gj)) == derive_db_name(str(gj).upper())
+
+
+def test_derive_db_name_separates_same_named_directories(tmp_path):
+    """Two unrelated projects whose directories share a name -> two databases.
+
+    This is the case a name built from the directory alone merged silently once
+    every user of the machine shares one hive.
+    """
+    a = derive_db_name(str(_graph_json(tmp_path / "work", "Hotel")))
+    b = derive_db_name(str(_graph_json(tmp_path / "arch", "Hotel")))
+    assert a != b
+    assert a.startswith("proj_hotel_") and b.startswith("proj_hotel_")
+
+
+def test_resolve_config_arcadedb_derives_db_when_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("GRAPHIFY_BACKEND", "arcadedb")
     monkeypatch.delenv("GRAPHIFY_ARCADE_DB", raising=False)
-    cfg = resolve_backend_config("/x/CoolProj/graphify-out/graph.json")
-    assert cfg["database"] == "proj_CoolProj"
+    gj = _graph_json(tmp_path, "CoolProj")
+    cfg = resolve_backend_config(str(gj))
+    assert cfg["database"] == derive_db_name(str(gj))
+    assert cfg["database"].startswith("proj_coolproj_")
 
 
 def test_open_backend_arcadedb_constructs_without_connecting(monkeypatch):
@@ -177,6 +228,45 @@ def test_open_backend_arcadedb_constructs_without_connecting(monkeypatch):
     be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
                               "database": "proj_x", "user": "root", "password": "x"})
     assert isinstance(be, ArcadeDBBackend) and be.db == "proj_x"
+
+
+def test_claim_project_refuses_a_digest_collision():
+    """A database already owned by another path is refused, not shared."""
+    be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
+                              "database": "proj_hotel_deadbeef", "user": "root", "password": "x",
+                              "project_path": r"D:\arch\Hotel"})
+    be._run = lambda *a, **kw: [{"value": r"C:\work\Hotel"}]
+    with pytest.raises(RuntimeError) as exc:
+        be.claim_project()
+    assert r"C:\work\Hotel" in str(exc.value) and r"D:\arch\Hotel" in str(exc.value)
+    assert "GRAPHIFY_ARCADE_DB" in str(exc.value)
+
+
+def test_claim_project_records_the_owner_on_first_write():
+    be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
+                              "database": "proj_hotel_deadbeef", "user": "root", "password": "x",
+                              "project_path": r"C:\work\Hotel"})
+    calls = []
+
+    def fake_run(q, **kw):
+        calls.append(q)
+        return []  # no Meta row yet
+
+    be._run = fake_run
+    be.claim_project()
+    assert any(q.startswith("INSERT INTO Meta") and r"C:\\work\\Hotel" in q for q in calls), calls
+
+
+def test_claim_project_is_a_noop_without_a_project():
+    be = open_backend(config={"kind": "arcadedb", "host": "127.0.0.1", "port": 2480,
+                              "database": "graphify_global", "user": "root", "password": "x",
+                              "project_path": ""})
+
+    def fail(*a, **kw):
+        raise AssertionError("claim_project must not touch the DB without a project")
+
+    be._run = fail
+    be.claim_project()
 
 
 def test_sync_graph_deletes_changed_ids_before_reinsert(monkeypatch):

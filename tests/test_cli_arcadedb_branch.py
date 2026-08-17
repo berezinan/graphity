@@ -29,7 +29,9 @@ def arcadedb_cli(monkeypatch, tmp_path):
     G.add_edge("alpha_node", "beta_node", relation="calls", confidence="EXTRACTED")
     backend = qb.JsonBackend(G)
     monkeypatch.setattr(qb, "resolve_backend_config", lambda gp=None: dict(_ARCADE_CFG))
-    monkeypatch.setattr(qb, "open_backend", lambda **kw: backend)
+    # require_backend, not open_backend: the CLI goes through the checked helper
+    # now, and stubbing it also skips the readiness probe no server would answer.
+    monkeypatch.setattr(qb, "require_backend", lambda **kw: backend)
     monkeypatch.chdir(tmp_path)
 
     def run(*argv):

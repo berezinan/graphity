@@ -118,6 +118,7 @@ from graphify.install import (  # noqa: E402,F401
     _OPENCODE_CONFIG_PATH,
     _PLATFORM_CONFIG,
 )
+from graphify.arcade_server import GraphDBUnavailable as _GraphDBUnavailable  # noqa: E402
 from graphify.cli import (  # noqa: E402,F401
     dispatch_command,
     _StageTimer,
@@ -469,6 +470,11 @@ def main() -> None:
         # shutdown — outside this try — where a reader that closed the pipe surfaces
         # as a noisy "Exception ignored on flushing sys.stdout" and a nonzero exit.
         sys.stdout.flush()
+    except _GraphDBUnavailable as exc:
+        # The graph database is required and there is no fallback to weigh up,
+        # so the message is already the whole answer: print it, exit non-zero.
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
     except BrokenPipeError:
         _silence_broken_pipe()
     except OSError as exc:

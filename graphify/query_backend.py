@@ -619,13 +619,16 @@ class ArcadeDBBackend(GraphBackend):
     rebuild) and stored, so it matches ``analyze.god_nodes`` exactly.
     """
 
-    def __init__(self, database, host="127.0.0.1", port=2480, user="root", password="playwithdata"):
+    def __init__(self, database, host="127.0.0.1", port=2480, user="root", password="",
+                 project_path=None):
         try:
             import requests  # lazy: keep JsonBackend users free of the dependency
         except ImportError as e:
             raise ImportError('ArcadeDB backend needs requests. Run: pip install "graphifyy[arcadedb]"') from e
         self.base = f"http://{host}:{port}"
         self.db = database
+        self.project_path = project_path
+        self.last_ready_status = None
         self._s = requests.Session()
         self._s.auth = (user, password)
 
@@ -645,10 +648,17 @@ class ArcadeDBBackend(GraphBackend):
         return r.json().get("result", [])
 
     def ready(self) -> bool:
+        # The status is kept so a caller can tell "nothing answered" from "the
+        # server answered and turned us away" — /ready is open to anonymous
+        # callers but rejects a WRONG credential, so a stale password reads as
+        # an unreachable service unless the two are told apart.
         try:
-            return self._s.get(f"{self.base}/api/v1/ready", timeout=5).status_code in (200, 204)
+            self.last_ready_status = self._s.get(
+                f"{self.base}/api/v1/ready", timeout=5).status_code
         except Exception:
+            self.last_ready_status = None
             return False
+        return self.last_ready_status in (200, 204)
 
     def is_populated(self) -> bool:
         """True if the database already has the schema + at least one node
@@ -674,6 +684,32 @@ class ArcadeDBBackend(GraphBackend):
         if not rows:
             return False
         return any(p.get("name") == "id_key" for p in (rows[0].get("properties") or []))
+
+    def claim_project(self) -> None:
+        """Record which project owns this database, refusing a digest collision.
+
+        The database name carries an 8-hex digest of the normalised project path
+        (see `derive_db_name`). A digest collision would quietly merge two
+        unrelated projects into one hive-shared database, so the owning path is
+        stored next to the graph and compared before every write. No-op when the
+        caller did not name a project (the global database, tests).
+        """
+        import json
+        if not self.project_path:
+            return
+        rows = self._run("SELECT value FROM Meta WHERE key = 'project_path' LIMIT 1")
+        owner = rows[0]["value"] if rows else None
+        if owner and owner != self.project_path:
+            raise RuntimeError(
+                f"database '{self.db}' already belongs to a different project:\n"
+                f"  stored: {owner}\n"
+                f"  wanted: {self.project_path}\n"
+                "The name digest collided. Set GRAPHIFY_ARCADE_DB explicitly for one "
+                "of the two projects and rebuild it."
+            )
+        if not owner:
+            self._run("INSERT INTO Meta CONTENT " + json.dumps(
+                {"key": "project_path", "value": self.project_path}, ensure_ascii=False))
 
     # ---- load (graph.json -> ArcadeDB; one-off materialized view) -----------
     def ensure_database(self, *, drop=False) -> None:
@@ -781,6 +817,7 @@ class ArcadeDBBackend(GraphBackend):
                     # in-heap sort cap on large graphs.
                     "CREATE INDEX ON Node (degree) NOTUNIQUE"):
             _ddl(cmd)
+        self.claim_project()
 
         keep_n = ("id", "label", "source_file", "source_location", "file_type", "community")
         for i in range(0, len(nodes), batch):
@@ -831,6 +868,7 @@ class ArcadeDBBackend(GraphBackend):
                 f"ArcadeDB database '{self.db}' predates the ASCII index key: Node.id_key is "
                 f"absent from its schema, so an incremental sync would leave it half-converted. "
                 f"Rebuild it with: graphify arcade reload <project-dir|graph.json>")
+        self.claim_project()
 
         changed = {s for s in changed_sources if s}
         pruned = {s for s in pruned_sources if s}
@@ -1258,36 +1296,78 @@ class ArcadeDBBackend(GraphBackend):
 # --------------------------------------------------------------------------- #
 # Backend selection (connect-only): env-driven, JSON by default
 # --------------------------------------------------------------------------- #
-def derive_db_name(graph_path: str | None) -> str:
-    """Per-project database name from the graph path: ``proj_<project-root>``.
-
-    Lets each repo map to its own ArcadeDB database automatically (a project
-    being the parent of its ``graphify-out/`` directory), so many projects can
-    share one server without manual `GRAPHIFY_ARCADE_DB` per repo.
-    """
-    import re
+def project_root_of(graph_path: str | None):
+    """The project root behind a graph path, normalised (a project being the
+    parent of its ``graphify-out/`` directory). ``None`` when there is none."""
     from pathlib import Path
     if not graph_path:
+        return None
+    p = Path(graph_path).resolve()  # also collapses "..", "." and a trailing separator
+    # Folded compare: the marker directory must be recognised however the caller
+    # spelled the path, or an upper-cased path roots the project one level deep.
+    return p.parent.parent if p.parent.name.casefold() == "graphify-out" else p.parent
+
+
+def _project_key(root) -> str:
+    """8-hex digest of a project root, stable across how the path was written.
+
+    Case is folded because the same directory reached as ``C:\\work\\Hotel`` and
+    ``c:\\work\\hotel`` must land in one database, not two — and because folding
+    it also keeps two databases whose names differ only in case out of one hive,
+    which ArcadeDB on Windows does not survive.
+
+    Same digest idiom as `_id_key` (blake2b/16), truncated: 32 bits is ample to
+    separate the databases of one machine, and a short tail keeps the database
+    name readable.
+    """
+    return _id_key(str(root).casefold())[:8]
+
+
+def derive_db_name(graph_path: str | None) -> str:
+    """Per-project database name: ``proj_<root-name>_<hash8>``.
+
+    The digest is taken over the normalised absolute project path, NOT over the
+    directory name. One hive serves every user of the machine, so a name built
+    from the last path component alone maps ``C:\\work\\Hotel`` and
+    ``D:\\arch\\Hotel`` onto a single database and silently mixes two unrelated
+    projects. The readable half is kept so ``graphify arcade reload`` and Studio
+    stay legible; the digest is what actually separates.
+
+    Lower-cased throughout so the whole name is a function of the normalised
+    path — a readable half that kept the original case would re-introduce the
+    split the digest exists to prevent.
+    """
+    import re
+    root = project_root_of(graph_path)
+    if root is None:
         return "graphify"
-    p = Path(graph_path).resolve()
-    root = p.parent.parent.name if p.parent.name == "graphify-out" else p.parent.name
-    safe = re.sub(r"[^A-Za-z0-9_]", "_", root).strip("_")
-    return f"proj_{safe}" if safe else "graphify"
+    safe = re.sub(r"[^a-z0-9_]", "_", root.name.casefold()).strip("_")
+    key = _project_key(root)
+    return f"proj_{safe}_{key}" if safe else f"proj_{key}"
 
 
 def resolve_backend_config(graph_path: str | None = None) -> dict:
     """Resolve which backend to use from the environment.
 
-    ``GRAPHIFY_BACKEND=arcadedb`` switches to the DB; otherwise the in-process
-    JSON model is used (so nothing changes for existing users). ArcadeDB is
-    connect-only here — the server is assumed already running. The database
-    name defaults to a per-project name derived from ``graph_path`` unless
-    ``GRAPHIFY_ARCADE_DB`` is set.
+    ArcadeDB is the default: the graph database is where graphify reads from,
+    and the server is a machine service that is expected to be running (see
+    `require_backend` for what happens when it is not). ``GRAPHIFY_BACKEND=json``
+    is the explicit opt-out onto the in-process model — kept for tests, CI and
+    upstream compatibility, not as a fallback the system chooses on its own.
+
+    The database name defaults to a per-project name derived from ``graph_path``
+    unless ``GRAPHIFY_ARCADE_DB`` is set.
     """
     import os
-    kind = os.environ.get("GRAPHIFY_BACKEND", "json").strip().lower()
+    from graphify import arcade_server
+    kind = os.environ.get("GRAPHIFY_BACKEND", "arcadedb").strip().lower()
     if kind in ("arcadedb", "arcade"):
-        url = os.environ.get("GRAPHIFY_ARCADE_URL", "http://127.0.0.1:2480")
+        # Precedence: environment, then the machine config the service writes,
+        # then the built-in default. Environment on top so a test or a debugging
+        # session never has to edit a machine-wide file; the config below it so
+        # an ordinary user configures nothing at all.
+        machine = arcade_server.read_machine_config()
+        url = os.environ.get("GRAPHIFY_ARCADE_URL") or machine.get("url") or "http://127.0.0.1:2480"
         rest = url.split("://", 1)[-1]
         host, _, port = rest.partition(":")
         return {
@@ -1295,8 +1375,11 @@ def resolve_backend_config(graph_path: str | None = None) -> dict:
             "host": host or "127.0.0.1",
             "port": int(port or 2480),
             "database": os.environ.get("GRAPHIFY_ARCADE_DB") or derive_db_name(graph_path),
-            "user": os.environ.get("GRAPHIFY_ARCADE_USER", "root"),
-            "password": os.environ.get("GRAPHIFY_ARCADE_PASSWORD", ""),
+            "user": os.environ.get("GRAPHIFY_ARCADE_USER") or machine.get("user") or "root",
+            "password": os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or machine.get("password") or "",
+            # Carried so the backend can refuse a database whose name digest
+            # collided with another project's (see ArcadeDBBackend.claim_project).
+            "project_path": str(project_root_of(graph_path) or ""),
         }
     return {"kind": "json", "graph_path": graph_path}
 
@@ -1311,22 +1394,130 @@ def open_backend(*, config: dict | None = None, graph=None, graph_path: str | No
     cfg = config or resolve_backend_config(graph_path)
     if cfg["kind"] == "arcadedb":
         return ArcadeDBBackend(cfg["database"], host=cfg["host"], port=cfg["port"],
-                               user=cfg["user"], password=cfg["password"])
+                               user=cfg["user"], password=cfg["password"],
+                               project_path=cfg.get("project_path"))
     if graph is None:
         from graphify.serve import _load_graph
         graph = _load_graph(cfg.get("graph_path") or graph_path)
     return JsonBackend(graph)
 
 
-def open_backend_for_sync(config: dict) -> GraphBackend:
-    """`open_backend` for the extract/update SYNC path only.
+# --------------------------------------------------------------------------- #
+# Availability: the graph database is required, so absence is fatal
+# --------------------------------------------------------------------------- #
+from graphify.arcade_server import SERVICE_NAME, GraphDBUnavailable  # noqa: E402,F401
 
-    Honors the opt-in ArcadeDB auto-start (GRAPHIFY_ARCADE_AUTOSTART, see
-    `arcade_server.maybe_autostart`) before connecting; queries stay
-    connect-only. Lives in this fork-owned file so the churn-file call sites
-    (cli.py extract sync, watch.py rebuild sync) stay one-line thin.
+_READY_TIMEOUT = 30.0  # the service starts with the OS; the first command after login waits
+_READY_POLL = 1.0
+
+
+def _await_ready(backend, *, timeout=None, poll=None, sleep=None, stream=None,
+                 clock=None) -> None:
+    """Block until the service answers /ready, or raise.
+
+    A bounded wait rather than a single probe: the service starts with the
+    machine, so the first command after login legitimately arrives while it is
+    still opening databases. Failing instantly there would teach the user to
+    re-run the command — that is, to ignore an error that is meant to be final.
+
+    The budget is wall-clock, not a count of attempts: a probe against a dead
+    service is not free (a refused connection costs seconds), so counting
+    attempts spends `timeout` on sleeping alone and overshoots the number the
+    user was just told to expect.
     """
-    if config.get("kind") == "arcadedb":
-        from graphify import arcade_server
-        arcade_server.maybe_autostart(config)
-    return open_backend(config=config)
+    import sys
+    import time
+
+    # Read the budget at call time, not at def time, so it stays one place to
+    # change (and one place for a test to shorten).
+    timeout = _READY_TIMEOUT if timeout is None else timeout
+    poll = _READY_POLL if poll is None else poll
+    sleep = time.sleep if sleep is None else sleep
+    stream = sys.stderr if stream is None else stream
+    clock = time.monotonic if clock is None else clock
+    deadline = clock() + timeout
+    announced = False
+    while True:
+        if backend.ready():
+            return
+        if getattr(backend, "last_ready_status", None) in (401, 403):
+            # Waiting cannot fix a rejected credential, and reporting it as an
+            # unreachable service sends the user to look at the wrong thing.
+            from graphify.arcade_server import config_path
+            raise GraphDBUnavailable(
+                f"the {SERVICE_NAME} service at {backend.base} is answering but "
+                f"rejected the credentials (HTTP {backend.last_ready_status}).\n"
+                f"The password in use does not match the one the service was installed "
+                f"with. Unset GRAPHIFY_ARCADE_PASSWORD to fall back on {config_path()},\n"
+                f"or reinstall the service: graphify arcade uninstall-service && "
+                f"graphify arcade install-service"
+            )
+        if not announced:
+            print(f"[graphify db] {SERVICE_NAME} at {backend.base} is not ready yet; "
+                  f"waiting up to {timeout:.0f}s ...", file=stream)
+            announced = True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        sleep(min(poll, remaining))
+    raise GraphDBUnavailable(
+        f"the {SERVICE_NAME} service at {backend.base} did not answer within {timeout:.0f}s.\n"
+        f"The graph database is required; graphify does not fall back to graph.json.\n"
+        f"Check it with: graphify arcade status"
+    )
+
+
+def _require_database(backend, config: dict) -> None:
+    """Fail with the computed database name and the way to create it."""
+    try:
+        names = backend._server("list databases").get("result", []) or []
+    except Exception as exc:
+        raise GraphDBUnavailable(
+            f"could not list databases on {backend.base}: {exc}\n"
+            f"Check the service with: graphify arcade status") from exc
+    if backend.db in names:
+        return
+    raise GraphDBUnavailable(
+        f"database '{backend.db}' does not exist on {backend.base}.\n"
+        f"  project: {config.get('project_path') or '(unknown)'}\n"
+        f"Build it with:  graphify extract <project-dir>\n"
+        f"or reload it from an existing graph:  graphify arcade reload <project-dir|graph.json>"
+    )
+
+
+def require_backend(*, config: dict | None = None, graph=None, graph_path: str | None = None,
+                    require_database: bool = True, timeout: float | None = None,
+                    sleep=None, stream=None) -> GraphBackend:
+    """`open_backend`, checked: for ArcadeDB an unavailable service is fatal.
+
+    ``require_database=False`` on the sync path, where the project's database is
+    allowed not to exist yet (a first build creates it).
+
+    Lives in this fork-owned file so the churn-file call sites stay one line:
+    upstream merges can sever a call, and the guard tests make that visible, but
+    they cannot carry off the logic.
+    """
+    cfg = config or resolve_backend_config(graph_path)
+    backend = open_backend(config=cfg, graph=graph, graph_path=graph_path)
+    if cfg["kind"] != "arcadedb":
+        return backend
+    _await_ready(backend, timeout=timeout, sleep=sleep, stream=stream)
+    if require_database:
+        _require_database(backend, cfg)
+    return backend
+
+
+def require_service(graph_path: str | None = None, *, config: dict | None = None, **kw) -> None:
+    """Fail at the START of a pipeline if the graph database is not there.
+
+    The sync runs at the very end, after AST extraction, LLM calls and real API
+    spend. Learning there that the service was unreachable is the expensive way
+    to learn it, and the probe costs milliseconds — so extract/update ask first.
+    No-op for the JSON backend.
+    """
+    cfg = config or resolve_backend_config(graph_path)
+    if cfg["kind"] != "arcadedb":
+        return
+    _await_ready(open_backend(config=cfg), **kw)
+
+
