@@ -13,6 +13,7 @@ from graphify.extract import (
     extract_edt_dcs, _make_id,
     extract_powershell_manifest,
 )
+from graphify.extractors.bsl import _edt_type_kind
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -2863,6 +2864,10 @@ EDT = FIXTURES / "edt"
 CATALOG_MDO = EDT / "Catalogs" / "Контрагенты" / "Контрагенты.mdo"
 ENUM_MDO = EDT / "Enums" / "СтатусДоговора" / "СтатусДоговора.mdo"
 CONFIG_MDO = EDT / "Configuration" / "Configuration.mdo"
+COMMON_COMMAND_MDO = EDT / "CommonCommands" / "ОбщаяКоманда" / "ОбщаяКоманда.mdo"
+REPORT_FORM = EDT / "Reports" / "ВзаиморасчетыОтчет" / "Forms" / "ФормаОтчета" / "Form.form"
+JOURNAL_FORM = (EDT / "DocumentJournals" / "ЖурналПродаж" / "Forms"
+                / "ФормаСписка" / "Form.form")
 CALCREG_MDO = EDT / "CalculationRegisters" / "РегистрРасчета1" / "РегистрРасчета1.mdo"
 RECALC_MDO = (EDT / "CalculationRegisters" / "РегистрРасчета1" / "Recalculations"
               / "Перерасчет" / "Перерасчет.mdo")
@@ -3058,6 +3063,178 @@ def test_edt_existing_ids_unchanged_by_nesting_support():
                           "Subsystem.Продажи")["id"] == "subsystem_продажи"
     assert _node_by_label(extract_edt_mdo(NESTED_SUBSYSTEM_MDO),
                           "Subsystem.Продажи.Розница")["id"] == "subsystem_продажи_розница"
+
+
+def test_edt_common_command_binds_its_own_module():
+    """A CommonCommand keeps CommandModule.bsl in its own folder (skill §4.15).
+
+    Every other kind puts its command module under Commands/<C>/, which is why
+    this one was the only binding missing.
+    """
+    r = extract_edt_mdo(COMMON_COMMAND_MDO)
+    defines = [e for e in r["edges"] if e["relation"] == "defines"]
+    assert len(defines) == 1
+    assert defines[0]["source"] == _node_by_label(r, "CommonCommand.ОбщаяКоманда")["id"]
+
+
+def test_edt_object_command_module_is_bound_once_and_from_the_command():
+    """An object's command module hangs off the command, not off the object.
+
+    This is the guard on the fix above: putting CommandModule.bsl into
+    _EDT_OBJECT_MODULES would hand every object a second edge to a file that
+    belongs to its command.
+    """
+    r = extract_edt_mdo(CATALOG_MDO)
+    module = CATALOG_MDO.parent / "Commands" / "Печать" / "CommandModule.bsl"
+    bound = [e for e in r["edges"]
+             if e["relation"] == "defines" and e["target"] == _make_id(str(module))]
+    assert len(bound) == 1
+    assert bound[0]["source"] == _make_id("Catalog", "Контрагенты", "Command", "Печать")
+
+
+def test_edt_configuration_binds_its_own_modules():
+    """Configuration modules live beside Configuration.mdo, not beside an object.
+
+    The Configuration branch returns before the shared module loop, so none of
+    the five (skill §1) was ever linked; the fixture carries two of them.
+    """
+    r = extract_edt_mdo(CONFIG_MDO)
+    defines = [e for e in r["edges"] if e["relation"] == "defines"]
+    conf_id = _node_by_label(r, "ТестоваяКонфигурация")["id"]
+    assert len(defines) == 2
+    assert {e["source"] for e in defines} == {conf_id}
+    assert {_make_id(str(CONFIG_MDO.parent / n)) for n in
+            ("ManagedApplicationModule.bsl", "SessionModule.bsl")} ==         {e["target"] for e in defines}
+
+
+def test_edt_configuration_contains_edges_unchanged_by_module_binding():
+    """Regression: registrations are untouched by the module fix.
+
+    Literal expected set — recomputing it from the same code would assert
+    nothing about whether the registrations still resolve.
+    """
+    r = extract_edt_mdo(CONFIG_MDO)
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    contained = sorted(labels[e["target"]] for e in r["edges"]
+                       if e["relation"] == "contains")
+    assert contained == [
+        "CalculationRegister.РегистрРасчета1",
+        "Catalog.Контрагенты",
+        "Catalog.Пользователи",
+        "CommonCommand.ОбщаяКоманда",
+        "DocumentJournal.ЖурналПродаж",
+        "Enum.СтатусДоговора",
+        "ExternalDataSource.ТекущаяСУБД",
+        "PaletteColor.ФирменныйСиний",
+        "Report.ВзаиморасчетыОтчет",
+        "Role.Менеджер",
+        "Role.ПолныеПрава",
+        "SettingsStorage.ХранилищеОтчетов",
+        "Subsystem.Продажи",
+    ]
+
+
+def test_edt_form_owner_resolves_for_every_kind_that_owns_a_folder():
+    """A form under a folder the map did not know lost its owner entirely.
+
+    _EDT_PLURAL_TO_KIND covered 17 of the 48 kinds, so extract_edt_form returned
+    an empty result for anything else — no node, no edges, no diagnostic.
+    """
+    r = extract_edt_form(JOURNAL_FORM)
+    assert r["nodes"], "форма без владельца не даёт вообще ничего"
+    assert _node_by_label(r, "ФормаСписка")["id"] == _make_id(
+        "DocumentJournal", "ЖурналПродаж", "Form", "ФормаСписка")
+    # …and it merges with the id the owner .mdo emits for the same form.
+    owner = extract_edt_mdo(EDT / "DocumentJournals" / "ЖурналПродаж" / "ЖурналПродаж.mdo")
+    assert _node_by_label(owner, "ФормаСписка")["id"] == _node_by_label(r, "ФормаСписка")["id"]
+
+
+def test_edt_form_under_an_unknown_folder_invents_nothing(tmp_path):
+    """An unmapped folder must yield no owner rather than a guessed one."""
+    d = tmp_path / "src" / "ВыдуманныйВид" / "Ы" / "Forms" / "Ф"
+    d.mkdir(parents=True)
+    form = d / "Form.form"
+    form.write_text(
+        '''<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form"/>
+''',
+        encoding="utf-8",
+    )
+    r = extract_edt_form(form)
+    assert r == {"nodes": [], "edges": []}
+
+
+def test_edt_type_flavours_all_resolve_to_one_object():
+    """A type flavour says in which capacity an object is used, not which object.
+
+    All eight flavours of `Справочник.Клиенты` denote the same catalog; giving
+    each its own node would split one object into seven.
+    """
+    for prefix in ("CatalogRef", "CatalogObject", "CatalogManager", "CatalogList",
+                   "CatalogSelection"):
+        assert _edt_type_kind(prefix) == "Catalog"
+    for prefix in ("InformationRegisterRecordSet", "InformationRegisterRecordKey",
+                   "InformationRegisterRecordManager"):
+        assert _edt_type_kind(prefix) == "InformationRegister"
+
+
+def test_edt_type_flavour_stripping_takes_the_longest_suffix():
+    """The greedy trap: two flavours can both match one prefix.
+
+    `InformationRegisterRecordManager` ends in `RecordManager` and in `Manager`;
+    stripping the shorter one leaves `InformationRegisterRecord`, which is not a
+    kind. `ChartOfCharacteristicTypesObject` is the mirror case — the kind name
+    itself ends in a word that looks like part of a flavour.
+    """
+    assert _edt_type_kind("InformationRegisterRecordManager") == "InformationRegister"
+    assert _edt_type_kind("ChartOfCharacteristicTypesObject") == "ChartOfCharacteristicTypes"
+
+
+def test_edt_type_remainder_that_is_not_a_kind_is_not_a_reference():
+    """Anything ending in a flavour word is not thereby a metadata reference."""
+    for prefix in ("String", "DynamicList", "ValueList", "Listendruck", "ValueTable"):
+        assert _edt_type_kind(prefix) is None
+
+
+def test_edt_form_links_its_main_attribute_to_the_owning_object():
+    """The main form attribute is typed `<Kind>Object.<Name>` (skill §5, rule 6).
+
+    It matched nothing while only `*Ref.` was parsed, which is why 719 typed
+    references were missing on the corpus. Asserted on a report form, where the
+    Object flavour is the only source of the target: the catalog form also
+    names its object in <mainTable>, so it would pass either way.
+    """
+    r = extract_edt_form(REPORT_FORM)
+    assert "Report.ВзаиморасчетыОтчет" in {n["label"] for n in r["nodes"]}
+
+
+def test_edt_tabular_section_attribute_is_reachable():
+    """A tabular-section column hangs off the section, not off the object.
+
+    The child loop was flat, so `Kind.Name.TabularSection.T.Attribute.A` — a
+    plain application of the recursive FQN grammar (skill §3) — did not exist;
+    on the corpus that is 1131 columns in 176 sections.
+    """
+    r = extract_edt_mdo(CATALOG_MDO)
+    column = _make_id("Catalog", "Контрагенты", "TabularSection", "Контакты",
+                      "Attribute", "Значение")
+    assert column in {n["id"] for n in r["nodes"]}
+    section = _make_id("Catalog", "Контрагенты", "TabularSection", "Контакты")
+    assert [e["source"] for e in r["edges"] if e["target"] == column] == [section]
+
+
+def test_edt_non_container_children_do_not_descend():
+    """Only documented containers descend; other blocks own nothing.
+
+    An attribute carries <type><types>String</types></type>; recursing
+    unconditionally would mint a node for the type and for every other nested
+    block that names nothing.
+    """
+    r = extract_edt_mdo(CATALOG_MDO)
+    attribute = _make_id("Catalog", "Контрагенты", "Attribute", "ИНН")
+    assert attribute in {n["id"] for n in r["nodes"]}
+    assert [e for e in r["edges"] if e["source"] == attribute] == []
+    assert "String" not in {n["label"] for n in r["nodes"]}
 
 
 def test_bsl_links_manager_access_to_metadata():

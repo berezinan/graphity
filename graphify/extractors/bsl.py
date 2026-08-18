@@ -316,6 +316,22 @@ _EDT_MANAGER_TO_KIND: dict[str, str] = {
     "Отчеты": "Report", "Reports": "Report",
 }
 
+# Configuration-level BSL modules, which live beside Configuration.mdo rather
+# than beside an object (skill: edt-structures §1). All five are listed even
+# though a given configuration carries at most a couple: the is_file() check
+# below filters, and hard-coding the observed subset would silently drop the
+# rest on the next project.
+_EDT_CONFIGURATION_MODULES: tuple[str, ...] = (
+    "ApplicationModule.bsl", "ManagedApplicationModule.bsl",
+    "OrdinaryApplicationModule.bsl", "SessionModule.bsl",
+    "ExternalConnectionModule.bsl",
+)
+
+# Inline children that own children of their own. Kept as an explicit set for
+# the same reason as every other whitelist here: descending into everything
+# would mint nodes for blocks that own nothing.
+_EDT_CONTAINER_CHILD_KINDS: frozenset[str] = frozenset({"TabularSection"})
+
 # Object-level BSL modules that may sit next to a <Name>.mdo, by their fixed
 # filename. Each existing one is linked object -> module with a `defines` edge.
 _EDT_OBJECT_MODULES: tuple[str, ...] = (
@@ -328,9 +344,38 @@ _EDT_OBJECT_MODULES: tuple[str, ...] = (
 # ignored.
 _EDT_FQN_RE = re.compile(r'^([A-Za-z]+)\.(.+)$')
 
-# A ref-type in a form, e.g. "CatalogRef.Клиенты" -> kind "Catalog". The prefix
-# minus the "Ref" suffix is the English singular kind.
-_EDT_REF_TYPE_RE = re.compile(r'^([A-Za-z]+)Ref\.(.+)$')
+# A typed value in a form, e.g. "CatalogRef.Клиенты" or "CatalogObject.Клиенты".
+# group(1) is the whole prefix; _edt_type_kind below strips the flavour suffix.
+_EDT_TYPE_RE = re.compile(r'^([A-Za-z]+)\.(.+)$')
+
+# Type flavours from the prefix table (skill: edt-structures §3). A flavour says
+# in WHICH CAPACITY an object is used, not which object — every flavour of
+# `Справочник.Клиенты` denotes the same `Catalog.Клиенты`, so they all resolve to
+# one node. Ordered longest-first: `InformationRegisterRecordManager` ends in
+# both `RecordManager` and `Manager`, and taking the shorter one leaves
+# `InformationRegisterRecord`, a kind that does not exist.
+_EDT_TYPE_FLAVOURS: tuple[str, ...] = (
+    "RecordManager", "RecordSet", "RecordKey", "Selection", "Manager",
+    "Object", "List", "Ref",
+)
+
+
+def _edt_type_kind(prefix: str) -> str | None:
+    """English kind behind a type prefix, or None when it is not one.
+
+    The remainder after stripping a flavour must itself be a known kind. Without
+    that check `ChartOfCharacteristicTypesObject` would yield the non-existent
+    kind `ChartOfCharacteristicTypes` + leftovers, and any word ending in "List"
+    would look like a metadata reference.
+    """
+    if prefix in _EDT_KIND_PREFIXES:
+        return prefix
+    for flavour in _EDT_TYPE_FLAVOURS:
+        if prefix.endswith(flavour):
+            kind = prefix[: -len(flavour)]
+            if kind in _EDT_KIND_PREFIXES:
+                return kind
+    return None
 
 # On-disk plural folder name (src/<KindPlural>/) -> English singular kind. Used to
 # rebuild a form's owner-object node id from its file path so the id matches the
@@ -347,6 +392,33 @@ _EDT_PLURAL_TO_KIND: dict[str, str] = {
     "ExchangePlans": "ExchangePlan", "BusinessProcesses": "BusinessProcess",
     "Tasks": "Task", "DataProcessors": "DataProcessor", "Reports": "Report",
     "ExternalDataSources": "ExternalDataSource",
+    # Everything else that owns a src/<KindPlural>/ folder (skill §4.0). Spelled
+    # out rather than derived by appending "s": the irregular plurals below are
+    # exactly the ones a rule would get wrong — ChartsOf* is not ChartOf*s,
+    # FilterCriteria comes from FilterCriterion, and Sequences / WSReferences /
+    # XDTOPackages / CommonPictures each break a different guess. A folder that
+    # is not in this map resolves to no owner, which is the safe outcome: an
+    # invented FQN is worse than a missing one.
+    "DocumentJournals": "DocumentJournal",
+    "DocumentNumerators": "DocumentNumerator",
+    "Constants": "Constant", "Sequences": "Sequence",
+    "CommonForms": "CommonForm", "CommonCommands": "CommonCommand",
+    "CommonTemplates": "CommonTemplate", "CommonPictures": "CommonPicture",
+    "CommonAttributes": "CommonAttribute", "CommonModules": "CommonModule",
+    "CommandGroups": "CommandGroup",
+    "Subsystems": "Subsystem", "Roles": "Role",
+    "ScheduledJobs": "ScheduledJob", "SessionParameters": "SessionParameter",
+    "SettingsStorages": "SettingsStorage", "DefinedTypes": "DefinedType",
+    "FunctionalOptions": "FunctionalOption",
+    "FunctionalOptionsParameters": "FunctionalOptionsParameter",
+    "EventSubscriptions": "EventSubscription",
+    "FilterCriteria": "FilterCriterion",
+    "HTTPServices": "HTTPService", "WebServices": "WebService",
+    "WSReferences": "WSReference", "XDTOPackages": "XDTOPackage",
+    "StyleItems": "StyleItem", "Styles": "Style",
+    "PaletteColors": "PaletteColor", "Languages": "Language",
+    "Bots": "Bot", "IntegrationServices": "IntegrationService",
+    "WebSocketClients": "WebSocketClient",
 }
 
 # Common (owner-less) plural folders -> singular kind, for path-based owner
@@ -524,6 +596,15 @@ def extract_edt_mdo(path: Path) -> dict:
             obj_id = _make_id(m.group(1), m.group(2))
             add_node(obj_id, text)
             add_edge(conf_id, obj_id, "contains")
+        # The five configuration modules sit beside Configuration.mdo. Linked
+        # here rather than by moving the early return: the return exists so a
+        # Configuration.mdo never runs through the object path (inline children,
+        # subsystems), and relaxing it to reach the shared module loop would
+        # cost more than repeating three lines.
+        for mod_name in _EDT_CONFIGURATION_MODULES:
+            mod = path.parent / mod_name
+            if mod.is_file():
+                add_edge(conf_id, _make_id(str(mod)), "defines")
         return {"nodes": nodes, "edges": edges}
 
     # ── Object root: the object plus its child artifacts and modules ───────────
@@ -587,6 +668,23 @@ def extract_edt_mdo(path: Path) -> dict:
         child_id = _make_id(*id_parts, sub, child_name)
         add_node(child_id, child_name, uuid=child.get("uuid"))
         add_edge(obj_id, child_id, "contains")
+        # A container child owns children of its own, and the FQN grammar is
+        # recursive (skill §3): a tabular-section column is
+        # `Kind.Name.TabularSection.T.Attribute.A`, hanging off the section
+        # rather than off the object. Only the kinds the skill documents as
+        # containers descend — an unconditional recursion would turn <type>,
+        # <synonym> and every other non-owning block into nodes.
+        if sub in _EDT_CONTAINER_CHILD_KINDS:
+            for grandchild in child:
+                sub2 = _CHILD_KINDS.get(_edt_localname(grandchild.tag))
+                if not sub2:
+                    continue
+                gc_name = child_text(grandchild, "name")
+                if not gc_name:
+                    continue
+                gc_id = _make_id(*id_parts, sub, child_name, sub2, gc_name)
+                add_node(gc_id, gc_name, uuid=grandchild.get("uuid"))
+                add_edge(child_id, gc_id, "contains")
         # A form/command owns a BSL module folder next to the .mdo.
         if sub == "Form":
             mod = path.parent / "Forms" / child_name / "Module.bsl"
@@ -622,6 +720,16 @@ def extract_edt_mdo(path: Path) -> dict:
     # Object-level modules sitting beside the .mdo.
     for mod_name in _EDT_OBJECT_MODULES:
         mod = path.parent / mod_name
+        if mod.is_file():
+            add_edge(obj_id, _make_id(str(mod)), "defines")
+
+    # A CommonCommand keeps its CommandModule.bsl in its own folder (skill:
+    # edt-structures §4.15). Bound here rather than added to _EDT_OBJECT_MODULES,
+    # because an object's command keeps that same filename in Commands/<C>/ and
+    # is already linked from the child loop above — an unconditional entry would
+    # give every object a second, wrong edge to a file it does not own.
+    if kind == "CommonCommand":
+        mod = path.parent / "CommandModule.bsl"
         if mod.is_file():
             add_edge(obj_id, _make_id(str(mod)), "defines")
 
@@ -835,9 +943,11 @@ def extract_edt_form(path: Path) -> dict:
             if m and m.group(1) in _EDT_KIND_PREFIXES:
                 add_ref(m.group(1), m.group(2))
         elif ln == "types":
-            m = _EDT_REF_TYPE_RE.match(text)
-            if m and m.group(1) in _EDT_KIND_PREFIXES:
-                add_ref(m.group(1), m.group(2))
+            m = _EDT_TYPE_RE.match(text)
+            if m:
+                kind = _edt_type_kind(m.group(1))
+                if kind:
+                    add_ref(kind, m.group(2))
 
     # An event/command handler binds the form to a procedure in its Module.bsl.
     # `<handlers><event>E</event><name>Proc</name>` (item/form events) and

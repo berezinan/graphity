@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:DocumentJournal xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                         uuid="dddddddd-1111-4000-8000-000000000001">
+  <name>ЖурналПродаж</name>
+  <synonym>
+    <key>ru</key>
+    <value>Журнал продаж</value>
+  </synonym>
+  <forms uuid="dddddddd-1111-4000-8000-000000000002">
+    <name>ФормаСписка</name>
+    <synonym>
+      <key>ru</key>
+      <value>Форма списка</value>
+    </synonym>
+  </forms>
+</mdclass:DocumentJournal>

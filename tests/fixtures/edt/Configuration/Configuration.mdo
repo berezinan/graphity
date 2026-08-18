@@ -22,4 +22,5 @@
   <documentJournals>DocumentJournal.ЖурналПродаж</documentJournals>
   <settingsStorages>SettingsStorage.ХранилищеОтчетов</settingsStorages>
   <paletteColors>PaletteColor.ФирменныйСиний</paletteColors>
+  <commonCommands>CommonCommand.ОбщаяКоманда</commonCommands>
 </mdclass:Configuration>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xmlns:form="http://g5.1c.ru/v8/dt/form">
+  <attributes>
+    <name>Список</name>
+    <valueType>
+      <types>DynamicList</types>
+    </valueType>
+    <extInfo xsi:type="form:DynamicListExtInfo">
+      <mainTable>DocumentJournal.ЖурналПродаж</mainTable>
+    </extInfo>
+  </attributes>
+</form:Form>

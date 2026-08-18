@@ -10,4 +10,11 @@
     <name>ОсновнаяСхема</name>
     <templateType>DataCompositionSchema</templateType>
   </templates>
+  <forms uuid="72727272-7272-4727-8727-727272727272">
+    <name>ФормаОтчета</name>
+    <synonym>
+      <key>ru</key>
+      <value>Форма отчёта</value>
+    </synonym>
+  </forms>
 </mdclass:Report>
