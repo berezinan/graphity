@@ -8,6 +8,7 @@
     <value>Тестовая конфигурация</value>
   </synonym>
   <scriptVariant>Russian</scriptVariant>
+  <compatibilityMode>8.3.24</compatibilityMode>
   <defaultRoles>Role.ПолныеПрава</defaultRoles>
   <subsystems>Subsystem.Продажи</subsystems>
   <catalogs>Catalog.Контрагенты</catalogs>
@@ -16,4 +17,9 @@
   <reports>Report.ВзаиморасчетыОтчет</reports>
   <roles>Role.ПолныеПрава</roles>
   <roles>Role.Менеджер</roles>
+  <calculationRegisters>CalculationRegister.РегистрРасчета1</calculationRegisters>
+  <externalDataSources>ExternalDataSource.ТекущаяСУБД</externalDataSources>
+  <documentJournals>DocumentJournal.ЖурналПродаж</documentJournals>
+  <settingsStorages>SettingsStorage.ХранилищеОтчетов</settingsStorages>
+  <paletteColors>PaletteColor.ФирменныйСиний</paletteColors>
 </mdclass:Configuration>

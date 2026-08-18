@@ -2863,6 +2863,14 @@ EDT = FIXTURES / "edt"
 CATALOG_MDO = EDT / "Catalogs" / "Контрагенты" / "Контрагенты.mdo"
 ENUM_MDO = EDT / "Enums" / "СтатусДоговора" / "СтатусДоговора.mdo"
 CONFIG_MDO = EDT / "Configuration" / "Configuration.mdo"
+CALCREG_MDO = EDT / "CalculationRegisters" / "РегистрРасчета1" / "РегистрРасчета1.mdo"
+RECALC_MDO = (EDT / "CalculationRegisters" / "РегистрРасчета1" / "Recalculations"
+              / "Перерасчет" / "Перерасчет.mdo")
+EDS_TABLE_MDO = (EDT / "ExternalDataSources" / "ТекущаяСУБД" / "Tables"
+                 / "ИнфоТаблица" / "ИнфоТаблица.mdo")
+EDS_CUBE_MDO = EDT / "ExternalDataSources" / "ТекущаяСУБД" / "Cubes" / "Куб1" / "Куб1.mdo"
+EDS_DIMTABLE_MDO = (EDT / "ExternalDataSources" / "ТекущаяСУБД" / "Cubes" / "Куб1"
+                    / "DimensionTables" / "Измерение1" / "Измерение1.mdo")
 
 
 def test_edt_mdo_no_error():
@@ -2935,6 +2943,121 @@ def test_edt_configuration_registers_children():
     assert ("ТестоваяКонфигурация", "Enum.СтатусДоговора") in contains
     # Non-FQN scalar children (scriptVariant, compatibilityMode) create no nodes.
     assert "Russian" not in labels
+
+
+def test_edt_configuration_registers_newly_recognised_kinds():
+    """Kinds the skill documents that the parser used to drop silently.
+
+    Asserted on the `contains` edge rather than on node presence: an object .mdo
+    becomes a node from its root tag regardless of _EDT_KIND_PREFIXES, so a
+    dropped registration surfaces as an orphan, not as a missing node — a
+    node-presence assertion would pass against the unfixed parser.
+    """
+    contains = _edge_labels(extract_edt_mdo(CONFIG_MDO), "contains")
+    for fqn in ("DocumentJournal.ЖурналПродаж",
+                "SettingsStorage.ХранилищеОтчетов",
+                "PaletteColor.ФирменныйСиний",
+                "ExternalDataSource.ТекущаяСУБД"):
+        assert ("ТестоваяКонфигурация", fqn) in contains
+
+
+def test_edt_configuration_ignores_non_fqn_children():
+    labels = _labels(extract_edt_mdo(CONFIG_MDO))
+    assert "8.3.24" not in labels     # <compatibilityMode>
+    assert "Russian" not in labels    # <scriptVariant>
+
+
+def test_edt_nested_unknown_root_tag_keeps_flat_id(tmp_path):
+    """An unrecognised layout must not get an invented FQN.
+
+    The recursive resolver keys off folder markers, but the root tag of the .mdo
+    is what names the SubKind. When the two disagree the object is something the
+    marker map does not model, so the parser falls back to the flat id instead of
+    asserting a parentage it cannot justify.
+    """
+    d = tmp_path / "ExternalDataSources" / "СУБД" / "Tables" / "Стол"
+    d.mkdir(parents=True)
+    mdo = d / "Стол.mdo"
+    mdo.write_text(
+        '''<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Sequence xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                  uuid="dddddddd-0000-4000-8000-000000000001">
+  <name>Стол</name>
+</mdclass:Sequence>
+''',
+        encoding="utf-8",
+    )
+    labels = _labels(extract_edt_mdo(mdo))
+    assert "Sequence.Стол" in labels
+    assert not [l for l in labels if l.startswith("ExternalDataSource.")]
+
+
+def test_edt_recalculation_fqn_carries_its_register():
+    """A Recalculation is a child of its CalculationRegister, not a top object.
+
+    The root tag of the standalone .mdo is `Recalculation`, so a flat id would
+    read `Recalculation.Перерасчет` — a name two registers can share.
+    """
+    r = extract_edt_mdo(RECALC_MDO)
+    assert "CalculationRegister.РегистрРасчета1.Recalculation.Перерасчет" in _labels(r)
+    assert ("CalculationRegister.РегистрРасчета1",
+            "CalculationRegister.РегистрРасчета1.Recalculation.Перерасчет")         in _edge_labels(r, "contains")
+
+
+def test_edt_recalculation_registered_inline_by_parent():
+    """The parent register declares its recalculations inline (skill §4.5)."""
+    contains = _edge_labels(extract_edt_mdo(CALCREG_MDO), "contains")
+    assert ("CalculationRegister.РегистрРасчета1", "Перерасчет") in contains
+
+
+def test_edt_external_data_source_children_fqn():
+    """Tables and cubes nest under the data source; there is no `Table` kind in 1C."""
+    t = extract_edt_mdo(EDS_TABLE_MDO)
+    assert "ExternalDataSource.ТекущаяСУБД.Table.ИнфоТаблица" in _labels(t)
+    assert ("ExternalDataSource.ТекущаяСУБД",
+            "ExternalDataSource.ТекущаяСУБД.Table.ИнфоТаблица") in _edge_labels(t, "contains")
+
+    c = extract_edt_mdo(EDS_CUBE_MDO)
+    assert "ExternalDataSource.ТекущаяСУБД.Cube.Куб1" in _labels(c)
+
+    # A dimension table nests one level deeper still — the grammar is recursive.
+    d = extract_edt_mdo(EDS_DIMTABLE_MDO)
+    assert "ExternalDataSource.ТекущаяСУБД.Cube.Куб1.DimensionTable.Измерение1" in _labels(d)
+
+
+def test_edt_external_table_fields_are_field_not_attribute():
+    """Fields of an external table carry SubKind `Field` (skill §4.21).
+
+    The two owners also spell the container differently: <tableFields> on a
+    Table, <fields> on a DimensionTable.
+    """
+    t = extract_edt_mdo(EDS_TABLE_MDO)
+    assert _make_id("ExternalDataSource", "ТекущаяСУБД", "Table", "ИнфоТаблица",
+                    "Field", "Поле1") in {n["id"] for n in t["nodes"]}
+    assert _make_id("ExternalDataSource", "ТекущаяСУБД", "Table", "ИнфоТаблица",
+                    "Attribute", "Поле1") not in {n["id"] for n in t["nodes"]}
+
+    d = extract_edt_mdo(EDS_DIMTABLE_MDO)
+    assert _make_id("ExternalDataSource", "ТекущаяСУБД", "Cube", "Куб1",
+                    "DimensionTable", "Измерение1", "Field",
+                    "ПолеИзмерения") in {n["id"] for n in d["nodes"]}
+
+
+def test_edt_existing_ids_unchanged_by_nesting_support():
+    """Regression: previously supported objects keep their exact ids.
+
+    Literal values, not recomputed ones — the point is that the id a stored graph
+    already holds still resolves, so recomputing through _make_id would assert
+    nothing.
+    """
+    assert _node_by_label(extract_edt_mdo(CATALOG_MDO),
+                          "Catalog.Контрагенты")["id"] == "catalog_контрагенты"
+    assert _node_by_label(extract_edt_mdo(ENUM_MDO),
+                          "Enum.СтатусДоговора")["id"] == "enum_статусдоговора"
+    assert _node_by_label(extract_edt_mdo(SUBSYSTEM_MDO),
+                          "Subsystem.Продажи")["id"] == "subsystem_продажи"
+    assert _node_by_label(extract_edt_mdo(NESTED_SUBSYSTEM_MDO),
+                          "Subsystem.Продажи.Розница")["id"] == "subsystem_продажи_розница"
 
 
 def test_bsl_links_manager_access_to_metadata():

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:ExternalDataSource xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="bbbbbbbb-0000-4000-8000-000000000001">
+  <name>ТекущаяСУБД</name>
+  <synonym>
+    <key>ru</key>
+    <value>Текущая СУБД</value>
+  </synonym>
+</mdclass:ExternalDataSource>

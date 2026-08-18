@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Recalculation xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="aaaaaaaa-0000-4000-8000-000000000002">
+  <name>Перерасчет</name>
+  <synonym>
+    <key>ru</key>
+    <value>Перерасчёт</value>
+  </synonym>
+</mdclass:Recalculation>

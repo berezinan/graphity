@@ -286,6 +286,12 @@ _EDT_KIND_PREFIXES: frozenset[str] = frozenset({
     "BusinessProcess", "Task", "Report", "DataProcessor", "HTTPService",
     "WebService", "XDTOPackage", "EventSubscription", "FilterCriterion",
     "FunctionalOption", "FunctionalOptionsParameter", "Language", "Sequence",
+    # Kinds documented by the skill but previously unrecognised: the first ten
+    # come from the mdclasses fixture (edt-structures §4.0), PaletteColor from
+    # the live-audited §4.22, which the fixture does not carry.
+    "DocumentJournal", "DocumentNumerator", "CommandGroup", "SettingsStorage",
+    "StyleItem", "Style", "PaletteColor", "ExternalDataSource", "WSReference",
+    "Bot", "IntegrationService", "WebSocketClient",
 })
 
 # Manager-collection identifiers (RU + EN) -> English kind prefix. A BSL access
@@ -340,6 +346,7 @@ _EDT_PLURAL_TO_KIND: dict[str, str] = {
     "ChartsOfCalculationTypes": "ChartOfCalculationTypes",
     "ExchangePlans": "ExchangePlan", "BusinessProcesses": "BusinessProcess",
     "Tasks": "Task", "DataProcessors": "DataProcessor", "Reports": "Report",
+    "ExternalDataSources": "ExternalDataSource",
 }
 
 # Common (owner-less) plural folders -> singular kind, for path-based owner
@@ -402,6 +409,44 @@ def _edt_subsystem_chain(path: Path) -> list[str]:
     parts = path.parts
     return [parts[i + 1] for i, seg in enumerate(parts[:-1])
             if seg == "Subsystems" and i + 1 < len(parts)]
+
+
+# Container folder -> the SubKind its children carry in an FQN. Unlike the
+# homogeneous `Subsystems` marker (one kind, repeated), these are heterogeneous:
+# the parent and the child are different kinds, so the FQN keeps both
+# (`CalculationRegister.X.Recalculation.R`). Skill: edt-structures §4.5, §4.21.
+_EDT_NESTED_MARKERS: dict[str, str] = {
+    "Recalculations": "Recalculation",
+    "Tables": "Table",
+    "Cubes": "Cube",
+    "Functions": "Function",
+    "DimensionTables": "DimensionTable",
+}
+
+
+def _edt_nested_owner_chain(path: Path) -> list[str] | None:
+    """FQN parts of the nested object `path` describes, or None if not nested.
+
+    Walks up from the file consuming `<Marker>/<Name>` pairs (`Tables/T`,
+    `Cubes/C`, `Recalculations/R`) and stops at the top-level `<KindPlural>/<Owner>`
+    pair, yielding `[Kind, Owner, SubKind, SubName, ...]` — the recursive grammar
+    `Kind.Name.SubKind.SubName[...]` verified against the 1c-syntax/mdclasses
+    fixtures. Returns None when the path is not under a marker folder, or when the
+    chain does not bottom out in a known kind folder, so callers fall back to the
+    flat id rather than invent an FQN.
+    """
+    dirs = path.parts[:-1]                      # drop the .mdo file name
+    chain: list[str] = []
+    i = len(dirs) - 2                           # index of the innermost marker
+    while i >= 0 and dirs[i] in _EDT_NESTED_MARKERS:
+        chain[:0] = [_EDT_NESTED_MARKERS[dirs[i]], dirs[i + 1]]
+        i -= 2
+    if not chain or i < 0:
+        return None
+    kind = _EDT_PLURAL_TO_KIND.get(dirs[i])
+    if not kind:
+        return None
+    return [kind, dirs[i + 1]] + chain
 
 
 def extract_edt_mdo(path: Path) -> dict:
@@ -488,6 +533,8 @@ def extract_edt_mdo(path: Path) -> dict:
 
     obj_id = _make_id(kind, name)
     obj_label = f"{kind}.{name}"
+    id_parts: list[str] = [kind, name]
+    parent_id: str | None = None
     sub_chain: list[str] = []
     if kind == "Subsystem":
         sub_chain = _edt_subsystem_chain(path)
@@ -496,12 +543,39 @@ def extract_edt_mdo(path: Path) -> dict:
         if len(sub_chain) > 1 and sub_chain[-1] == name:
             obj_id = _make_id(kind, *sub_chain)
             obj_label = f"{kind}." + ".".join(sub_chain)
+    else:
+        # Heterogeneous nesting. The root tag of a nested standalone .mdo IS the
+        # SubKind, so the flat `_make_id(kind, name)` above both invents a kind
+        # that does not exist in 1C (`Table.X`) and collides between parents.
+        # Requiring the tag to match the marker map means an unrecognised layout
+        # keeps the flat id rather than getting an invented FQN.
+        chain = _edt_nested_owner_chain(path)
+        if chain and chain[-2] == kind and chain[-1] == name:
+            id_parts = chain
+            obj_id = _make_id(*chain)
+            obj_label = ".".join(chain)
+            parent_id = _make_id(*chain[:-2])
     add_node(obj_id, obj_label, uuid=root.get("uuid"))
+    if parent_id:
+        # ExternalDataSource children are registered by folder only — the parent
+        # .mdo carries no inline block to emit this edge from (skill §4.21), so it
+        # is synthesised here. A Recalculation also gets it from the parent's
+        # inline <recalculations>; the duplicate collapses on the shared id.
+        add_node(parent_id, ".".join(id_parts[:-2]))
+        add_edge(parent_id, obj_id, "contains")
 
     # Child artifacts: attributes / tabular sections / enum values / forms / commands.
     _CHILD_KINDS = {
         "attributes": "Attribute", "tabularSections": "TabularSection",
         "enumValues": "EnumValue", "forms": "Form", "commands": "Command",
+        # A CalculationRegister registers its recalculations inline, so this is
+        # where the parent -> child edge comes from (the child .mdo also
+        # synthesises it from its path; the two share an id and collapse).
+        "recalculations": "Recalculation",
+        # External-table fields are SubKind `Field`, not `Attribute` — and the
+        # container tag differs by owner: <tableFields> on a Table, <fields> on a
+        # DimensionTable (skill: edt-structures §4.21).
+        "tableFields": "Field", "fields": "Field",
     }
     for child in root:
         sub = _CHILD_KINDS.get(_edt_localname(child.tag))
@@ -510,7 +584,7 @@ def extract_edt_mdo(path: Path) -> dict:
         child_name = child_text(child, "name")
         if not child_name:
             continue
-        child_id = _make_id(kind, name, sub, child_name)
+        child_id = _make_id(*id_parts, sub, child_name)
         add_node(child_id, child_name, uuid=child.get("uuid"))
         add_edge(obj_id, child_id, "contains")
         # A form/command owns a BSL module folder next to the .mdo.
