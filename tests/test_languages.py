@@ -13,7 +13,9 @@ from graphify.extract import (
     extract_edt_dcs, _make_id,
     extract_powershell_manifest,
 )
-from graphify.extractors.bsl import _edt_type_kind
+from graphify.extractors.bsl import (
+    _edt_type_kind, _edt_ref_target, _EDT_REF_TAGS, _EDT_REF_CONTAINER_TAGS,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -2865,6 +2867,16 @@ CATALOG_MDO = EDT / "Catalogs" / "Контрагенты" / "Контраген�
 ENUM_MDO = EDT / "Enums" / "СтатусДоговора" / "СтатусДоговора.mdo"
 CONFIG_MDO = EDT / "Configuration" / "Configuration.mdo"
 COMMON_COMMAND_MDO = EDT / "CommonCommands" / "ОбщаяКоманда" / "ОбщаяКоманда.mdo"
+DOCUMENT_MDO = EDT / "Documents" / "Заказ" / "Заказ.mdo"
+FUNCOPT_MDO = EDT / "FunctionalOptions" / "УчетСкидок" / "УчетСкидок.mdo"
+EXCHANGE_MDO = EDT / "ExchangePlans" / "Обмен" / "Обмен.mdo"
+SUBSCRIPTION_MDO = (EDT / "EventSubscriptions" / "ПриЗаписиКонтрагента"
+                    / "ПриЗаписиКонтрагента.mdo")
+PARTIAL_SUBSCRIPTION_MDO = (EDT / "EventSubscriptions" / "БезОбработчика"
+                            / "БезОбработчика.mdo")
+HTTP_SERVICE_MDO = EDT / "HTTPServices" / "Обмен" / "Обмен.mdo"
+WEB_SERVICE_MDO = EDT / "WebServices" / "Каталог" / "Каталог.mdo"
+JOURNAL_MDO = EDT / "DocumentJournals" / "ЖурналПродаж" / "ЖурналПродаж.mdo"
 REPORT_FORM = EDT / "Reports" / "ВзаиморасчетыОтчет" / "Forms" / "ФормаОтчета" / "Form.form"
 JOURNAL_FORM = (EDT / "DocumentJournals" / "ЖурналПродаж" / "Forms"
                 / "ФормаСписка" / "Form.form")
@@ -3122,15 +3134,21 @@ def test_edt_configuration_contains_edges_unchanged_by_module_binding():
         "Catalog.Контрагенты",
         "Catalog.Пользователи",
         "CommonCommand.ОбщаяКоманда",
+        "Document.Заказ",
         "DocumentJournal.ЖурналПродаж",
         "Enum.СтатусДоговора",
+        "EventSubscription.ПриЗаписиКонтрагента",
+        "ExchangePlan.Обмен",
         "ExternalDataSource.ТекущаяСУБД",
+        "FunctionalOption.УчетСкидок",
+        "HTTPService.Обмен",
         "PaletteColor.ФирменныйСиний",
         "Report.ВзаиморасчетыОтчет",
         "Role.Менеджер",
         "Role.ПолныеПрава",
         "SettingsStorage.ХранилищеОтчетов",
         "Subsystem.Продажи",
+        "WebService.Каталог",
     ]
 
 
@@ -3235,6 +3253,178 @@ def test_edt_non_container_children_do_not_descend():
     assert attribute in {n["id"] for n in r["nodes"]}
     assert [e for e in r["edges"] if e["source"] == attribute] == []
     assert "String" not in {n["label"] for n in r["nodes"]}
+
+
+def _refs(result):
+    """(source label, target label, context) for every `references` edge."""
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+    return {(labels.get(e["source"]), labels.get(e["target"]), e.get("context"))
+            for e in result["edges"] if e["relation"] == "references"}
+
+
+def test_edt_reference_tag_map_covers_the_documented_tags():
+    """The map IS the whitelist; a gap in it is a silently dropped class."""
+    covered = set(_EDT_REF_TAGS) | set(_EDT_REF_CONTAINER_TAGS) | {"references", "columns"}
+    for tag in ("registerRecords", "basedOn", "owners", "sequences", "inputByString",
+                "defaultObjectForm", "defaultListForm", "defaultChoiceForm",
+                "characteristicExtValues", "chartOfAccounts", "registeredDocuments",
+                "references", "mainDataCompositionSchema", "location", "content",
+                "handler", "source", "methodName", "task", "addressing",
+                "mainAddressingAttribute", "addressingDimension",
+                "commandParameterType", "defaultRoles", "defaultLanguage"):
+        assert tag in covered, tag
+
+
+def test_edt_declared_reference_becomes_an_edge():
+    refs = _refs(extract_edt_mdo(DOCUMENT_MDO))
+    assert ("Document.Заказ", "AccumulationRegister.ТоварыНаСкладах",
+            "register-records") in refs
+    assert ("Document.Заказ", "Catalog.Контрагенты", "based-on") in refs
+
+
+def test_edt_unknown_tag_and_unparseable_value_yield_nothing():
+    """Two ways to invent an edge, both refused.
+
+    The fixture carries a tag outside the map whose value looks exactly like an
+    FQN, and a <version> that would parse as kind "3" under any shape-only
+    heuristic.
+    """
+    refs = _refs(extract_edt_mdo(DOCUMENT_MDO))
+    assert not [r for r in refs if r[1] and r[1].startswith("3.")]
+    assert len([r for r in refs if r[1] == "Catalog.Контрагенты"]) == 1
+
+
+def test_edt_membership_content_is_references_not_contains():
+    """A functional option does not OWN the document whose visibility it drives.
+
+    Same for an exchange plan and the catalogs it replicates. `contains` there
+    would compete with the real ownership edge from Configuration.
+    """
+    fo = extract_edt_mdo(FUNCOPT_MDO)
+    assert ("FunctionalOption.УчетСкидок", "Document.Заказ",
+            "functional-option-content") in _refs(fo)
+    assert [e for e in fo["edges"] if e["relation"] == "contains"] == []
+
+    # ExchangePlan spells the SAME tag as a container: <content><mdObject>...
+    ep = extract_edt_mdo(EXCHANGE_MDO)
+    assert ("ExchangePlan.Обмен", "Catalog.Контрагенты",
+            "exchange-plan-content") in _refs(ep)
+
+
+def test_edt_subsystem_content_still_contains_and_unchanged():
+    """Regression: the one <content> that IS ownership keeps its relation."""
+    r = extract_edt_mdo(SUBSYSTEM_MDO)
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    contained = sorted((labels[e["source"]], labels[e["target"]])
+                       for e in r["edges"] if e["relation"] == "contains")
+    assert contained == [
+        ("Subsystem.Продажи", "Catalog.Контрагенты"),
+        ("Subsystem.Продажи", "Enum.СтатусДоговора"),
+        ("Subsystem.Продажи", "Subsystem.Продажи.Розница"),
+    ]
+    assert [e for e in r["edges"] if e["relation"] == "references"] == []
+
+
+def test_edt_value_forms_are_parsed_separately():
+    """One string shape, four meanings, decided by the tag it came from."""
+    assert _edt_ref_target("object", "Document.Заказ") == (["Document", "Заказ"], None)
+    assert _edt_ref_target("member", "Catalog.X.StandardAttribute.Description") == (
+        ["Catalog", "X", "StandardAttribute", "Description"], None)
+    assert _edt_ref_target("method", "CommonModule.Обмен.Выполнить") == (
+        ["CommonModule", "Обмен"], "Выполнить")
+    assert _edt_ref_target("type", "CatalogObject.Клиенты") == (["Catalog", "Клиенты"], None)
+    assert _edt_ref_target("object", "3.2.7.38") is None
+
+
+def test_edt_input_by_string_targets_the_member_not_the_object():
+    assert ("Document.Заказ", "Document.Заказ.StandardAttribute.Number",
+            "input-by-string") in _refs(extract_edt_mdo(DOCUMENT_MDO))
+
+
+def test_edt_reference_to_a_member_nobody_extracts_yet_is_stubbed():
+    """A reference is not dropped because its target has no extractor yet.
+
+    The stub carries the id the real node will get, so it merges rather than
+    duplicating once that extraction lands.
+    """
+    stub = _make_id("Document", "Заказ", "StandardAttribute", "Number")
+    ids = [n["id"] for n in extract_edt_mdo(DOCUMENT_MDO)["nodes"]]
+    assert stub in ids and ids.count(stub) == 1
+
+
+def test_edt_attribute_type_reference_belongs_to_the_attribute():
+    """Precision over aggregate: the aggregate follows, the reverse does not."""
+    r = extract_edt_mdo(CATALOG_MDO)
+    attribute = _make_id("Catalog", "Контрагенты", "Attribute", "ОсновнойМенеджер")
+    target = _make_id("Catalog", "Пользователи")
+    typed = [e for e in r["edges"]
+             if e["relation"] == "references" and e["target"] == target]
+    assert [e["source"] for e in typed] == [attribute]
+
+
+def test_edt_journal_column_reference_belongs_to_the_column():
+    r = extract_edt_mdo(JOURNAL_MDO)
+    column = _make_id("DocumentJournal", "ЖурналПродаж", "Column", "Организация")
+    assert ("Организация", "Document.Заказ.Attribute.Организация",
+            "journal-column-source") in _refs(r)
+    assert column in {n["id"] for n in r["nodes"]}
+
+
+def test_edt_event_subscription_is_read_as_a_triple():
+    """Alone each of the three tags says little; the meaning is in the triple."""
+    refs = _refs(extract_edt_mdo(SUBSCRIPTION_MDO))
+    assert ("EventSubscription.ПриЗаписиКонтрагента", "Catalog.Контрагенты",
+            "event-source") in refs
+    handler = [r for r in refs if r[1] == "CommonModule.ОбработчикиСобытий"]
+    assert len(handler) == 1
+    assert handler[0][2] == "event-handler:OnWrite:ПриЗаписи"
+
+
+def test_edt_incomplete_subscription_yields_what_is_determinable():
+    refs = _refs(extract_edt_mdo(PARTIAL_SUBSCRIPTION_MDO))
+    assert ("EventSubscription.БезОбработчика", "Catalog.Контрагенты",
+            "event-source") in refs
+    assert not [r for r in refs if r[1] and r[1].startswith("CommonModule.")]
+
+
+def test_edt_service_handler_resolves_a_bare_procedure_name():
+    """A service names its handler by bare procedure name, not by FQN.
+
+    The skill spells out the contrast (§4.22): an EventSubscription's <handler>
+    is a full method FQN in someone else's module, while a service's is a bare
+    name implemented in the Module.bsl beside the .mdo. Parsing only the FQN
+    form covered 8 handlers out of 98 on a real configuration.
+    """
+    mdo = extract_edt_mdo(HTTP_SERVICE_MDO)
+    handler = [e for e in mdo["edges"] if e.get("context") == "service-handler"]
+    assert len(handler) == 1
+    assert handler[0]["source"] == _make_id(
+        "HTTPService", "Обмен", "URLTemplate", "ШаблонЗаказа", "Method", "POST")
+    # The target is the real procedure node, not a dangling id: extract_bsl
+    # gives that procedure the same id, so the two halves merge.
+    module = extract_bsl(HTTP_SERVICE_MDO.parent / "Module.bsl")
+    assert handler[0]["target"] in {n["id"] for n in module["nodes"]}
+
+
+def test_edt_web_service_operation_resolves_its_procedure():
+    r = extract_edt_mdo(WEB_SERVICE_MDO)
+    proc = [e for e in r["edges"] if e.get("context") == "service-procedure"]
+    assert len(proc) == 1
+    assert proc[0]["source"] == _make_id(
+        "WebService", "Каталог", "Operation", "ПолучитьНоменклатуру")
+    module = extract_bsl(WEB_SERVICE_MDO.parent / "Module.bsl")
+    assert proc[0]["target"] in {n["id"] for n in module["nodes"]}
+
+
+def test_edt_event_subscription_handler_is_not_treated_as_a_bare_name():
+    """The two <handler> forms must not be confused for one another.
+
+    A dotted value is a method FQN in another module and must never be resolved
+    against the local Module.bsl — that would invent a procedure that is not
+    there.
+    """
+    refs = _refs(extract_edt_mdo(SUBSCRIPTION_MDO))
+    assert not [r for r in refs if r[2] and r[2].startswith("service-")]
 
 
 def test_bsl_links_manager_access_to_metadata():

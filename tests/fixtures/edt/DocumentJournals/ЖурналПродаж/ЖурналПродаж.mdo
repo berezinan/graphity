@@ -6,6 +6,11 @@
     <key>ru</key>
     <value>Журнал продаж</value>
   </synonym>
+  <registeredDocuments>Document.Заказ</registeredDocuments>
+  <columns uuid="dddddddd-1111-4000-8000-000000000003">
+    <name>Организация</name>
+    <references>Document.Заказ.Attribute.Организация</references>
+  </columns>
   <forms uuid="dddddddd-1111-4000-8000-000000000002">
     <name>ФормаСписка</name>
     <synonym>

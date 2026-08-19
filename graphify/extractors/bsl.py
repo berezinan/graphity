@@ -332,6 +332,81 @@ _EDT_CONFIGURATION_MODULES: tuple[str, ...] = (
 # would mint nodes for blocks that own nothing.
 _EDT_CONTAINER_CHILD_KINDS: frozenset[str] = frozenset({"TabularSection"})
 
+# Reference-bearing tags of an object .mdo: tag -> (value shape, context label).
+#
+# An explicit map, not "anything shaped like Kind.Name is a reference". That
+# shortcut breaks immediately: <name> can contain a dot, <synonym> and <comment>
+# hold free text, and <version>3.2.7.38 parses as kind "3". The cost is manual
+# upkeep; the benefit is that no edge is ever invented.
+#
+# Shapes:
+#   object    Kind.Name                     -> the object node
+#   member    Kind.Name.SubKind.SubName     -> the member node (stub if absent)
+#   method    CommonModule.Name.Method      -> the module node, method in context
+#   type      CatalogRef.Name / CatalogObject.Name -> the object node
+_EDT_REF_TAGS: dict[str, tuple[str, str]] = {
+    "registerRecords": ("object", "register-records"),
+    "basedOn": ("object", "based-on"),
+    "owners": ("object", "owner"),
+    "sequences": ("object", "sequence"),
+    "characteristicExtValues": ("object", "characteristic-ext-values"),
+    "chartOfAccounts": ("object", "chart-of-accounts"),
+    "registeredDocuments": ("object", "registered-document"),
+    "task": ("object", "task"),
+    "addressing": ("object", "addressing-register"),
+    "location": ("object", "functional-option-location"),
+    "defaultRoles": ("object", "default-role"),
+    "defaultLanguage": ("object", "default-language"),
+    "mainDataCompositionSchema": ("member", "main-dcs"),
+    "defaultObjectForm": ("member", "default-object-form"),
+    "defaultListForm": ("member", "default-list-form"),
+    "defaultChoiceForm": ("member", "default-choice-form"),
+    "inputByString": ("member", "input-by-string"),
+    "mainAddressingAttribute": ("member", "main-addressing-attribute"),
+    "addressingDimension": ("member", "addressing-dimension"),
+    "handler": ("method", "event-handler"),
+    "methodName": ("method", "scheduled-job-method"),
+}
+
+# Container-shaped tags: the FQN sits in a named child, not in the tag's text.
+# `<content>` is BOTH — a leaf on Subsystem and FunctionalOption, a container on
+# ExchangePlan (`<content><mdObject>Catalog.X</mdObject></content>`). Reading
+# only `.text` reports zero for 562 real references; this is the container/leaf
+# trap the skill calls out (edt-structures §3). Keying on the child tag also
+# makes Catalog's unrelated <content> blocks (name/description/code) a no-op.
+_EDT_REF_CONTAINER_TAGS: dict[str, tuple[str, str, str]] = {
+    "content": ("mdObject", "object", "exchange-plan-content"),
+    "source": ("types", "type", "event-source"),
+    "commandParameterType": ("types", "type", "command-parameter"),
+}
+
+
+def _edt_ref_target(shape: str, text: str) -> tuple[list[str], str | None] | None:
+    """FQN parts of a reference value, plus a trailing method name if any.
+
+    Returns None when the value is not a reference of that shape — the caller
+    then emits nothing rather than inventing a node.
+    """
+    parts = [p for p in text.split(".") if p]
+    if len(parts) < 2:
+        return None
+    if shape == "type":
+        kind = _edt_type_kind(parts[0])
+        return ([kind, parts[1]], None) if kind else None
+    if parts[0] not in _EDT_KIND_PREFIXES:
+        return None
+    if shape == "object":
+        return ([parts[0], parts[1]], None)
+    if shape == "method":
+        # `CommonModule.X.Метод` — the graph has no method nodes, so the edge
+        # lands on the module and the method name rides in the context.
+        return ([parts[0], parts[1]], ".".join(parts[2:]) or None)
+    if shape == "member":
+        # A bare `Kind.Name` in a member slot is still the object itself.
+        return (parts, None)
+    return None
+
+
 # Object-level BSL modules that may sit next to a <Name>.mdo, by their fixed
 # filename. Each existing one is linked object -> module with a `defines` edge.
 _EDT_OBJECT_MODULES: tuple[str, ...] = (
@@ -575,6 +650,60 @@ def extract_edt_mdo(path: Path) -> dict:
                       "confidence": "EXTRACTED", "source_file": str_path,
                       "weight": 1.0})
 
+    def add_ref_edge(src_id: str, tgt_id: str, context: str) -> None:
+        """A declared reference. Deduped WITH the context, so one object naming
+        another through two different tags yields two edges, not one."""
+        key = (src_id, tgt_id, "references", context)
+        if not src_id or not tgt_id or src_id == tgt_id or key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({"source": src_id, "target": tgt_id, "relation": "references",
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "weight": 1.0, "context": context})
+
+    def add_ref(src_id: str, shape: str, text: str, context: str) -> None:
+        parsed = _edt_ref_target(shape, text)
+        if not parsed:
+            return
+        target_parts, method = parsed
+        target_id = _make_id(*target_parts)
+        # The target may not be produced by any extractor yet — a register
+        # dimension, a standard attribute. A stub carrying the id the real node
+        # will get keeps the reference instead of dropping it, and merges the
+        # moment that extraction lands. Configuration.mdo registrations already
+        # work this way.
+        add_node(target_id, ".".join(target_parts))
+        add_ref_edge(src_id, target_id, f"{context}:{method}" if method else context)
+
+    def add_procedure_ref(src_id: str, proc: str | None, context: str) -> None:
+        """Link a BARE procedure name to the procedure in the sibling Module.bsl.
+
+        A service names its handler this way — `<handler>PostEntriesPOST</handler>`
+        on an HTTPService method, `<procedureName>` on a WebService operation,
+        both implemented in the Module.bsl beside the .mdo (skill §4.22). That is
+        a different value form from an EventSubscription's `<handler>`, which is
+        a full method FQN in someone ELSE's module; the skill spells out the
+        contrast, and reading only the FQN form covered 8 of 98 handlers.
+
+        The target id matches what extract_bsl emits for that procedure, so the
+        two halves merge — the same wiring extract_edt_form already uses for
+        form event handlers.
+        """
+        if not proc or "." in proc:
+            return
+        module = path.parent / "Module.bsl"
+        if module.is_file():
+            add_ref_edge(src_id, _make_id(_file_stem(module), proc), context)
+
+    def type_refs(elem, src_id: str, context: str = "attribute-type") -> None:
+        """Emit references for the `<type><types>…</types></type>` of one element."""
+        for t in elem:
+            if _edt_localname(t.tag) != "type":
+                continue
+            for tt in t:
+                if _edt_localname(tt.tag) == "types" and (tt.text or "").strip():
+                    add_ref(src_id, "type", tt.text.strip(), context)
+
     def child_text(elem, localname: str) -> str | None:
         for c in elem:
             if _edt_localname(c.tag) == localname and c.text:
@@ -668,6 +797,10 @@ def extract_edt_mdo(path: Path) -> dict:
         child_id = _make_id(*id_parts, sub, child_name)
         add_node(child_id, child_name, uuid=child.get("uuid"))
         add_edge(obj_id, child_id, "contains")
+        # A typed member references the object it is typed by, and the edge
+        # belongs to the member, not to its owner: the aggregate follows from
+        # the precise fact, never the other way round.
+        type_refs(child, child_id)
         # A container child owns children of its own, and the FQN grammar is
         # recursive (skill §3): a tabular-section column is
         # `Kind.Name.TabularSection.T.Attribute.A`, hanging off the section
@@ -685,6 +818,7 @@ def extract_edt_mdo(path: Path) -> dict:
                 gc_id = _make_id(*id_parts, sub, child_name, sub2, gc_name)
                 add_node(gc_id, gc_name, uuid=grandchild.get("uuid"))
                 add_edge(child_id, gc_id, "contains")
+                type_refs(grandchild, gc_id)
         # A form/command owns a BSL module folder next to the .mdo.
         if sub == "Form":
             mod = path.parent / "Forms" / child_name / "Module.bsl"
@@ -694,6 +828,93 @@ def extract_edt_mdo(path: Path) -> dict:
             mod = None
         if mod is not None and mod.is_file():
             add_edge(child_id, _make_id(str(mod)), "defines")
+
+    # Declared references, read by the explicit tag map. A tag outside the map
+    # is ignored and a value that does not parse yields nothing — the same
+    # "never invent" rule the kind whitelist follows.
+    #
+    # An EventSubscription only means something as a triple: <source> names the
+    # type, <event> the platform event, <handler> the module method. The event
+    # is read up front so it can ride in the handler edge's context; on its own
+    # it names nothing to point at.
+    event_name = child_text(root, "event") if kind == "EventSubscription" else None
+    # The object's own <type>: a Constant, DefinedType, SessionParameter or
+    # FilterCriterion is defined BY the type it holds, so the reference belongs
+    # to the object itself rather than to any member of it.
+    type_refs(root, obj_id, "object-type")
+    for child in root:
+        ln = _edt_localname(child.tag)
+        text = (child.text or "").strip()
+
+        entry = _EDT_REF_TAGS.get(ln)
+        if entry and text:
+            shape, context = entry
+            if ln == "handler" and event_name:
+                context = f"{context}:{event_name}"
+            add_ref(obj_id, shape, text, context)
+
+        # `<content>` is a leaf on FunctionalOption (membership, not ownership —
+        # an option does not own the document whose visibility it drives, so
+        # this stays `references`) and a container on ExchangePlan. Subsystem
+        # keeps its own `contains` branch below and is skipped here.
+        if ln == "content" and text and kind != "Subsystem":
+            add_ref(obj_id, "object", text, "functional-option-content")
+
+        container = _EDT_REF_CONTAINER_TAGS.get(ln)
+        if container:
+            child_tag, shape, context = container
+            for c in child:
+                if _edt_localname(c.tag) == child_tag and (c.text or "").strip():
+                    add_ref(obj_id, shape, c.text.strip(), context)
+
+        # A service's methods and operations are inline sub-objects. They are
+        # stubbed here with the ids extend-edt-inline-children will use
+        # (`URLTemplate`/`Method`, `Operation`) so the handler edge sits at its
+        # final anchor immediately — re-anchoring it later would register as a
+        # deleted edge, which the acceptance criterion of every change in this
+        # series forbids.
+        if ln == "urlTemplates":
+            tpl_name = child_text(child, "name")
+            if tpl_name:
+                tpl_id = _make_id(*id_parts, "URLTemplate", tpl_name)
+                add_node(tpl_id, tpl_name, uuid=child.get("uuid"))
+                add_edge(obj_id, tpl_id, "contains")
+                for method in child:
+                    if _edt_localname(method.tag) != "methods":
+                        continue
+                    m_name = child_text(method, "name")
+                    if not m_name:
+                        continue
+                    m_id = _make_id(*id_parts, "URLTemplate", tpl_name,
+                                    "Method", m_name)
+                    add_node(m_id, m_name, uuid=method.get("uuid"))
+                    add_edge(tpl_id, m_id, "contains")
+                    add_procedure_ref(m_id, child_text(method, "handler"),
+                                      "service-handler")
+
+        if ln == "operations":
+            op_name = child_text(child, "name")
+            if op_name:
+                op_id = _make_id(*id_parts, "Operation", op_name)
+                add_node(op_id, op_name, uuid=child.get("uuid"))
+                add_edge(obj_id, op_id, "contains")
+                add_procedure_ref(op_id, child_text(child, "procedureName"),
+                                  "service-procedure")
+
+        # A journal column is not yet extracted as a node of its own — that is
+        # extend-edt-inline-children's scope — so it is stubbed with the id that
+        # change will give it (SubKind `Column`), and its <references> hangs off
+        # the column rather than off the journal.
+        if ln == "columns":
+            col_name = child_text(child, "name")
+            if col_name:
+                col_id = _make_id(*id_parts, "Column", col_name)
+                add_node(col_id, col_name, uuid=child.get("uuid"))
+                add_edge(obj_id, col_id, "contains")
+                for c in child:
+                    if _edt_localname(c.tag) == "references" and (c.text or "").strip():
+                        add_ref(col_id, "member", c.text.strip(),
+                                "journal-column-source")
 
     # A subsystem registers the objects it groups via <content>Kind.Name</content>,
     # and its child subsystems via <subsystems>BareName</subsystems> (skill §4.8).

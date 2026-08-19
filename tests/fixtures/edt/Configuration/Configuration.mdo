@@ -23,4 +23,10 @@
   <settingsStorages>SettingsStorage.ХранилищеОтчетов</settingsStorages>
   <paletteColors>PaletteColor.ФирменныйСиний</paletteColors>
   <commonCommands>CommonCommand.ОбщаяКоманда</commonCommands>
+  <documents>Document.Заказ</documents>
+  <functionalOptions>FunctionalOption.УчетСкидок</functionalOptions>
+  <exchangePlans>ExchangePlan.Обмен</exchangePlans>
+  <eventSubscriptions>EventSubscription.ПриЗаписиКонтрагента</eventSubscriptions>
+  <httpServices>HTTPService.Обмен</httpServices>
+  <webServices>WebService.Каталог</webServices>
 </mdclass:Configuration>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:EventSubscription xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                           uuid="50000000-0000-4000-8000-000000000002">
+  <name>БезОбработчика</name>
+  <source>
+    <types>CatalogObject.Контрагенты</types>
+  </source>
+  <event>OnWrite</event>
+</mdclass:EventSubscription>

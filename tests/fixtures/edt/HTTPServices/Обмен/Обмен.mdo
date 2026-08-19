@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:HTTPService xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                     uuid="a0000000-0000-4000-8000-000000000001">
+  <name>Обмен</name>
+  <rootURL>exchange</rootURL>
+  <urlTemplates uuid="a0000000-0000-4000-8000-000000000002">
+    <name>ШаблонЗаказа</name>
+    <template>/order</template>
+    <methods uuid="a0000000-0000-4000-8000-000000000003">
+      <name>POST</name>
+      <httpMethod>POST</httpMethod>
+      <handler>ПолучитьЗаказPOST</handler>
+    </methods>
+  </urlTemplates>
+</mdclass:HTTPService>
