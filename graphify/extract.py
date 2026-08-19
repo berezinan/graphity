@@ -40,6 +40,8 @@ from graphify.extractors.bsl import (  # noqa: F401
     extract_edt_dcs,
     extract_edt_form,
     extract_edt_mdo,
+    extract_edt_cmi,
+    extract_edt_oform,
     extract_edt_rights,
 )
 from graphify.extractors.csharp import (
@@ -3932,6 +3934,8 @@ _DISPATCH: dict[str, Any] = {
     ".rights": extract_edt_rights,
     ".form": extract_edt_form,
     ".dcs": extract_edt_dcs,
+    ".oform": extract_edt_oform,
+    ".cmi": extract_edt_cmi,
 }
 
 

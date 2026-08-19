@@ -10,11 +10,12 @@ from graphify.extract import (
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_verilog,
     extract_bsl, extract_edt_mdo, extract_edt_rights, extract_edt_form,
-    extract_edt_dcs, _make_id,
+    extract_edt_dcs, extract_edt_oform, extract_edt_cmi, _make_id,
     extract_powershell_manifest,
 )
 from graphify.extractors.bsl import (
     _edt_type_kind, _edt_ref_target, _EDT_REF_TAGS, _EDT_REF_CONTAINER_TAGS,
+    _v8_elements, _oform_tree_uuids, _oform_element_names, _OFORM_TOKEN_RE,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -3579,6 +3580,539 @@ def test_edt_dcs_ignores_field_aliases():
     r = extract_edt_dcs(DCS)
     targets = {t for _, t in _edge_labels(r, "references", "dcs")}
     assert not any(t.endswith(".ИНН") for t in targets)
+
+# ── 1C:EDT ordinary form (.oform) ────────────────────────────────────────────
+#
+# The container is built here instead of being committed as a binary fixture:
+# an opaque .oform in the repository can be neither read nor regenerated. The
+# writer alone does not validate the reader — the reader was measured against
+# the 904 ordinary forms of a real configuration, where every file parsed, each
+# held exactly the two elements `form` and `module`, and no module was split
+# across blocks (578 form trees were).
+
+_V8_NONE = 0x7FFFFFFF
+_V8_STAMP = bytes.fromhex("a04f8c3c42440200") * 2 + b"\x00\x00\x00\x00"
+
+
+def _v8_block(payload: bytes, doc_size: int, next_off: int, pad: int = 0) -> bytes:
+    size = max(len(payload), pad)
+    head = b"\r\n%08x %08x %08x \r\n" % (doc_size, size, next_off)
+    return head + payload.ljust(size, b"\x00")
+
+
+def _v8_document(payload: bytes, offset: int, chunk: int | None = None) -> bytes:
+    """One container document, optionally split across a chain of blocks.
+
+    `chunk` splits the payload so the continuation field (`next`) is exercised;
+    a reader that stops after the first block truncates such a document.
+    """
+    if chunk is None or chunk >= len(payload):
+        return _v8_block(payload, len(payload), _V8_NONE)
+    out = b""
+    for pos in range(0, len(payload), chunk):
+        piece = payload[pos:pos + chunk]
+        last = pos + chunk >= len(payload)
+        nxt = _V8_NONE if last else offset + len(out) + 31 + len(piece)
+        out += _v8_block(piece, len(payload) if pos == 0 else len(piece), nxt)
+    return out
+
+
+def _oform_bytes(module: bytes | None, tree: bytes = b"{1,\r\n}",
+                 module_first: bool = False, chunk: int | None = None) -> bytes:
+    """A V8 container of the shape an ordinary form has on disk."""
+    elements = [("form", tree)]
+    if module is not None:
+        elements.append(("module", module))
+    if module_first:
+        elements.reverse()
+
+    toc_block = 512
+    cursor = 16 + 31 + toc_block
+    parts: list[bytes] = []
+    entries: list[tuple[int, int]] = []
+    for name, payload in elements:
+        head = _v8_document(_V8_STAMP + name.encode("utf-16-le") + b"\x00" * 4, cursor)
+        head_off, cursor = cursor, cursor + len(head)
+        body = _v8_document(payload, cursor, chunk)
+        body_off, cursor = cursor, cursor + len(body)
+        parts += [head, body]
+        entries.append((head_off, body_off))
+
+    toc = b"".join(h.to_bytes(4, "little") + b.to_bytes(4, "little")
+                   + _V8_NONE.to_bytes(4, "little") for h, b in entries)
+    return (bytes.fromhex("ffffff7f000200000200000000000000")
+            + _v8_block(toc, len(toc), _V8_NONE, pad=toc_block) + b"".join(parts))
+
+
+def _write_oform(tmp_path: Path, module: bytes | None, **kw) -> Path:
+    """Write a form under the path shape EDT uses, so its owner resolves."""
+    p = tmp_path / "Catalogs" / "Контрагенты" / "Forms" / "ФормаЭлемента" / "Form.oform"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(_oform_bytes(module, **kw))
+    return p
+
+
+_OFORM_MODULE_EN = (
+    "﻿// Ordinary form module: no compilation directives exist here.\r\n"
+    "\r\n"
+    "Procedure ClientOnChange(pControl)\r\n"
+    "\tRecalculate();\r\n"
+    "EndProcedure\r\n"
+    "\r\n"
+    "Function Recalculate()\r\n"
+    "\tReturn ThisForm.Controls.Total;\r\n"
+    "EndFunction\r\n"
+).encode("utf-8")
+
+_OFORM_MODULE_RU = (
+    "﻿// Модуль обычной формы.\r\n"
+    "\r\n"
+    "Процедура КлиентПриИзменении(пЭлемент)\r\n"
+    "\tПересчитать();\r\n"
+    "КонецПроцедуры\r\n"
+    "\r\n"
+    "Функция Пересчитать()\r\n"
+    "\tВозврат ЭтаФорма.Controls.Итого;\r\n"
+    "КонецФункции\r\n"
+).encode("utf-8")
+
+
+def test_edt_oform_extracts_module_procedures(tmp_path):
+    r = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_EN))
+    assert "error" not in r
+    assert {"ClientOnChange()", "Recalculate()"} <= set(_labels(r))
+
+
+def test_edt_oform_module_calls_resolve(tmp_path):
+    # The module goes through the shared extract_bsl, so its call graph is built
+    # the same way a .bsl module's is.
+    r = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_EN))
+    assert ("ClientOnChange()", "Recalculate()") in _calls(r)
+
+
+def test_edt_oform_nodes_indistinguishable_from_bsl(tmp_path):
+    # The same module text, once inside a container and once as a plain .bsl:
+    # the procedure nodes agree in every field but the file they came from.
+    oform = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_EN))
+    plain = tmp_path / "Module.bsl"
+    plain.write_bytes(_OFORM_MODULE_EN)
+
+    def procs(result):
+        return {n["label"]: {k: v for k, v in n.items()
+                             if k not in ("id", "source_file", "source_location")}
+                for n in result["nodes"] if n["label"].endswith("()")}
+
+    assert procs(oform) == procs(extract_bsl(plain))
+
+
+def test_edt_oform_module_read_before_the_tree(tmp_path):
+    # 326 of the corpus's 904 files store the module first. The element is
+    # picked by name, so physical order cannot change the result.
+    first = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_EN, module_first=True))
+    second = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_EN))
+    assert _labels(first) == _labels(second)
+    assert "ClientOnChange()" in _labels(first)
+
+
+def test_edt_oform_module_block_keeps_its_comment_header():
+    # Taken whole, not from the first declaration: 752 modules of the corpus
+    # open with a comment header, which a declaration-first recipe cuts off.
+    payload, _ = _v8_elements(_oform_bytes(_OFORM_MODULE_EN))["module"]
+    assert payload == _OFORM_MODULE_EN
+    assert payload.startswith("﻿// Ordinary form".encode("utf-8"))
+
+
+def test_edt_oform_module_spanning_blocks_is_not_truncated():
+    # Container data may continue in a further block (`next`); a reader that
+    # takes only the first block loses everything after it.
+    payload, _ = _v8_elements(_oform_bytes(_OFORM_MODULE_EN, chunk=64))["module"]
+    assert payload == _OFORM_MODULE_EN
+
+
+def test_edt_oform_positions_point_into_the_form_file(tmp_path):
+    # The module has no file of its own, so positions are lines of the .oform.
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    lines = path.read_bytes().split(b"\n")
+    line = int(_node_by_label(extract_edt_oform(path),
+                              "ClientOnChange()")["source_location"].lstrip("L"))
+    assert line > 1
+    assert b"Procedure ClientOnChange" in lines[line - 1]
+
+
+def test_edt_oform_file_node_stays_at_line_one(tmp_path):
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    assert _node_by_label(extract_edt_oform(path), "Form.oform")["source_location"] == "L1"
+
+
+def test_edt_oform_form_defines_its_module(tmp_path):
+    # The form node already exists (emitted from the parent .mdo <forms> block);
+    # the defines edge targets the .oform itself, there being no Module.bsl.
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    r = extract_edt_oform(path)
+    form_id = _make_id("Catalog", "Контрагенты", "Form", "ФормаЭлемента")
+    assert (form_id, _make_id(str(path)), "defines") in {
+        (e["source"], e["target"], e["relation"]) for e in r["edges"]}
+    assert len([n for n in r["nodes"] if n["id"] == form_id]) == 1
+
+
+def test_edt_oform_english_keywords(tmp_path):
+    r = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_EN))
+    assert {"ClientOnChange()", "Recalculate()"} <= set(_labels(r))
+
+
+def test_edt_oform_russian_keywords(tmp_path):
+    r = extract_edt_oform(_write_oform(tmp_path, _OFORM_MODULE_RU))
+    assert {"КлиентПриИзменении()", "Пересчитать()"} <= set(_labels(r))
+
+
+def test_edt_oform_single_language_scan_would_miss_a_module():
+    # Why the two tests above are not redundant: this work began with the
+    # measurement "no module in any of the 904 files", taken by grepping for
+    # КонецПроцедуры in a configuration whose scriptVariant is English. A
+    # one-language scan returns a confident, wrong zero.
+    assert "КонецПроцедуры".encode("utf-8") not in _OFORM_MODULE_EN
+    assert b"EndProcedure" not in _OFORM_MODULE_RU
+
+
+def test_edt_oform_without_a_module(tmp_path):
+    # Six of the corpus's 904 forms hold no module. The form node still stands —
+    # its layout may still refer to things — but nothing is defined by it.
+    r = extract_edt_oform(_write_oform(tmp_path, None))
+    assert "error" not in r
+    assert not [n for n in r["nodes"] if n["label"].endswith("()")]
+    assert not [e for e in r["edges"] if e["relation"] == "defines"]
+
+
+def test_edt_oform_with_an_empty_module(tmp_path):
+    # Six of the corpus's forms hold a module element with nothing in it. There
+    # is no file node to define, so no `defines` edge may claim one.
+    r = extract_edt_oform(_write_oform(tmp_path, b""))
+    assert "error" not in r
+    ids = {n["id"] for n in r["nodes"]}
+    for edge in r["edges"]:
+        assert edge["target"] in ids, f"dangling target: {edge}"
+
+
+def test_edt_oform_empty_file(tmp_path):
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    path.write_bytes(b"")
+    r = extract_edt_oform(path)
+    assert r["error"] and r["nodes"] == [] and r["edges"] == []
+
+
+def test_edt_oform_truncated_file(tmp_path):
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    path.write_bytes(path.read_bytes()[:100])
+    r = extract_edt_oform(path)
+    assert r["error"] and r["nodes"] == [] and r["edges"] == []
+
+
+def test_edt_oform_not_a_container(tmp_path):
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    path.write_bytes(b"this is not a V8 container" * 40)
+    r = extract_edt_oform(path)
+    assert r["error"] and r["nodes"] == [] and r["edges"] == []
+
+
+def test_edt_oform_is_never_written_to(tmp_path):
+    # The file is binary and EDT does not open it; only the Configurator edits
+    # one. Extraction leaves it byte for byte as it was.
+    import hashlib
+
+    path = _write_oform(tmp_path, _OFORM_MODULE_EN)
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    extract_edt_oform(path)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+# ── 1C:EDT ordinary form: references out of the layout ───────────────────────
+#
+# The layout names nothing it refers to — it carries uuids, and only the .mdo
+# files say what they are. Measured across the corpus: the `Kind.Name` tokens
+# the design first expected here occur exactly zero times in 904 layouts, while
+# 899 of those files hold at least one uuid that a .mdo declares.
+
+_OBJECT_UUID = "b39b8b42-0061-4aac-a0de-206ebc513617"
+_ATTRIBUTE_UUID = "c1c1c1c1-0000-4000-8000-000000000002"
+_FORM_UUID = "c1c1c1c1-0000-4000-8000-000000000003"
+_REF_TYPE_UUID = "e9a9379f-c522-4ea0-87d6-6d9791afdd61"
+_UNKNOWN_UUID = "deadbeef-0000-4000-8000-000000000009"
+
+_OFORM_MDO = f"""<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+    uuid="{_OBJECT_UUID}">
+  <producedTypes>
+    <refType typeId="{_REF_TYPE_UUID}" valueTypeId="f8c75947-3d64-477c-a11d-b9d8a665c2e5"/>
+  </producedTypes>
+  <name>Контрагенты</name>
+  <attributes uuid="{_ATTRIBUTE_UUID}">
+    <name>ИНН</name>
+  </attributes>
+  <forms uuid="{_FORM_UUID}">
+    <name>ФормаЭлемента</name>
+  </forms>
+</mdclass:Catalog>
+"""
+
+_OFORM_FORM_ID = _make_id("Catalog", "Контрагенты", "Form", "ФормаЭлемента")
+
+
+def _write_oform_project(tmp_path: Path, tree: bytes,
+                         module: bytes | None = _OFORM_MODULE_EN) -> Path:
+    """A one-object project: the .mdo that declares the uuids, plus the form."""
+    owner = tmp_path / "Catalogs" / "Контрагенты"
+    (owner / "Forms" / "ФормаЭлемента").mkdir(parents=True, exist_ok=True)
+    (owner / "Контрагенты.mdo").write_text(_OFORM_MDO, encoding="utf-8")
+    form = owner / "Forms" / "ФормаЭлемента" / "Form.oform"
+    form.write_bytes(_oform_bytes(module, tree=tree))
+    return form
+
+
+def _oform_refs(result: dict) -> set[str]:
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+    return {labels.get(e["target"], e["target"]) for e in result["edges"]
+            if e["relation"] == "references" and e.get("context") == "oform"}
+
+
+def test_oform_layout_token_kinds():
+    # One token per construct of the bracket notation, doubled quote included:
+    # `""` inside a string is a quote, not the end of the string.
+    sample = '{27,"a,b","say ""{hi}""",09ccdc77-ea1a-4a6d-ab1c-3435eada2433,-1.5,#}'
+    assert _OFORM_TOKEN_RE.findall(sample) == [
+        "{", "27", ",", '"a,b"', ",", '"say ""{hi}"""', ",",
+        "09ccdc77-ea1a-4a6d-ab1c-3435eada2433", ",", "-1.5", ",", "#", "}",
+    ]
+
+
+def test_oform_uuid_inside_a_string_is_not_a_reference():
+    # A uuid written into a caption or a stored setting is data. Tokenising is
+    # what tells the two apart; a regex over the file cannot.
+    assert _oform_tree_uuids(f'{{1,"{_OBJECT_UUID}"}}') == []
+    assert _oform_tree_uuids(f"{{1,{_OBJECT_UUID}}}") == [_OBJECT_UUID]
+
+
+def test_oform_uuid_resolves_to_the_object(tmp_path):
+    form = _write_oform_project(tmp_path, f"{{1,{_OBJECT_UUID}}}".encode("utf-8"))
+    assert "Catalog.Контрагенты" in _oform_refs(extract_edt_oform(form))
+
+
+def test_oform_uuid_resolves_to_an_attribute(tmp_path):
+    # The valuable half: which attribute a control is bound to. 689 files of the
+    # corpus carry attribute uuids.
+    form = _write_oform_project(tmp_path, f"{{1,{_ATTRIBUTE_UUID}}}".encode("utf-8"))
+    result = extract_edt_oform(form)
+    assert "ИНН" in _oform_refs(result)
+    assert _make_id("Catalog", "Контрагенты", "Attribute", "ИНН") in {
+        e["target"] for e in result["edges"] if e.get("context") == "oform"}
+
+
+def test_oform_produced_type_resolves_to_its_object(tmp_path):
+    # A control typed `CatalogRef.Контрагенты` carries the type's uuid, not the
+    # object's; 883 of the corpus's 904 forms reach an object that way.
+    form = _write_oform_project(tmp_path, f"{{1,{_REF_TYPE_UUID}}}".encode("utf-8"))
+    assert "Catalog.Контрагенты" in _oform_refs(extract_edt_oform(form))
+
+
+def test_oform_unknown_uuid_gives_no_edge(tmp_path):
+    # Nothing is invented: a uuid no .mdo declares is not a reference. The index
+    # is what replaced the kind whitelist.
+    form = _write_oform_project(tmp_path, f"{{1,{_UNKNOWN_UUID}}}".encode("utf-8"))
+    assert _oform_refs(extract_edt_oform(form)) == set()
+
+
+def test_oform_caption_with_a_dot_gives_no_edge(tmp_path):
+    # `Listendruck.Print`, `Settings.X` and friends: interface text of a
+    # localised configuration, and the reason a `Kind.Name` whitelist was
+    # specified in the first place. Nothing textual becomes a reference now.
+    tree = '{1,"Listendruck.Print","Catalog.Контрагенты","Settings.X"}'.encode("utf-8")
+    form = _write_oform_project(tmp_path, tree)
+    assert _oform_refs(extract_edt_oform(form)) == set()
+
+
+def test_oform_uuid_outside_the_layout_is_not_a_reference(tmp_path):
+    # Only the layout element is read. A uuid in the module text — or in the
+    # container's service bytes — is outside the stream that carries references,
+    # even though a scan of the raw file would find it.
+    module = (_OFORM_MODULE_EN.decode("utf-8")
+              + f'\r\nProcedure Note()\r\n\tX = "{_OBJECT_UUID}";\r\nEndProcedure\r\n'
+              ).encode("utf-8")
+    form = _write_oform_project(tmp_path, b"{1,\r\n}", module=module)
+    assert _OBJECT_UUID.encode("utf-8") in form.read_bytes()
+    assert _oform_refs(extract_edt_oform(form)) == set()
+
+
+def test_oform_does_not_reference_itself(tmp_path):
+    # The layout carries the form's own uuid. An edge from the form to itself is
+    # not a fact about anything.
+    form = _write_oform_project(tmp_path, f"{{1,{_FORM_UUID}}}".encode("utf-8"))
+    result = extract_edt_oform(form)
+    assert _oform_refs(result) == set()
+    assert not [e for e in result["edges"] if e["source"] == e["target"]]
+
+
+def test_oform_references_start_from_the_form_node_the_mdo_emits(tmp_path):
+    # Anchored on the node the parent .mdo already created for this form, so the
+    # two collapse into one instead of splitting the form in half.
+    form = _write_oform_project(tmp_path, f"{{1,{_OBJECT_UUID}}}".encode("utf-8"))
+    result = extract_edt_oform(form)
+    mdo = extract_edt_mdo(form.parent.parent.parent / "Контрагенты.mdo")
+    assert {e["source"] for e in result["edges"]
+            if e.get("context") == "oform"} == {_OFORM_FORM_ID}
+    assert _OFORM_FORM_ID in {n["id"] for n in mdo["nodes"]}
+
+
+def test_oform_reference_edges_are_not_dangling(tmp_path):
+    form = _write_oform_project(
+        tmp_path,
+        f"{{1,{_OBJECT_UUID},{_ATTRIBUTE_UUID},{_UNKNOWN_UUID}}}".encode("utf-8"))
+    result = extract_edt_oform(form)
+    ids = {n["id"] for n in result["nodes"]}
+    for edge in result["edges"]:
+        assert edge["source"] in ids, f"dangling source: {edge}"
+        if edge["relation"] != "imports":
+            assert edge["target"] in ids, f"dangling target: {edge}"
+
+
+def test_oform_without_a_module_still_yields_references(tmp_path):
+    form = _write_oform_project(tmp_path, f"{{1,{_OBJECT_UUID}}}".encode("utf-8"),
+                                module=None)
+    result = extract_edt_oform(form)
+    assert "Catalog.Контрагенты" in _oform_refs(result)
+    assert not [n for n in result["nodes"] if n["label"].endswith("()")]
+
+
+# ── 1C:EDT ordinary form: controls out of the layout ─────────────────────────
+#
+# The layout grammar is positional and undocumented. What is read here is the
+# one record shape measurement pinned down — `{14,"<Name>",…` opens a named
+# control — and the change kept it only because the measurement cleared the
+# threshold it set in advance: names come out of 100% of the corpus's 904 forms.
+
+_OFORM_LAYOUT = ('{27,\r\n{14,"ПанельКнопок",4294967295,0,0,0},\r\n'
+                 '{14,"КнопкаЗакрыть",4294967295,0,0,0},\r\n'
+                 '{18,"НеЭлемент"}\r\n}').encode("utf-8")
+
+
+def _oform_contains(result: dict) -> set[str]:
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+    return {labels.get(e["target"], e["target"]) for e in result["edges"]
+            if e["relation"] == "contains" and e["source"] == _OFORM_FORM_ID}
+
+
+def test_oform_controls_become_nodes(tmp_path):
+    form = _write_oform_project(tmp_path, _OFORM_LAYOUT)
+    assert {"ПанельКнопок", "КнопкаЗакрыть"} <= _oform_contains(extract_edt_oform(form))
+
+
+def test_oform_control_id_hangs_off_the_form(tmp_path):
+    # Same scheme a managed form's attributes use: the control has no uuid of
+    # its own, so the id is the form's id plus the name.
+    form = _write_oform_project(tmp_path, _OFORM_LAYOUT)
+    ids = {n["id"] for n in extract_edt_oform(form)["nodes"]}
+    assert _make_id(_OFORM_FORM_ID, "FormElement", "ПанельКнопок") in ids
+
+
+def test_oform_control_records_the_form_uuid(tmp_path):
+    form = _write_oform_project(tmp_path, _OFORM_LAYOUT)
+    node = _node_by_label(extract_edt_oform(form), "КнопкаЗакрыть")
+    assert node["parent_uuid"] == _FORM_UUID
+
+
+def test_oform_other_records_are_not_controls(tmp_path):
+    # Only the record that measurement identified is read. `{18,"…"` is some
+    # other structure, and guessing that every `{N,"…"` names a control would
+    # populate the graph with whatever else the layout stores.
+    form = _write_oform_project(tmp_path, _OFORM_LAYOUT)
+    assert "НеЭлемент" not in _oform_contains(extract_edt_oform(form))
+
+
+def test_oform_control_names_keep_layout_order():
+    assert _oform_element_names(_OFORM_LAYOUT.decode("utf-8")) == [
+        "ПанельКнопок", "КнопкаЗакрыть"]
+
+
+# ── 1C:EDT command interface (.cmi) ──────────────────────────────────────────
+
+CONFIG_CMI = EDT / "Configuration" / "CommandInterface.cmi"
+SUBSYSTEM_CMI = EDT / "Subsystems" / "Продажи" / "CommandInterface.cmi"
+NESTED_CMI = (EDT / "Subsystems" / "Продажи" / "Subsystems" / "Розница"
+              / "CommandInterface.cmi")
+
+
+def test_edt_cmi_no_error():
+    assert "error" not in extract_edt_cmi(SUBSYSTEM_CMI)
+
+
+def test_edt_cmi_owner_is_the_configuration():
+    r = extract_edt_cmi(CONFIG_CMI)
+    assert {e["source"] for e in r["edges"]} == {_make_id("Configuration")}
+
+
+def test_edt_cmi_owner_is_the_subsystem():
+    r = extract_edt_cmi(SUBSYSTEM_CMI)
+    assert {e["source"] for e in r["edges"]} == {_make_id("Subsystem", "Продажи")}
+
+
+def test_edt_cmi_owner_of_a_nested_subsystem_carries_the_chain():
+    # The same id the nested subsystem's own .mdo emits — otherwise the command
+    # interface would hang off a second, parallel node for the same subsystem.
+    r = extract_edt_cmi(NESTED_CMI)
+    owner = _make_id("Subsystem", "Продажи", "Розница")
+    assert {e["source"] for e in r["edges"]} == {owner}
+    assert owner in {n["id"] for n in extract_edt_mdo(NESTED_SUBSYSTEM_MDO)["nodes"]}
+
+
+def test_edt_cmi_references_commands_and_roles():
+    refs = _edge_labels(extract_edt_cmi(SUBSYSTEM_CMI), "references", "command-interface")
+    assert ("Subsystem.Продажи", "CommonCommand.ОбщаяКоманда") in refs
+    assert ("Subsystem.Продажи", "Role.Менеджер") in refs
+
+
+def test_edt_cmi_object_command_keeps_its_own_node():
+    # `Catalog.Контрагенты.Command.Команда` is a metadata object in its own
+    # right, and the .mdo emits a node for it under exactly this id.
+    r = extract_edt_cmi(SUBSYSTEM_CMI)
+    command_id = _make_id("Catalog", "Контрагенты", "Command", "Печать")
+    assert command_id in {e["target"] for e in r["edges"]}
+    assert command_id in {n["id"] for n in extract_edt_mdo(CATALOG_MDO)["nodes"]}
+
+
+def test_edt_cmi_standard_command_lands_on_its_object():
+    # A standard command is provided by the platform and has no node of its own;
+    # 1217 of the corpus's 1653 values are of this shape, and inventing a node
+    # for each would populate the graph with metadata that does not exist.
+    r = extract_edt_cmi(SUBSYSTEM_CMI)
+    targets = {e["target"] for e in r["edges"]}
+    assert _make_id("Catalog", "Контрагенты") in targets
+    assert _make_id("Catalog", "Контрагенты", "StandardCommand", "OpenList") not in targets
+
+
+def test_edt_cmi_nested_subsystem_value_collapses_the_repeated_marker():
+    # `Subsystem.Продажи.Subsystem.Розница` is the FQN spelling; the node id
+    # keeps the chain without repeating the kind.
+    r = extract_edt_cmi(CONFIG_CMI)
+    assert _make_id("Subsystem", "Продажи", "Розница") in {e["target"] for e in r["edges"]}
+
+
+def test_edt_cmi_unknown_kind_gives_no_edge():
+    # `Listendruck.Печать` — interface text of a localised configuration.
+    r = extract_edt_cmi(SUBSYSTEM_CMI)
+    assert not [e for e in r["edges"] if "Listendruck" in e["target"]]
+
+
+def test_edt_cmi_does_not_reference_its_own_owner():
+    # The subsystem lists itself in <subsystemsVisibility>.
+    r = extract_edt_cmi(SUBSYSTEM_CMI)
+    assert not [e for e in r["edges"] if e["source"] == e["target"]]
+
+
+def test_edt_cmi_no_dangling_edges():
+    for cmi in (CONFIG_CMI, SUBSYSTEM_CMI, NESTED_CMI):
+        r = extract_edt_cmi(cmi)
+        ids = {n["id"] for n in r["nodes"]}
+        for edge in r["edges"]:
+            assert edge["source"] in ids and edge["target"] in ids, f"dangling: {edge}"
+
 
 # ── Header/impl class merge + .h routing (#1547 C++, #1556 ObjC/Swift) ─────────
 from graphify.extract import (

@@ -33,6 +33,8 @@ from typing import Callable, Iterator
 from graphify.detect import CODE_EXTENSIONS, classify_file
 from graphify.extractors.bsl import (
     extract_edt_dcs,
+    extract_edt_cmi,
+    extract_edt_oform,
     extract_edt_form,
     extract_edt_mdo,
     extract_edt_rights,
@@ -49,6 +51,10 @@ EDT_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     ".rights": extract_edt_rights,
     ".form": extract_edt_form,
     ".dcs": extract_edt_dcs,
+    # An ordinary form carries its BSL module inside the container, so the
+    # snapshot has to go through the extractor to see any of it.
+    ".oform": extract_edt_oform,
+    ".cmi": extract_edt_cmi,
 }
 
 # Never descended into: build output, VCS and IDE state, and — required by the

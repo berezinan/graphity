@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cmi:CommandInterface xmlns:cmi="http://g5.1c.ru/v8/dt/cmi">
+  <commandsOrder>
+    <orderFragments>
+      <commands>CommonCommand.ОбщаяКоманда</commands>
+      <commands>Catalog.Контрагенты.Command.Печать</commands>
+      <commands>Catalog.Контрагенты.StandardCommand.OpenList</commands>
+      <commands>Listendruck.Печать</commands>
+    </orderFragments>
+  </commandsOrder>
+  <subsystemsVisibility>
+    <visibilityFragments>
+      <subsystem>Subsystem.Продажи</subsystem>
+      <visible>
+        <common>true</common>
+        <for>
+          <role>Role.Менеджер</role>
+        </for>
+      </visible>
+    </visibilityFragments>
+  </subsystemsVisibility>
+</cmi:CommandInterface>

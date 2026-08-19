@@ -8,11 +8,13 @@ convenience.
 """
 from __future__ import annotations
 
+import re
 import socket
 from pathlib import Path
 
 import pytest
 
+from graphify.extractors.bsl import _v8_elements
 from tests.edt_harness import (
     CORPUS_ENV,
     EDT_EXTRACTORS,
@@ -164,15 +166,18 @@ def test_census_marks_extension_that_never_reaches_a_parser(tmp_path):
         "</mdclass:Catalog>\n",
         encoding="utf-8",
     )
-    (project / "src" / "Catalogs" / "X" / "Forms" / "Ф" / "Form.oform").write_bytes(
-        b"\x01binary ordinary form\x02"
+    # `.dcss` — dynamic-list settings. Measured across the corpus as carrying no
+    # links (661 files, 13 references), so it is deliberately left without an
+    # extractor; that decision holds only while the census keeps saying so.
+    (project / "src" / "Catalogs" / "X" / "Forms" / "Ф" / "ListSettings.dcss").write_text(
+        "<settings/>", encoding="utf-8",
     )
 
     rows = {row["ext"]: row for row in census(project)}
     assert rows[".mdo"]["status"] == STATUS_EDT
-    assert rows[".oform"]["status"] == STATUS_NOT_PARSED
-    assert rows[".oform"]["files"] == 1
-    assert rows[".oform"]["in_code_extensions"] is False
+    assert rows[".dcss"]["status"] == STATUS_NOT_PARSED
+    assert rows[".dcss"]["files"] == 1
+    assert rows[".dcss"]["in_code_extensions"] is False
     assert "не доходит до парсера" in format_census(census(project))
 
 
@@ -247,3 +252,31 @@ def test_corpus_census_reports_unparsed_extensions(corpus):
     assert any(r["status"] == STATUS_NOT_PARSED and r["files"] > 0 for r in rows), (
         "ожидалось хотя бы одно расширение, не доходящее до парсера"
     )
+
+
+# Headers and terminators of a BSL module, matched at the start of a line.
+_BSL_HEAD_RE = re.compile(r"^\s*(?:Procedure|Function|Процедура|Функция)\b", re.I)
+_BSL_TAIL_RE = re.compile(r"^\s*(?:EndProcedure|EndFunction|КонецПроцедуры|КонецФункции)\b", re.I)
+
+
+def test_corpus_oform_modules_are_complete(corpus):
+    """Every procedure opened inside an extracted module block is also closed.
+
+    A block cut short is the failure with teeth: it drops the tail of a module
+    and returns no error. Counting terminators against headers is what makes
+    that visible. Lines are split as BSL reads them — on CR, LF or CRLF alike,
+    because one module of the audited corpus uses bare CR inside a procedure.
+    """
+    heads = tails = 0
+    for path in corpus.rglob("*.oform"):
+        elements = _v8_elements(path.read_bytes())
+        module = (elements or {}).get("module")
+        if not module:
+            continue
+        # utf-8-sig: a module that opens straight with a declaration puts the
+        # byte-order mark in front of it, where `^\s*` will not step over it.
+        lines = module[0].decode("utf-8-sig", "replace").splitlines()
+        heads += sum(1 for line in lines if _BSL_HEAD_RE.match(line))
+        tails += sum(1 for line in lines if _BSL_TAIL_RE.match(line))
+    assert heads, "в корпусе не найдено ни одного модуля .oform"
+    assert heads == tails

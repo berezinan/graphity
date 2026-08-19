@@ -18,6 +18,8 @@ from graphify.extractors.bsl import (
     extract_edt_dcs,
     extract_edt_form,
     extract_edt_mdo,
+    extract_edt_cmi,
+    extract_edt_oform,
     extract_edt_rights,
 )
 from graphify.extractors.dart import extract_dart
@@ -54,6 +56,8 @@ LANGUAGE_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     "edt_dcs": extract_edt_dcs,
     "edt_form": extract_edt_form,
     "edt_mdo": extract_edt_mdo,
+    "edt_cmi": extract_edt_cmi,
+    "edt_oform": extract_edt_oform,
     "edt_rights": extract_edt_rights,
     "elixir": extract_elixir,
     "fortran": extract_fortran,

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 
 from graphify.extractors.base import (
@@ -30,9 +31,16 @@ _BSL_USE_RE = re.compile(
 )
 
 
-def extract_bsl(path: Path) -> dict:
+def extract_bsl(path: Path, source: bytes | None = None,
+                line_offset: int = 0) -> dict:
     """Extract procedures, functions, call graph, `Новый <Тип>` references, and
     OneScript `#Использовать` imports from a .bsl/.os/.osl file via tree-sitter.
+
+    `source` lets a caller hand in module text that is not the whole file — an
+    ordinary form keeps its module inside the .oform container, where it has no
+    file of its own. `line_offset` is added to every reported line so positions
+    point into the real file rather than into the extracted fragment: a link to
+    `Form.oform:15890` opens where the procedure actually is.
 
     1C has no class or import constructs: a module is a flat list of procedures
     and functions that call each other (and procedures in other modules) by bare
@@ -50,7 +58,8 @@ def extract_bsl(path: Path) -> dict:
     try:
         language = Language(tsbsl.language())
         parser = Parser(language)
-        source = path.read_bytes()
+        if source is None:
+            source = path.read_bytes()
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:
@@ -71,7 +80,7 @@ def extract_bsl(path: Path) -> dict:
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
-                "source_location": f"L{line}",
+                "source_location": f"L{line + line_offset}",
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -83,7 +92,7 @@ def extract_bsl(path: Path) -> dict:
             "relation": relation,
             "confidence": confidence,
             "source_file": str_path,
-            "source_location": f"L{line}",
+            "source_location": f"L{line + line_offset}",
             "weight": weight,
         }
         if context:
@@ -91,7 +100,9 @@ def extract_bsl(path: Path) -> dict:
         edges.append(edge)
 
     file_nid = _make_id(str(path))
-    add_node(file_nid, path.name, 1)
+    # The file node stands for the whole file, so it sits at line 1 even when the
+    # fragment it was parsed from starts further down.
+    add_node(file_nid, path.name, 1 - line_offset)
 
     def ensure_named_node(name: str, line: int) -> str:
         nid = _make_id(stem, name)
@@ -211,7 +222,8 @@ def extract_bsl(path: Path) -> dict:
                             "callee": callee_name,
                             "is_member_call": is_member_call,
                             "source_file": str_path,
-                            "source_location": f"L{node.start_point[0] + 1}",
+                            "source_location":
+                                f"L{node.start_point[0] + 1 + line_offset}",
                         })
 
         elif t == "new_expression":
@@ -957,6 +969,299 @@ def extract_edt_mdo(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# ── 1C:EDT ordinary form (.oform) ─────────────────────────────────────────────
+#
+# An ordinary (non-managed) form is a V8 container — the same envelope as
+# .cf/.epf/.erf — holding two named elements: `form` (the bracket tree of the
+# layout) and `module` (the BSL, stored as a plain UTF-8 fragment, uncompressed).
+# The format has NO official description: neither EDT's documentation nor
+# edt.1c.ru specifies it. What is encoded here was measured across the 904
+# ordinary forms of a real configuration and cross-checked against the
+# edt-structures skill §5.3.
+#
+# A block header is the ASCII line `\r\nDDDDDDDD BBBBBBBB NNNNNNNN \r\n`:
+# document size, this block's size, and the offset of the block that continues
+# it (0x7fffffff = none). Data can be chained across blocks, so a reader that
+# takes only the first block truncates the larger forms.
+_V8_BLOCK_HEADER = re.compile(rb"\r\n([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8}) \r\n")
+_V8_NO_NEXT = 0x7FFFFFFF
+_V8_TOC_OFFSET = 16
+_V8_NAME_OFFSET = 20          # element header: 8+8+4 bytes, then the UTF-16 name
+
+
+def _v8_read_block(data: bytes, offset: int) -> bytes | None:
+    """Payload of the block at `offset`, following its continuation chain."""
+    m = _V8_BLOCK_HEADER.match(data, offset)
+    if not m:
+        return None
+    doc_size, block_size, nxt = (int(g, 16) for g in m.groups())
+    chunks = [data[m.end():m.end() + block_size]]
+    seen = {offset}
+    while nxt != _V8_NO_NEXT and nxt not in seen:
+        seen.add(nxt)
+        m = _V8_BLOCK_HEADER.match(data, nxt)
+        if not m:
+            break
+        _, block_size, nxt = (int(g, 16) for g in m.groups())
+        chunks.append(data[m.end():m.end() + block_size])
+    payload = b"".join(chunks)
+    return payload[:doc_size] if doc_size else payload
+
+
+def _v8_elements(data: bytes) -> dict[str, tuple[bytes, int]] | None:
+    """`{element name: (payload, byte offset of its data)}`, or None if unreadable.
+
+    Selecting by NAME rather than by position or by sniffing the first byte:
+    the container names its elements, and the physical order of the two data
+    blocks is not fixed — measured 578 files with the tree first and 326 with
+    the module first, so any position-based rule is wrong on a third of them.
+    """
+    toc = _v8_read_block(data, _V8_TOC_OFFSET)
+    if not toc:
+        return None
+    out: dict[str, tuple[bytes, int]] = {}
+    for i in range(0, len(toc) - 11, 12):
+        head = int.from_bytes(toc[i:i + 4], "little")
+        body = int.from_bytes(toc[i + 4:i + 8], "little")
+        if head == _V8_NO_NEXT or body == _V8_NO_NEXT:
+            continue
+        header = _v8_read_block(data, head)
+        if not header or len(header) <= _V8_NAME_OFFSET:
+            continue
+        try:
+            name = header[_V8_NAME_OFFSET:].decode("utf-16-le").rstrip("\x00")
+        except UnicodeDecodeError:
+            continue
+        payload = _v8_read_block(data, body)
+        if payload is not None:
+            out[name] = (payload, body)
+    return out or None
+
+
+def _v8_payload_line(data: bytes, body_offset: int) -> int:
+    """1-based line in the .oform where an element's payload starts."""
+    m = _V8_BLOCK_HEADER.match(data, body_offset)
+    start = m.end() if m else body_offset
+    return data.count(b"\n", 0, start) + 1
+
+
+# The layout half of the container is 1C's bracket notation: nested `{…}` lists
+# of quoted strings, uuids and numbers. It is tokenised rather than scanned with
+# a regex over the file, so that a match inside a caption or inside the
+# container's service bytes cannot become a reference.
+_OFORM_TOKEN_RE = re.compile(
+    r'"(?:[^"]|"")*"'                       # string; "" escapes a quote
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"   # uuid
+    r"|-?\d+(?:\.\d+)?"                     # number
+    r"|[{},]"                               # structure
+    r'|[^\s{},"]+'                          # bare word
+)
+_OFORM_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
+def _oform_tree_uuids(text: str) -> list[str]:
+    """Uuid tokens of a form layout, in order of first appearance.
+
+    Only tokens that stand on their own in the stream: a uuid written inside a
+    quoted string is data — a caption, a stored setting — not a reference.
+    """
+    seen: dict[str, None] = {}
+    for m in _OFORM_TOKEN_RE.finditer(text):
+        token = m.group(0)
+        if token[0] != '"' and _OFORM_UUID_RE.fullmatch(token):
+            seen.setdefault(token, None)
+    return list(seen)
+
+
+def _oform_element_names(text: str) -> list[str]:
+    """Names of the form's controls, in order of first appearance.
+
+    The layout grammar is positional and undocumented, so this reads the one
+    record shape that measurement pinned down: `{14,"<Name>",…` opens a named
+    control. Verified on the corpus — every one of the 904 layouts yields names,
+    23 039 in total, and not one of them fails to be a valid 1C identifier.
+
+    Incomplete by construction: a few control kinds are named in a different
+    record (`…,1,"CatalogList",{"Pattern"…`) and are not read here. Cross-checked
+    against the `Controls.<Name>` uses in the modules, 94.5% of the forms that
+    can be checked yield every name their own code refers to.
+    """
+    names: dict[str, None] = {}
+    pending = 0        # 1 after `{`, 2 after `{14`, 3 after `{14,`
+    for m in _OFORM_TOKEN_RE.finditer(text):
+        token = m.group(0)
+        if token == "{":
+            pending = 1
+        elif pending == 1 and token == "14":
+            pending = 2
+        elif pending == 2 and token == ",":
+            pending = 3
+        elif pending == 3 and token[0] == '"':
+            names.setdefault(token[1:-1].replace('""', '"'), None)
+            pending = 0
+        else:
+            pending = 0
+    return list(names)
+
+
+def _edt_metadata_root(path: Path) -> Path | None:
+    """The folder holding the project's metadata kind folders (`…/src`)."""
+    parts = path.parts
+    for i, seg in enumerate(parts[:-1]):
+        if seg in _EDT_PLURAL_TO_KIND or seg in _EDT_COMMON_FOLDER_TO_KIND:
+            return Path(*parts[:i]) if i else None
+    return None
+
+
+@lru_cache(maxsize=4)
+def _edt_uuid_index(root: Path) -> dict[str, tuple[str, str]]:
+    """`{uuid: (node id, label)}` for every object and member of the project.
+
+    An ordinary form names nothing it refers to: the layout carries uuids, and
+    only the `.mdo` files say what they are. Measured on the audited corpus,
+    899 of 904 forms hold at least one uuid that resolves here, while the
+    `Kind.Name` tokens the design first expected occur exactly zero times.
+
+    Built by running the `.mdo` extractor rather than by re-deriving ids from
+    the XML: an id assembled twice is an id that eventually disagrees with
+    itself, and a reference to a node that does not exist is worse than none.
+    """
+    index: dict[str, tuple[str, str]] = {}
+    for mdo in sorted(root.rglob("*.mdo")):
+        result = extract_edt_mdo(mdo)
+        if result.get("error"):
+            continue
+        object_id: tuple[str, str] | None = None
+        for node in result.get("nodes", []):
+            uuid = node.get("uuid")
+            if not uuid:
+                continue
+            index.setdefault(uuid, (node["id"], node["label"]))
+            if object_id is None:
+                object_id = (node["id"], node["label"])
+        # `<producedTypes>` are the platform types the object generates
+        # (`CatalogRef.X` and friends). A control typed by one of them refers to
+        # the object itself, which is how most object-level references appear.
+        if object_id is None:
+            continue
+        try:
+            head = mdo.read_bytes()[:4096].decode("utf-8", "replace")
+        except OSError:
+            continue
+        produced = re.search(r"<producedTypes>(.*?)</producedTypes>", head, re.S)
+        if produced:
+            for uuid in _OFORM_UUID_RE.findall(produced.group(1)):
+                index.setdefault(uuid, object_id)
+    return index
+
+
+def extract_edt_oform(path: Path) -> dict:
+    """Extract an ordinary form (Form.oform): its module, controls and references.
+
+    An ordinary form's module has no file of its own — it lives inside the
+    container — which is why it was invisible to a scan that only looked at
+    `.bsl`. On the audited configuration that is 16 045 procedures, roughly a
+    third of all application logic.
+
+    The module is handed to the shared `extract_bsl` rather than parsed here:
+    a second BSL parser would drift from the first. Ordinary-form BSL has no
+    compilation directives and reaches the form through `Controls.<Name>`
+    instead of `Элементы`, so the extractor has to accept it as-is.
+
+    The layout half yields the form's controls and its references, the latter by
+    uuid — an ordinary form names nothing it refers to. Everything hangs off the
+    form node the parent `.mdo` already emitted.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {"nodes": [], "edges": [], "error": f"cannot read {path}"}
+    if len(data) > _PROJECT_XML_MAX_BYTES:
+        return {"nodes": [], "edges": [], "error": "oform file too large"}
+
+    elements = _v8_elements(data)
+    if not elements:
+        return {"nodes": [], "edges": [], "error": "not a readable V8 container"}
+
+    module = elements.get("module")
+    result: dict = {"nodes": [], "edges": []}
+    has_module = module is not None and module[0].strip() != b""
+    if has_module:
+        payload, body_offset = module
+        if payload[:3] == b"\xef\xbb\xbf":
+            payload = payload[3:]
+        result = extract_bsl(path, source=payload,
+                             line_offset=_v8_payload_line(data, body_offset) - 1)
+        if result.get("error"):
+            return result
+
+    # The form node already exists, emitted from the <forms> block of the
+    # parent .mdo; this fills it in rather than creating a second one.
+    form_id = _edt_form_owner_id(path)
+    if not form_id:
+        return result
+    str_path = str(path)
+    result["nodes"].append({
+        "id": form_id, "label": path.parent.name, "file_type": "code",
+        "source_file": str_path, "source_location": "L1",
+    })
+    if has_module:
+        # Only when the module was actually parsed: six forms of the corpus carry
+        # an empty module element, and pointing `defines` at a file node that was
+        # never emitted would leave the edge dangling.
+        result["edges"].append({
+            "source": form_id, "target": _make_id(str_path),
+            "relation": "defines", "confidence": "EXTRACTED",
+            "source_file": str_path, "weight": 1.0,
+        })
+
+    tree = elements.get("form")
+    if tree is None:
+        return result
+    layout = tree[0].decode("utf-8", "replace")
+
+    # Controls of the form. Like a managed form's attributes they carry no uuid,
+    # so the id is the form's id plus the name, and the form's uuid is recorded
+    # as parent_uuid.
+    form_uuid = _edt_parent_uuid(path, form_name=path.parent.name)
+    for name in _oform_element_names(layout):
+        element_id = _make_id(form_id, "FormElement", name)
+        if element_id == form_id:
+            continue
+        node = {"id": element_id, "label": name, "file_type": "code",
+                "source_file": str_path, "source_location": "L1"}
+        if form_uuid:
+            node["parent_uuid"] = form_uuid
+        result["nodes"].append(node)
+        result["edges"].append({
+            "source": form_id, "target": element_id, "relation": "contains",
+            "confidence": "EXTRACTED", "source_file": str_path, "weight": 1.0,
+        })
+
+    root = _edt_metadata_root(path)
+    if root is None:
+        return result
+    index = _edt_uuid_index(root)
+    seen = {form_id}
+    for uuid in _oform_tree_uuids(layout):
+        target = index.get(uuid)
+        if target is None or target[0] in seen:
+            continue
+        seen.add(target[0])
+        result["nodes"].append({
+            "id": target[0], "label": target[1], "file_type": "code",
+            "source_file": str_path, "source_location": "L1",
+        })
+        result["edges"].append({
+            "source": form_id, "target": target[0], "relation": "references",
+            "confidence": "EXTRACTED", "source_file": str_path, "weight": 1.0,
+            "context": "oform",
+        })
+    return result
+
+
 def _edt_parse_xml(path: Path):
     """Shared, guarded parse for .rights/.form XML. Returns (root, error_result).
 
@@ -1209,6 +1514,84 @@ def _edt_owner_id_from_path(path: Path) -> tuple[str, str] | None:
         if kind:
             return _make_id(kind, parts[i + 1]), f"{kind}.{parts[i + 1]}"
     return None
+
+
+# ── 1C:EDT command interface (.cmi) ───────────────────────────────────────────
+#
+# The command interface of the configuration or of one subsystem: which commands
+# it shows, in what order, and to which roles. Plain XML, and — unlike the
+# ordinary form beside it — it names what it refers to. Measured on the audited
+# corpus: 49 files, 1653 references, every one of them a `Kind.Name` FQN.
+
+
+def _edt_cmi_owner(path: Path) -> tuple[str, str] | None:
+    """`(node id, label)` of the configuration or subsystem the file belongs to."""
+    chain = _edt_subsystem_chain(path)
+    if chain:
+        return _make_id("Subsystem", *chain), "Subsystem." + ".".join(chain)
+    if "Configuration" in path.parts:
+        return _make_id("Configuration"), "Configuration"
+    return None
+
+
+def _edt_cmi_target(text: str) -> tuple[str, str] | None:
+    """`(node id, label)` for one command-interface value.
+
+    Three shapes occur, and only these: `Kind.Name`; `Kind.Name.Command.C`, an
+    object's own command; and `Kind.Name.StandardCommand.C`, a command the
+    platform provides. A standard command is not a metadata object and has no
+    node of its own, so that edge lands on the object it acts on.
+    """
+    parts = [p for p in text.split(".") if p]
+    if len(parts) < 2 or parts[0] not in _EDT_KIND_PREFIXES:
+        return None
+    if len(parts) == 2:
+        return _make_id(*parts), text
+    if len(parts) == 4:
+        if parts[0] == "Subsystem" and parts[2] == "Subsystem":
+            # Nested subsystem: the repeated marker is the FQN's, not the id's.
+            return (_make_id("Subsystem", parts[1], parts[3]),
+                    f"Subsystem.{parts[1]}.{parts[3]}")
+        if parts[2] == "Command":
+            return _make_id(*parts), text
+        if parts[2] == "StandardCommand":
+            return _make_id(parts[0], parts[1]), f"{parts[0]}.{parts[1]}"
+    return None
+
+
+def extract_edt_cmi(path: Path) -> dict:
+    """Extract the references a 1C:EDT command interface (.cmi) declares.
+
+    Denser in links than any other auxiliary file of an EDT project — 34 per
+    file against 6.8 for an ordinary form — because that is all it is: an
+    ordering of commands, the subsystems that show them, and the roles that see
+    them. Anchors on the configuration or the subsystem the file sits under.
+    """
+    root, err = _edt_parse_xml(path)
+    if err is not None:
+        return err
+    owner = _edt_cmi_owner(path)
+    if not owner:
+        return {"nodes": [], "edges": []}
+    owner_id, owner_label = owner
+
+    str_path = str(path)
+    nodes: list[dict] = [{"id": owner_id, "label": owner_label, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    seen: set[str] = {owner_id}
+    for elem in root.iter():
+        target = _edt_cmi_target((elem.text or "").strip())
+        if target is None or target[0] in seen:
+            continue
+        seen.add(target[0])
+        nodes.append({"id": target[0], "label": target[1], "file_type": "code",
+                      "source_file": str_path, "source_location": "L1"})
+        edges.append({"source": owner_id, "target": target[0],
+                      "relation": "references", "confidence": "EXTRACTED",
+                      "source_file": str_path, "weight": 1.0,
+                      "context": "command-interface"})
+    return {"nodes": nodes, "edges": edges}
 
 
 def extract_edt_dcs(path: Path) -> dict:
