@@ -341,8 +341,67 @@ _EDT_CONFIGURATION_MODULES: tuple[str, ...] = (
 
 # Inline children that own children of their own. Kept as an explicit set for
 # the same reason as every other whitelist here: descending into everything
-# would mint nodes for blocks that own nothing.
-_EDT_CONTAINER_CHILD_KINDS: frozenset[str] = frozenset({"TabularSection"})
+# would mint nodes for blocks that own nothing — `<attributes>` holds a
+# `<type><types>String</types>`, and an unconditional walk would turn that into
+# a node. Measured on the audited corpus: nothing nests three levels deep, so
+# one level of descent is the whole requirement.
+_EDT_CONTAINER_CHILD_KINDS: frozenset[str] = frozenset({
+    "TabularSection", "Operation", "URLTemplate",
+})
+
+# Where a SubKind comes from. CONFIRMED means 1C names this FQN form itself
+# (skill: edt-structures §3, §4.20, §4.22), so the id addresses something the
+# platform addresses too. CONVENTION means the name is graphify's own and 1C
+# makes no such statement — `HTTPService.X.URLTemplate.Y` is our spelling, not a
+# claim about 1C's nomenclature. The origin is kept in the map rather than in a
+# comment so it stays checkable six months from now.
+_EDT_SUBKIND_CONFIRMED = "skill"
+_EDT_SUBKIND_CONVENTION = "graphify"
+
+# Inline child blocks of a .mdo: XML tag -> (SubKind, origin of that SubKind).
+_EDT_CHILD_KINDS: dict[str, tuple[str, str]] = {
+    "attributes": ("Attribute", _EDT_SUBKIND_CONFIRMED),
+    "tabularSections": ("TabularSection", _EDT_SUBKIND_CONFIRMED),
+    "enumValues": ("EnumValue", _EDT_SUBKIND_CONFIRMED),
+    "forms": ("Form", _EDT_SUBKIND_CONFIRMED),
+    "commands": ("Command", _EDT_SUBKIND_CONFIRMED),
+    # A CalculationRegister registers its recalculations inline, so this is
+    # where the parent -> child edge comes from (the child .mdo also
+    # synthesises it from its path; the two share an id and collapse).
+    "recalculations": ("Recalculation", _EDT_SUBKIND_CONFIRMED),
+    # External-table fields are SubKind `Field`, not `Attribute` — and the
+    # container tag differs by owner: <tableFields> on a Table, <fields> on a
+    # DimensionTable (skill: edt-structures §4.21).
+    "tableFields": ("Field", _EDT_SUBKIND_CONFIRMED),
+    "fields": ("Field", _EDT_SUBKIND_CONFIRMED),
+    "standardAttributes": ("StandardAttribute", _EDT_SUBKIND_CONFIRMED),
+    "resources": ("Resource", _EDT_SUBKIND_CONFIRMED),
+    "dimensions": ("Dimension", _EDT_SUBKIND_CONFIRMED),
+    "templates": ("Template", _EDT_SUBKIND_CONFIRMED),
+    "addressingAttributes": ("AddressingAttribute", _EDT_SUBKIND_CONFIRMED),
+    "accountingFlags": ("AccountingFlag", _EDT_SUBKIND_CONFIRMED),
+    "items": ("Predefined", _EDT_SUBKIND_CONVENTION),
+    "columns": ("Column", _EDT_SUBKIND_CONVENTION),
+    "operations": ("Operation", _EDT_SUBKIND_CONVENTION),
+    "parameters": ("Parameter", _EDT_SUBKIND_CONVENTION),
+    "urlTemplates": ("URLTemplate", _EDT_SUBKIND_CONVENTION),
+    "methods": ("Method", _EDT_SUBKIND_CONVENTION),
+    "integrationServiceChannels": ("Channel", _EDT_SUBKIND_CONVENTION),
+}
+
+# Wrappers that are not entities: they carry neither a name nor a uuid, and the
+# things worth a node are their children. `<predefined>` is the only one in the
+# audited corpus — 44 wrappers holding 559 items — and it is exactly the
+# container-versus-leaf trap the skill names (§3): counting the wrapper answers
+# "44 predefined items" for a configuration that has 559.
+_EDT_TRANSPARENT_CHILD_TAGS: frozenset[str] = frozenset({"predefined"})
+
+# Blocks whose identifier is not spelled `uuid`. A standard attribute has no
+# identifier at all, and a predefined item's is `id` — the item's identity in
+# user data (skill §3). Reading `uuid` unconditionally returns None for both,
+# which loses the second silently.
+_EDT_NO_IDENTIFIER_TAGS: frozenset[str] = frozenset({"standardAttributes"})
+_EDT_PLAIN_ID_TAGS: frozenset[str] = frozenset({"items"})
 
 # Reference-bearing tags of an object .mdo: tag -> (value shape, context label).
 #
@@ -640,7 +699,7 @@ def extract_edt_mdo(path: Path) -> dict:
     seen_edges: set[tuple[str, str, str]] = set()
 
     def add_node(nid: str, label: str, file_type: str = "code",
-                 uuid: str | None = None) -> None:
+                 uuid: str | None = None, predefined_id: str | None = None) -> None:
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
             node = {"id": nid, "label": label, "file_type": file_type,
@@ -651,6 +710,11 @@ def extract_edt_mdo(path: Path) -> dict:
             # collisions and anchors uuid-keyed lookups downstream.
             if uuid:
                 node["uuid"] = uuid
+            # A predefined item's `id` is a different thing from a uuid — it is
+            # the item's identity in user data — and it keeps its own field so
+            # the two stay tellable apart.
+            if predefined_id:
+                node["predefined_id"] = predefined_id
             nodes.append(node)
 
     def add_edge(src_id: str, tgt_id: str, relation: str) -> None:
@@ -786,33 +850,49 @@ def extract_edt_mdo(path: Path) -> dict:
         add_node(parent_id, ".".join(id_parts[:-2]))
         add_edge(parent_id, obj_id, "contains")
 
-    # Child artifacts: attributes / tabular sections / enum values / forms / commands.
-    _CHILD_KINDS = {
-        "attributes": "Attribute", "tabularSections": "TabularSection",
-        "enumValues": "EnumValue", "forms": "Form", "commands": "Command",
-        # A CalculationRegister registers its recalculations inline, so this is
-        # where the parent -> child edge comes from (the child .mdo also
-        # synthesises it from its path; the two share an id and collapse).
-        "recalculations": "Recalculation",
-        # External-table fields are SubKind `Field`, not `Attribute` — and the
-        # container tag differs by owner: <tableFields> on a Table, <fields> on a
-        # DimensionTable (skill: edt-structures §4.21).
-        "tableFields": "Field", "fields": "Field",
-    }
-    for child in root:
-        sub = _CHILD_KINDS.get(_edt_localname(child.tag))
-        if not sub:
-            continue
-        child_name = child_text(child, "name")
-        if not child_name:
-            continue
-        child_id = _make_id(*id_parts, sub, child_name)
-        add_node(child_id, child_name, uuid=child.get("uuid"))
-        add_edge(obj_id, child_id, "contains")
+    # Child artifacts: attributes, tabular sections, enum values, forms, commands,
+    # resources, dimensions, templates, predefined items and the rest of the map.
+    def emit_child(elem, owner_id: str, owner_parts: list[str]):
+        """One inline child: its node plus `contains` from its owner.
+
+        Returns `(node id, SubKind, name)`, or None when the block is not in the
+        map or carries no name — a block outside the map yields nothing rather
+        than a guessed node.
+        """
+        tag = _edt_localname(elem.tag)
+        entry = _EDT_CHILD_KINDS.get(tag)
+        if entry is None:
+            return None
+        sub = entry[0]
+        name = child_text(elem, "name")
+        if not name:
+            return None
+        nid = _make_id(*owner_parts, sub, name)
+        # The identifier is read the way its own block spells it, not uniformly.
+        if tag in _EDT_NO_IDENTIFIER_TAGS:
+            add_node(nid, name)
+        elif tag in _EDT_PLAIN_ID_TAGS:
+            add_node(nid, name, predefined_id=elem.get("id"))
+        else:
+            add_node(nid, name, uuid=elem.get("uuid"))
+        add_edge(owner_id, nid, "contains")
         # A typed member references the object it is typed by, and the edge
         # belongs to the member, not to its owner: the aggregate follows from
         # the precise fact, never the other way round.
-        type_refs(child, child_id)
+        type_refs(elem, nid)
+        return nid, sub, name
+
+    for child in root:
+        if _edt_localname(child.tag) in _EDT_TRANSPARENT_CHILD_TAGS:
+            # A wrapper that is not an entity: no name, no uuid. Its children
+            # hang off the object itself, and they are what gets counted.
+            for item in child:
+                emit_child(item, obj_id, id_parts)
+            continue
+        emitted = emit_child(child, obj_id, id_parts)
+        if emitted is None:
+            continue
+        child_id, sub, child_name = emitted
         # A container child owns children of its own, and the FQN grammar is
         # recursive (skill §3): a tabular-section column is
         # `Kind.Name.TabularSection.T.Attribute.A`, hanging off the section
@@ -821,16 +901,7 @@ def extract_edt_mdo(path: Path) -> dict:
         # <synonym> and every other non-owning block into nodes.
         if sub in _EDT_CONTAINER_CHILD_KINDS:
             for grandchild in child:
-                sub2 = _CHILD_KINDS.get(_edt_localname(grandchild.tag))
-                if not sub2:
-                    continue
-                gc_name = child_text(grandchild, "name")
-                if not gc_name:
-                    continue
-                gc_id = _make_id(*id_parts, sub, child_name, sub2, gc_name)
-                add_node(gc_id, gc_name, uuid=grandchild.get("uuid"))
-                add_edge(child_id, gc_id, "contains")
-                type_refs(grandchild, gc_id)
+                emit_child(grandchild, child_id, [*id_parts, sub, child_name])
         # A form/command owns a BSL module folder next to the .mdo.
         if sub == "Form":
             mod = path.parent / "Forms" / child_name / "Module.bsl"
@@ -879,18 +950,14 @@ def extract_edt_mdo(path: Path) -> dict:
                 if _edt_localname(c.tag) == child_tag and (c.text or "").strip():
                     add_ref(obj_id, shape, c.text.strip(), context)
 
-        # A service's methods and operations are inline sub-objects. They are
-        # stubbed here with the ids extend-edt-inline-children will use
-        # (`URLTemplate`/`Method`, `Operation`) so the handler edge sits at its
-        # final anchor immediately — re-anchoring it later would register as a
-        # deleted edge, which the acceptance criterion of every change in this
-        # series forbids.
+        # References that belong to an inline child rather than to the object.
+        # The child's node and its `contains` edge come from the child map above;
+        # only the id is rebuilt here, to anchor the reference where it belongs.
+        # A handler edge hanging off the service instead of off the method would
+        # have to be re-anchored later, and a moved edge reads as a deleted one.
         if ln == "urlTemplates":
             tpl_name = child_text(child, "name")
             if tpl_name:
-                tpl_id = _make_id(*id_parts, "URLTemplate", tpl_name)
-                add_node(tpl_id, tpl_name, uuid=child.get("uuid"))
-                add_edge(obj_id, tpl_id, "contains")
                 for method in child:
                     if _edt_localname(method.tag) != "methods":
                         continue
@@ -899,30 +966,20 @@ def extract_edt_mdo(path: Path) -> dict:
                         continue
                     m_id = _make_id(*id_parts, "URLTemplate", tpl_name,
                                     "Method", m_name)
-                    add_node(m_id, m_name, uuid=method.get("uuid"))
-                    add_edge(tpl_id, m_id, "contains")
                     add_procedure_ref(m_id, child_text(method, "handler"),
                                       "service-handler")
 
         if ln == "operations":
             op_name = child_text(child, "name")
             if op_name:
-                op_id = _make_id(*id_parts, "Operation", op_name)
-                add_node(op_id, op_name, uuid=child.get("uuid"))
-                add_edge(obj_id, op_id, "contains")
-                add_procedure_ref(op_id, child_text(child, "procedureName"),
+                add_procedure_ref(_make_id(*id_parts, "Operation", op_name),
+                                  child_text(child, "procedureName"),
                                   "service-procedure")
 
-        # A journal column is not yet extracted as a node of its own — that is
-        # extend-edt-inline-children's scope — so it is stubbed with the id that
-        # change will give it (SubKind `Column`), and its <references> hangs off
-        # the column rather than off the journal.
         if ln == "columns":
             col_name = child_text(child, "name")
             if col_name:
                 col_id = _make_id(*id_parts, "Column", col_name)
-                add_node(col_id, col_name, uuid=child.get("uuid"))
-                add_edge(obj_id, col_id, "contains")
                 for c in child:
                     if _edt_localname(c.tag) == "references" and (c.text or "").strip():
                         add_ref(col_id, "member", c.text.strip(),

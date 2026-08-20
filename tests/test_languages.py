@@ -15,6 +15,7 @@ from graphify.extract import (
 )
 from graphify.extractors.bsl import (
     _edt_type_kind, _edt_ref_target, _EDT_REF_TAGS, _EDT_REF_CONTAINER_TAGS,
+    _EDT_CHILD_KINDS, _EDT_SUBKIND_CONFIRMED, _EDT_SUBKIND_CONVENTION,
     _v8_elements, _oform_tree_uuids, _oform_element_names, _OFORM_TOKEN_RE,
 )
 
@@ -3580,6 +3581,155 @@ def test_edt_dcs_ignores_field_aliases():
     r = extract_edt_dcs(DCS)
     targets = {t for _, t in _edge_labels(r, "references", "dcs")}
     assert not any(t.endswith(".ИНН") for t in targets)
+
+# ── 1C:EDT inline children of a .mdo ─────────────────────────────────────────
+
+REGISTER_MDO = EDT / "InformationRegisters" / "КурсыВалют" / "КурсыВалют.mdo"
+TASK_MDO = EDT / "Tasks" / "Поручение" / "Поручение.mdo"
+CHART_MDO = EDT / "ChartsOfAccounts" / "Основной" / "Основной.mdo"
+REPORT_MDO = (EDT / "Reports" / "ВзаиморасчетыОтчет"
+              / "ВзаиморасчетыОтчет.mdo")
+
+
+def test_edt_child_map_covers_every_documented_block():
+    # The map is the whole mechanism: a block missing from it is a block the
+    # graph never sees, and nothing else in the parser would notice.
+    assert {
+        "attributes", "tabularSections", "enumValues", "forms", "commands",
+        "recalculations", "tableFields", "fields",
+        "standardAttributes", "resources", "dimensions", "templates",
+        "addressingAttributes", "accountingFlags",
+        "items", "columns", "operations", "parameters", "urlTemplates",
+        "methods", "integrationServiceChannels",
+    } <= set(_EDT_CHILD_KINDS)
+
+
+def test_edt_child_map_marks_a_skill_confirmed_subkind():
+    # `InformationRegister.Курсы.Resource.Курс` is a form 1C uses itself.
+    assert _EDT_CHILD_KINDS["resources"] == ("Resource", _EDT_SUBKIND_CONFIRMED)
+
+
+def test_edt_child_map_marks_a_graphify_convention():
+    # `HTTPService.X.URLTemplate.Y` is our spelling. 1C documents no FQN for a
+    # URL template, and the graph must not imply that it does.
+    assert _EDT_CHILD_KINDS["urlTemplates"] == ("URLTemplate", _EDT_SUBKIND_CONVENTION)
+
+
+def test_edt_child_map_origins_are_only_the_two_known_values():
+    assert {origin for _, origin in _EDT_CHILD_KINDS.values()} == {
+        _EDT_SUBKIND_CONFIRMED, _EDT_SUBKIND_CONVENTION}
+
+
+def test_edt_block_outside_the_map_yields_nothing(tmp_path):
+    # No automatic descent: an unmapped child is ignored rather than guessed at.
+    mdo = tmp_path / "Справочник.mdo"
+    mdo.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"'
+        ' uuid="aaaaaaaa-0000-4000-8000-000000000001">\n'
+        "  <name>Справочник</name>\n"
+        "  <somethingElse uuid=\"aaaaaaaa-0000-4000-8000-000000000002\">\n"
+        "    <name>НеРебёнок</name>\n"
+        "  </somethingElse>\n"
+        "</mdclass:Catalog>\n",
+        encoding="utf-8",
+    )
+    r = extract_edt_mdo(mdo)
+    assert "НеРебёнок" not in _labels(r)
+    assert _labels(r) == ["Catalog.Справочник"]
+
+
+def test_edt_register_dimensions_and_resources():
+    r = extract_edt_mdo(REGISTER_MDO)
+    contains = _edge_labels(r, "contains")
+    assert ("InformationRegister.КурсыВалют", "Валюта") in contains
+    assert ("InformationRegister.КурсыВалют", "Курс") in contains
+    ids = {n["id"] for n in r["nodes"]}
+    assert _make_id("InformationRegister", "КурсыВалют", "Dimension", "Валюта") in ids
+    assert _make_id("InformationRegister", "КурсыВалют", "Resource", "Курс") in ids
+
+
+def test_edt_addressing_attribute_and_accounting_flag():
+    # Neither block occurs in the audited corpus, so a fixture is the only place
+    # the claim "the map covers them" can be checked against real parsing.
+    assert _make_id("Task", "Поручение", "AddressingAttribute", "Исполнитель") in {
+        n["id"] for n in extract_edt_mdo(TASK_MDO)["nodes"]}
+    assert _make_id("ChartOfAccounts", "Основной", "AccountingFlag", "Валютный") in {
+        n["id"] for n in extract_edt_mdo(CHART_MDO)["nodes"]}
+
+
+def test_edt_standard_attribute_node_has_no_uuid_field():
+    # The block carries no uuid attribute at all (skill §3), so the field is
+    # absent rather than present and empty.
+    node = _node_by_label(extract_edt_mdo(CATALOG_MDO), "Description")
+    assert node is not None
+    assert "uuid" not in node
+
+
+def test_edt_predefined_item_id_is_kept_apart_from_uuid():
+    # A predefined item's `id` is its identity in user data — a different thing
+    # from a metadata uuid, and merging the two would make them indistinguishable.
+    node = _node_by_label(extract_edt_mdo(CATALOG_MDO), "Основной")
+    assert node["predefined_id"] == "11111111-0000-4000-8000-000000000001"
+    assert "uuid" not in node
+
+
+def test_edt_ordinary_blocks_still_carry_uuid():
+    r = extract_edt_mdo(CATALOG_MDO)
+    assert _node_by_label(r, "ИНН")["uuid"]
+    assert _node_by_label(r, "ФормаЭлемента")["uuid"]
+
+
+def test_edt_predefined_items_are_counted_one_by_one():
+    # The container-versus-leaf trap: `<predefined>` is a wrapper with no name
+    # and no uuid. Counting wrappers answers 1 for a catalog that has five
+    # predefined items — measured corpus-wide as 44 wrappers over 559 items.
+    r = extract_edt_mdo(CATALOG_MDO)
+    predefined = [n for n in r["nodes"] if n.get("predefined_id")]
+    assert len(predefined) == 5
+    contains = _edge_labels(r, "contains")
+    assert ("Catalog.Контрагенты", "Резервный") in contains
+
+
+def test_edt_web_service_operation_parameters():
+    # The parameter hangs off the operation, not off the service, and its FQN
+    # carries both — the recursive grammar of skill §3.
+    r = extract_edt_mdo(WEB_SERVICE_MDO)
+    operation_id = _make_id("WebService", "Каталог", "Operation", "ПолучитьНоменклатуру")
+    parameter_id = _make_id("WebService", "Каталог", "Operation", "ПолучитьНоменклатуру",
+                            "Parameter", "Период")
+    assert parameter_id in {n["id"] for n in r["nodes"]}
+    assert (operation_id, parameter_id, "contains") in {
+        (e["source"], e["target"], e["relation"]) for e in r["edges"]}
+
+
+def test_edt_http_url_template_methods():
+    r = extract_edt_mdo(HTTP_SERVICE_MDO)
+    template_id = _make_id("HTTPService", "Обмен", "URLTemplate", "ШаблонЗаказа")
+    method_id = _make_id("HTTPService", "Обмен", "URLTemplate", "ШаблонЗаказа",
+                         "Method", "POST")
+    assert (template_id, method_id, "contains") in {
+        (e["source"], e["target"], e["relation"]) for e in r["edges"]}
+
+
+def test_edt_child_properties_are_not_extracted():
+    # Node, name, identifier and ownership — nothing else. The resource in the
+    # fixture has a type with number qualifiers; none of it reaches the node.
+    node = _node_by_label(extract_edt_mdo(REGISTER_MDO), "Курс")
+    assert set(node) <= {"id", "label", "file_type", "source_file",
+                         "source_location", "uuid", "predefined_id"}
+
+
+def test_edt_template_node_does_not_re_anchor_the_dcs_edges():
+    # The template now has a node of its own. The composition schema's edges
+    # must still start at the report: moving them would delete existing edges,
+    # which is a regression however tidy it looks.
+    template_id = _make_id("Report", "ВзаиморасчетыОтчет", "Template", "ОсновнаяСхема")
+    assert template_id in {n["id"] for n in extract_edt_mdo(REPORT_MDO)["nodes"]}
+    dcs = extract_edt_dcs(DCS)
+    assert {e["source"] for e in dcs["edges"] if e["relation"] == "references"} == {
+        _make_id("Report", "ВзаиморасчетыОтчет")}
+
 
 # ── 1C:EDT ordinary form (.oform) ────────────────────────────────────────────
 #
