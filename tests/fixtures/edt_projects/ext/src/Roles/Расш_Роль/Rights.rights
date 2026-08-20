@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Rights xmlns="http://g5.1c.ru/v8/dt/rights">
+  <object>
+    <name>Catalog.Контрагенты</name>
+    <right>
+      <name>Read</name>
+      <value>true</value>
+    </right>
+  </object>
+</Rights>

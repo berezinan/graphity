@@ -17,6 +17,8 @@ from graphify.extractors.bsl import (
     _edt_type_kind, _edt_ref_target, _EDT_REF_TAGS, _EDT_REF_CONTAINER_TAGS,
     _EDT_CHILD_KINDS, _EDT_SUBKIND_CONFIRMED, _EDT_SUBKIND_CONVENTION,
     _v8_elements, _oform_tree_uuids, _oform_element_names, _OFORM_TOKEN_RE,
+    _EDT_KIND_PREFIXES, _EDT_PLURAL_TO_KIND, _edt_project_kind, _edt_id_scope,
+    EDT_PROJECT_CONFIGURATION, EDT_PROJECT_EXTENSION, EDT_PROJECT_EXTERNAL_OBJECTS,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -4262,6 +4264,233 @@ def test_edt_cmi_no_dangling_edges():
         ids = {n["id"] for n in r["nodes"]}
         for edge in r["edges"]:
             assert edge["source"] in ids and edge["target"] in ids, f"dangling: {edge}"
+
+
+# ── 1C:EDT project kinds (configuration / extension / external objects) ───
+#
+# One workspace holds all three side by side. The fixture tree mirrors that:
+# `base` extends nothing, `ext` adopts `base`'s catalog under the same name, and
+# `external` is a standalone data processor with no configuration root at all.
+
+PROJECTS = FIXTURES / "edt_projects"
+BASE_PROJECT = PROJECTS / "base"
+EXT_PROJECT = PROJECTS / "ext"
+EXTERNAL_PROJECT = PROJECTS / "external"
+
+BASE_CATALOG_MDO = BASE_PROJECT / "src/Catalogs/Контрагенты/Контрагенты.mdo"
+BASE_CONFIG_MDO = BASE_PROJECT / "src/Configuration/Configuration.mdo"
+EXT_ADOPTED_MDO = EXT_PROJECT / "src/Catalogs/Контрагенты/Контрагенты.mdo"
+EXT_NATIVE_MDO = EXT_PROJECT / "src/Catalogs/Расш_Своя/Расш_Своя.mdo"
+EXT_CONFIG_MDO = EXT_PROJECT / "src/Configuration/Configuration.mdo"
+EXT_RIGHTS = EXT_PROJECT / "src/Roles/Расш_Роль/Rights.rights"
+EXTERNAL_MDO = (EXTERNAL_PROJECT
+                / "src/ExternalDataProcessors/ВнешняяОбработка/ВнешняяОбработка.mdo")
+EXTERNAL_FORM = (EXTERNAL_PROJECT / "src/ExternalDataProcessors/ВнешняяОбработка"
+                 / "Forms/Форма/Form.form")
+
+EXT_SCOPE = ("Extension", "Расш")
+
+
+def _ids(result: dict) -> set[str]:
+    return {node["id"] for node in result["nodes"]}
+
+
+def _node(result: dict, node_id: str) -> dict:
+    for node in result["nodes"]:
+        if node["id"] == node_id:
+            return node
+    raise AssertionError(f"missing node id {node_id!r}")
+
+
+# --- project kind -------------------------------------------------------------
+
+def test_edt_project_kind_reads_all_three_natures():
+    assert _edt_project_kind(BASE_PROJECT)[0] == EDT_PROJECT_CONFIGURATION
+    assert _edt_project_kind(EXT_PROJECT)[0] == EDT_PROJECT_EXTENSION
+    assert _edt_project_kind(EXTERNAL_PROJECT)[0] == EDT_PROJECT_EXTERNAL_OBJECTS
+
+
+def test_edt_project_name_comes_from_the_project_file():
+    assert _edt_project_kind(EXT_PROJECT)[1] == "Расш"
+
+
+def test_edt_project_kind_is_one_per_project_not_per_file():
+    """The adopted and the native object of one extension share a project kind.
+
+    Reading the kind from the .mdo instead would answer differently for the two:
+    only the adopted one carries the adoption markers.
+    """
+    assert _edt_id_scope(EXT_ADOPTED_MDO.parent) == EXT_SCOPE
+    assert _edt_id_scope(EXT_NATIVE_MDO.parent) == EXT_SCOPE
+
+
+def test_edt_no_project_file_behaves_as_ordinary_configuration():
+    """The fixture configuration tree has no .project — ids must not move."""
+    assert _edt_id_scope(CATALOG_MDO.parent) == ()
+    assert _make_id("Catalog", "Контрагенты") in _ids(extract_edt_mdo(CATALOG_MDO))
+
+
+def test_edt_external_objects_project_is_not_scoped():
+    assert _edt_id_scope(EXTERNAL_MDO.parent) == ()
+
+
+# --- ids: base and extension no longer collapse -------------------------------
+
+def test_edt_extension_object_does_not_collide_with_the_base_object():
+    base = extract_edt_mdo(BASE_CATALOG_MDO)
+    ext = extract_edt_mdo(EXT_ADOPTED_MDO)
+    base_obj = _make_id("Catalog", "Контрагенты")
+    ext_obj = _make_id(*EXT_SCOPE, "Catalog", "Контрагенты")
+    assert base_obj != ext_obj
+    assert base_obj in _ids(base) and ext_obj in _ids(ext)
+    # The only id the two share is the base object the extension adopts, and it
+    # is present in the extension's result as the target of that one edge.
+    assert _ids(base) & _ids(ext) == {base_obj}
+
+
+def test_edt_ordinary_configuration_ids_are_unchanged():
+    """Pinned literals, not values recomputed from the code under test.
+
+    Recomputing would make the assertion true by construction — exactly the way
+    an id shift goes unnoticed.
+    """
+    ids = _ids(extract_edt_mdo(CATALOG_MDO))
+    assert "catalog_контрагенты" in ids
+    assert "catalog_контрагенты_attribute_инн" in ids
+    assert "configuration" in _ids(extract_edt_mdo(CONFIG_MDO))
+
+
+def test_edt_extension_configuration_root_is_scoped():
+    ext_conf = _make_id(*EXT_SCOPE, "Configuration")
+    assert ext_conf in _ids(extract_edt_mdo(EXT_CONFIG_MDO))
+    assert "configuration" in _ids(extract_edt_mdo(BASE_CONFIG_MDO))
+
+
+def test_edt_extension_configuration_registers_its_own_objects_in_scope():
+    r = extract_edt_mdo(EXT_CONFIG_MDO)
+    contains = {e["target"] for e in r["edges"] if e["relation"] == "contains"}
+    assert _make_id(*EXT_SCOPE, "Catalog", "Контрагенты") in contains
+    assert _make_id(*EXT_SCOPE, "Catalog", "Расш_Своя") in contains
+    assert _make_id(*EXT_SCOPE, "Role", "Расш_Роль") in contains
+
+
+def test_edt_extension_registration_without_its_own_mdo_stays_in_the_base(tmp_path):
+    """A registration the project does not back with a .mdo is a base reference.
+
+    The scoped id claims "this project defines it"; the claim is checked against
+    the disk rather than assumed from the registration list.
+    """
+    project = tmp_path / "Расш2"
+    (project / "src" / "Configuration").mkdir(parents=True)
+    (project / ".project").write_text(
+        "<projectDescription><name>Расш2</name><natures>"
+        "<nature>com._1c.g5.v8.dt.core.V8ExtensionNature</nature>"
+        "</natures></projectDescription>", encoding="utf-8")
+    (project / "src" / "Configuration" / "Configuration.mdo").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mdclass:Configuration xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass">'
+        "<name>Расш2</name><catalogs>Catalog.НетТакого</catalogs>"
+        "</mdclass:Configuration>", encoding="utf-8")
+    r = extract_edt_mdo(project / "src" / "Configuration" / "Configuration.mdo")
+    contains = {e["target"] for e in r["edges"] if e["relation"] == "contains"}
+    assert contains == {_make_id("Catalog", "НетТакого")}
+
+
+# --- belonging: an attribute, never a kind ------------------------------------
+
+def test_edt_adopted_object_is_marked_and_keeps_its_kind():
+    node = _node(extract_edt_mdo(EXT_ADOPTED_MDO),
+                 _make_id(*EXT_SCOPE, "Catalog", "Контрагенты"))
+    assert node["object_belonging"] == "Adopted"
+    assert node["label"] == "Extension.Расш.Catalog.Контрагенты"
+
+
+def test_edt_native_extension_object_is_marked_native():
+    node = _node(extract_edt_mdo(EXT_NATIVE_MDO),
+                 _make_id(*EXT_SCOPE, "Catalog", "Расш_Своя"))
+    assert node["object_belonging"] == "Native"
+
+
+def test_edt_ordinary_configuration_object_carries_no_belonging():
+    assert "object_belonging" not in _node(extract_edt_mdo(BASE_CATALOG_MDO),
+                                           _make_id("Catalog", "Контрагенты"))
+
+
+def test_edt_adoption_introduces_no_pseudo_kind():
+    """`Catalog` stays `Catalog`: the kind set must not grow for adopted objects."""
+    assert not [k for k in _EDT_KIND_PREFIXES
+                if k.startswith("Adopted") or k.startswith("Native")]
+    for result in (extract_edt_mdo(EXT_ADOPTED_MDO), extract_edt_mdo(EXT_NATIVE_MDO)):
+        for node_id in _ids(result):
+            assert "adopted" not in node_id and "native" not in node_id
+
+
+# --- the adopted -> base link -------------------------------------------------
+
+def test_edt_adopted_object_references_the_base_object():
+    r = extract_edt_mdo(EXT_ADOPTED_MDO)
+    assert (_make_id(*EXT_SCOPE, "Catalog", "Контрагенты"),
+            _make_id("Catalog", "Контрагенты")) in {
+        (e["source"], e["target"]) for e in r["edges"]
+        if e["relation"] == "references" and e.get("context") == "adopted-from"}
+
+
+def test_edt_adopted_object_links_without_the_base_project():
+    """Extraction of the extension alone still yields the link, via a stub."""
+    r = extract_edt_mdo(EXT_ADOPTED_MDO)
+    assert _node(r, _make_id("Catalog", "Контрагенты"))["label"] == "Catalog.Контрагенты"
+
+
+def test_edt_native_object_has_no_adoption_link():
+    r = extract_edt_mdo(EXT_NATIVE_MDO)
+    assert not [e for e in r["edges"] if e.get("context") == "adopted-from"]
+
+
+# --- scope boundary: values keep base ids -------------------------------------
+
+def test_edt_extension_rights_secure_base_objects():
+    """The role is the extension's; the objects it secures are the base's.
+
+    Measured on a real workspace: one extension role secures 4 613 objects of the
+    configuration it extends. Scoping those would invent 4 613 objects.
+    """
+    r = extract_edt_rights(EXT_RIGHTS)
+    assert [(e["source"], e["target"]) for e in r["edges"]] == [
+        (_make_id(*EXT_SCOPE, "Role", "Расш_Роль"),
+         _make_id("Catalog", "Контрагенты"))]
+
+
+# --- external-objects projects ------------------------------------------------
+
+def test_edt_external_object_kinds_are_recognised():
+    assert {"ExternalDataProcessor", "ExternalReport"} <= _EDT_KIND_PREFIXES
+    assert _EDT_PLURAL_TO_KIND["ExternalDataProcessors"] == "ExternalDataProcessor"
+    assert _EDT_PLURAL_TO_KIND["ExternalReports"] == "ExternalReport"
+
+
+def test_edt_external_processor_owns_its_form_and_module():
+    r = extract_edt_mdo(EXTERNAL_MDO)
+    obj = _make_id("ExternalDataProcessor", "ВнешняяОбработка")
+    form = _make_id("ExternalDataProcessor", "ВнешняяОбработка", "Form", "Форма")
+    assert (obj, form) in {(e["source"], e["target"]) for e in r["edges"]
+                           if e["relation"] == "contains"}
+    defines = {e["target"] for e in r["edges"] if e["relation"] == "defines"}
+    assert any(t.endswith("objectmodule_bsl") for t in defines)
+
+
+def test_edt_external_processor_form_content_is_extracted():
+    """Without the folder in the map this file resolved no owner and was dropped."""
+    r = extract_edt_form(EXTERNAL_FORM)
+    form = _make_id("ExternalDataProcessor", "ВнешняяОбработка", "Form", "Форма")
+    assert form in _ids(r)
+    assert _make_id("Catalog", "Контрагенты") in _ids(r)
+
+
+def test_edt_external_objects_project_needs_no_configuration_root():
+    """No Configuration.mdo exists here by construction, and that is not an error."""
+    assert not (EXTERNAL_PROJECT / "src" / "Configuration").exists()
+    assert "error" not in extract_edt_mdo(EXTERNAL_MDO)
+    assert "error" not in extract_edt_form(EXTERNAL_FORM)
 
 
 # ── Header/impl class merge + .h routing (#1547 C++, #1556 ObjC/Swift) ─────────

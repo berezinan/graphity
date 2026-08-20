@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Configuration xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"
+                       uuid="a0000000-0000-4000-8000-000000000001">
+  <name>БазоваяКонфигурация</name>
+  <catalogs>Catalog.Контрагенты</catalogs>
+</mdclass:Configuration>

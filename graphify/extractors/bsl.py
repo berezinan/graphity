@@ -304,6 +304,14 @@ _EDT_KIND_PREFIXES: frozenset[str] = frozenset({
     "DocumentJournal", "DocumentNumerator", "CommandGroup", "SettingsStorage",
     "StyleItem", "Style", "PaletteColor", "ExternalDataSource", "WSReference",
     "Bot", "IntegrationService", "WebSocketClient",
+    # Kinds that only ever occur in an external-objects project (skill §12): the
+    # object is the project. The object's own node never needed this set — the
+    # root tag IS the kind — so the two entries buy exactly one thing: an FQN
+    # naming such an object parses instead of being discarded as an unknown kind.
+    # No value in either audited configuration names one today; the set is the
+    # place where "is this a kind" is answered, and answering "no" here would be
+    # wrong.
+    "ExternalDataProcessor", "ExternalReport",
 })
 
 # Manager-collection identifiers (RU + EN) -> English kind prefix. A BSL access
@@ -565,6 +573,18 @@ _EDT_PLURAL_TO_KIND: dict[str, str] = {
     "PaletteColors": "PaletteColor", "Languages": "Language",
     "Bots": "Bot", "IntegrationServices": "IntegrationService",
     "WebSocketClients": "WebSocketClient",
+    # An external-objects project has no Configuration.mdo, so these two folders
+    # are the only thing that says what lives under them. Without them a
+    # Form.form or a .dcs inside such a project resolves no owner and its whole
+    # content is dropped — measured: 22 forms, 747 KiB, zero nodes.
+    "ExternalDataProcessors": "ExternalDataProcessor",
+    "ExternalReports": "ExternalReport",
+}
+
+# Reverse of the map above: singular kind -> on-disk plural folder. Derived
+# rather than spelled out a second time, so the two cannot drift apart.
+_EDT_KIND_TO_PLURAL: dict[str, str] = {
+    kind: plural for plural, kind in _EDT_PLURAL_TO_KIND.items()
 }
 
 # Common (owner-less) plural folders -> singular kind, for path-based owner
@@ -667,6 +687,126 @@ def _edt_nested_owner_chain(path: Path) -> list[str] | None:
     return [kind, dirs[i + 1]] + chain
 
 
+# ── 1C:EDT project kinds ──────────────────────────────────────────────────────
+#
+# An EDT workspace holds three kinds of project side by side, and the `.project`
+# file is the only place that says which is which (skill: edt-structures §1,
+# §4.23, §12). Everything below reads it once per project and caches the answer.
+#
+# The kind matters for one reason: a configuration extension re-declares objects
+# of the configuration it extends, under THE SAME kind and THE SAME name. Its
+# `Catalog.Контрагенты` is a different thing from the base `Catalog.Контрагенты`,
+# and a name-based id cannot tell them apart on its own. Measured on one real
+# workspace: 148 of 212 ids of the `Volkova` extension (70%) already exist in the
+# base configuration's snapshot, the `Configuration` root among them.
+
+EDT_PROJECT_CONFIGURATION = "configuration"
+EDT_PROJECT_EXTENSION = "extension"
+EDT_PROJECT_EXTERNAL_OBJECTS = "external-objects"
+
+# `<nature>` values, minus the `com._1c.g5.v8.dt.core.` package prefix.
+_EDT_NATURE_TO_PROJECT_KIND: dict[str, str] = {
+    "V8ConfigurationNature": EDT_PROJECT_CONFIGURATION,
+    "V8ExtensionNature": EDT_PROJECT_EXTENSION,
+    "V8ExternalObjectsNature": EDT_PROJECT_EXTERNAL_OBJECTS,
+}
+
+# Leading id part for objects an extension defines. A word, not a punctuation
+# marker, so the id keeps reading as an FQN: `Extension.Volkova.Catalog.X`.
+_EDT_EXTENSION_SCOPE_KIND = "Extension"
+
+
+@lru_cache(maxsize=256)
+def _edt_project_kind(project_dir: Path) -> tuple[str, str]:
+    """`(project kind, project name)` for the EDT project rooted at `project_dir`.
+
+    An unreadable, unparseable or nature-less `.project` yields the ordinary
+    configuration kind: the fallback has to be the behaviour that predates this
+    reader, or extracting a subdirectory would silently change every id in it.
+    """
+    project_file = project_dir / ".project"
+    try:
+        src = project_file.read_bytes()
+    except OSError:
+        return EDT_PROJECT_CONFIGURATION, project_dir.name
+    if len(src) > _PROJECT_XML_MAX_BYTES or not _project_xml_is_safe(src):
+        return EDT_PROJECT_CONFIGURATION, project_dir.name
+
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(src)
+    except ET.ParseError:
+        return EDT_PROJECT_CONFIGURATION, project_dir.name
+
+    kind = EDT_PROJECT_CONFIGURATION
+    for elem in root.iter():
+        if _edt_localname(elem.tag) != "nature" or not elem.text:
+            continue
+        found = _EDT_NATURE_TO_PROJECT_KIND.get(elem.text.strip().rsplit(".", 1)[-1])
+        if found:
+            kind = found
+            break
+    return kind, (_edt_child_text(root, "name") or project_dir.name)
+
+
+@lru_cache(maxsize=2048)
+def _edt_project_dir(directory: Path) -> Path | None:
+    """Nearest ancestor of `directory` (itself included) that holds a `.project`.
+
+    None when there is none — a fixture tree, or a metadata folder extracted on
+    its own. Callers then keep the ordinary-configuration behaviour.
+    """
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".project").is_file():
+            return candidate
+    return None
+
+
+def _edt_id_scope(directory: Path) -> tuple[str, ...]:
+    """Leading id parts that scope objects of `directory` to their project.
+
+    Empty for an ordinary configuration and for an external-objects project —
+    their ids are unchanged by this reader. `("Extension", <name>)` inside a
+    configuration extension.
+
+    Cached through :func:`_edt_project_dir` per directory rather than per file:
+    every file of one metadata object shares a directory, and the walk up to
+    `.project` is the expensive part.
+    """
+    project_dir = _edt_project_dir(directory)
+    if project_dir is None:
+        return ()
+    kind, name = _edt_project_kind(project_dir)
+    if kind == EDT_PROJECT_EXTENSION and name:
+        return (_EDT_EXTENSION_SCOPE_KIND, name)
+    return ()
+
+
+def _edt_scope_of(path: Path) -> tuple[str, ...]:
+    """Id scope for the artifact at `path` (see :func:`_edt_id_scope`)."""
+    return _edt_id_scope(path.parent)
+
+
+def _edt_scoped_label(scope: tuple[str, ...], fqn: str) -> str:
+    """Human label for a scoped id: `Extension.Volkova.Catalog.X`."""
+    return ".".join([*scope, fqn]) if scope else fqn
+
+
+def _edt_defines_object(project_dir: Path, kind: str, name: str) -> bool:
+    """True when the project itself carries the `.mdo` of `Kind.Name`.
+
+    The one place a scoped id is built from a value rather than from a root tag
+    is the registration list of an extension's own `Configuration.mdo`. Measured,
+    that list holds exactly the extension's own objects (50 of 50 in `Volkova`,
+    19 of 19 in `Управление_нашей_фирмой.MCP`) — but "measured" is not "always",
+    so the claim is checked against the disk instead of assumed.
+    """
+    plural = _EDT_KIND_TO_PLURAL.get(kind)
+    if not plural:
+        return False
+    return (project_dir / "src" / plural / name / f"{name}.mdo").is_file()
+
+
 def extract_edt_mdo(path: Path) -> dict:
     """Extract a 1C:EDT metadata object (or the configuration root) from a .mdo file.
 
@@ -699,7 +839,8 @@ def extract_edt_mdo(path: Path) -> dict:
     seen_edges: set[tuple[str, str, str]] = set()
 
     def add_node(nid: str, label: str, file_type: str = "code",
-                 uuid: str | None = None, predefined_id: str | None = None) -> None:
+                 uuid: str | None = None, predefined_id: str | None = None,
+                 object_belonging: str | None = None) -> None:
         if nid and nid not in seen_ids:
             seen_ids.add(nid)
             node = {"id": nid, "label": label, "file_type": file_type,
@@ -715,6 +856,13 @@ def extract_edt_mdo(path: Path) -> dict:
             # the two stay tellable apart.
             if predefined_id:
                 node["predefined_id"] = predefined_id
+            # Whether an extension re-declares an object of the configuration it
+            # extends (`Adopted`) or introduces one of its own (`Native`). A
+            # property, not a kind: `Catalog` stays `Catalog`, and the question
+            # "what did the extension add" becomes a filter on this attribute
+            # instead of being unaskable.
+            if object_belonging:
+                node["object_belonging"] = object_belonging
             nodes.append(node)
 
     def add_edge(src_id: str, tgt_id: str, relation: str) -> None:
@@ -787,19 +935,41 @@ def extract_edt_mdo(path: Path) -> dict:
         return None
 
     kind = _edt_localname(root.tag)
+    # Objects of a configuration extension carry the extension in their id;
+    # everything else is unscoped and unchanged (design.md, Decision 6).
+    scope = _edt_scope_of(path)
+    # `<objectBelonging>Adopted</objectBelonging>` on the root, paired with the
+    # `extendedConfigurationObject` attribute, is how an extension marks an
+    # object it took over from the configuration it extends.
+    belonging = None
+    if scope:
+        belonging = "Adopted" if child_text(root, "objectBelonging") == "Adopted" else "Native"
 
     # ── Configuration root: register every contained child object ──────────────
     if kind == "Configuration":
-        conf_id = _make_id("Configuration")
+        conf_id = _make_id(*scope, "Configuration")
         add_node(conf_id, child_text(root, "name") or "Configuration", "concept",
-                 uuid=root.get("uuid"))
+                 uuid=root.get("uuid"), object_belonging=belonging)
+        # An extension's own root is adopted from the configuration it extends,
+        # and that is the one relation the file states about it.
+        if belonging == "Adopted":
+            base_conf_id = _make_id("Configuration")
+            add_node(base_conf_id, "Configuration", "concept")
+            add_ref_edge(conf_id, base_conf_id, "adopted-from")
+        project_dir = _edt_project_dir(path.parent) if scope else None
         for child in root:
             text = (child.text or "").strip()
             m = _EDT_FQN_RE.match(text)
             if not m or m.group(1) not in _EDT_KIND_PREFIXES:
                 continue
-            obj_id = _make_id(m.group(1), m.group(2))
-            add_node(obj_id, text)
+            # The registration names an object of THIS project only when the
+            # project carries its .mdo; otherwise it is a reference to the base
+            # configuration and keeps the unscoped id.
+            reg_scope = scope if (project_dir is not None
+                                  and _edt_defines_object(project_dir, m.group(1),
+                                                          m.group(2))) else ()
+            obj_id = _make_id(*reg_scope, m.group(1), m.group(2))
+            add_node(obj_id, _edt_scoped_label(reg_scope, text))
             add_edge(conf_id, obj_id, "contains")
         # The five configuration modules sit beside Configuration.mdo. Linked
         # here rather than by moving the early return: the return exists so a
@@ -817,9 +987,9 @@ def extract_edt_mdo(path: Path) -> dict:
     if not name:
         return {"nodes": nodes, "edges": edges}
 
-    obj_id = _make_id(kind, name)
-    obj_label = f"{kind}.{name}"
-    id_parts: list[str] = [kind, name]
+    obj_id = _make_id(*scope, kind, name)
+    obj_label = _edt_scoped_label(scope, f"{kind}.{name}")
+    id_parts: list[str] = [*scope, kind, name]
     parent_id: str | None = None
     sub_chain: list[str] = []
     if kind == "Subsystem":
@@ -827,8 +997,8 @@ def extract_edt_mdo(path: Path) -> dict:
         # Only nested subsystems (chain length > 1) change id; top-level keeps the
         # bare `Subsystem.Name` id so existing references/merge are untouched.
         if len(sub_chain) > 1 and sub_chain[-1] == name:
-            obj_id = _make_id(kind, *sub_chain)
-            obj_label = f"{kind}." + ".".join(sub_chain)
+            obj_id = _make_id(*scope, kind, *sub_chain)
+            obj_label = _edt_scoped_label(scope, f"{kind}." + ".".join(sub_chain))
     else:
         # Heterogeneous nesting. The root tag of a nested standalone .mdo IS the
         # SubKind, so the flat `_make_id(kind, name)` above both invents a kind
@@ -837,11 +1007,19 @@ def extract_edt_mdo(path: Path) -> dict:
         # keeps the flat id rather than getting an invented FQN.
         chain = _edt_nested_owner_chain(path)
         if chain and chain[-2] == kind and chain[-1] == name:
-            id_parts = chain
-            obj_id = _make_id(*chain)
-            obj_label = ".".join(chain)
-            parent_id = _make_id(*chain[:-2])
-    add_node(obj_id, obj_label, uuid=root.get("uuid"))
+            id_parts = [*scope, *chain]
+            obj_id = _make_id(*id_parts)
+            obj_label = _edt_scoped_label(scope, ".".join(chain))
+            parent_id = _make_id(*scope, *chain[:-2])
+    add_node(obj_id, obj_label, uuid=root.get("uuid"), object_belonging=belonging)
+    # An adopted object IS the base object, seen from inside the extension. The
+    # link is by kind and name, not by the `extendedConfigurationObject` uuid:
+    # resolving that uuid needs an index of the base project, which may not be
+    # in the graph at all (design.md, Decision 4).
+    if belonging == "Adopted":
+        base_id = _make_id(kind, name)
+        add_node(base_id, f"{kind}.{name}")
+        add_ref_edge(obj_id, base_id, "adopted-from")
     if parent_id:
         # ExternalDataSource children are registered by folder only — the parent
         # .mdo carries no inline block to emit this edge from (skill §4.21), so it
@@ -1003,8 +1181,9 @@ def extract_edt_mdo(path: Path) -> dict:
                 # Child registered by bare name; its id is the full parent chain +
                 # child, matching what the child's own .mdo emits, so they merge.
                 child_chain = base_chain + [text]
-                child_sid = _make_id("Subsystem", *child_chain)
-                add_node(child_sid, "Subsystem." + ".".join(child_chain))
+                child_sid = _make_id(*scope, "Subsystem", *child_chain)
+                add_node(child_sid,
+                         _edt_scoped_label(scope, "Subsystem." + ".".join(child_chain)))
                 add_edge(obj_id, child_sid, "contains")
 
     # Object-level modules sitting beside the .mdo.
@@ -1366,8 +1545,13 @@ def extract_edt_rights(path: Path) -> dict:
                           "source_file": str_path, "source_location": "L1"})
 
     role_name = path.parent.name
-    role_id = _make_id("Role", role_name)
-    add_node(role_id, f"Role.{role_name}")
+    # The role is defined by this project; the objects it secures below are not
+    # — they are values naming objects of the base configuration, and they keep
+    # unscoped ids (design.md, Decision 6). Measured: one extension's single role
+    # secures 4 613 objects of the configuration it extends.
+    scope = _edt_scope_of(path)
+    role_id = _make_id(*scope, "Role", role_name)
+    add_node(role_id, _edt_scoped_label(scope, f"Role.{role_name}"))
 
     for obj in root.iter():
         if _edt_localname(obj.tag) != "object":
@@ -1401,16 +1585,17 @@ def _edt_form_owner_id(path: Path) -> str | None:
     Common form:  `.../CommonForms/<Name>/Form.form` -> `_make_id("CommonForm", <Name>)`.
     """
     parts = path.parts
+    scope = _edt_scope_of(path)
     if "Forms" in parts:
         i = parts.index("Forms")
         if 0 < i - 1 and i + 1 < len(parts):
             kind = _EDT_PLURAL_TO_KIND.get(parts[i - 2])
             if kind:
-                return _make_id(kind, parts[i - 1], "Form", parts[i + 1])
+                return _make_id(*scope, kind, parts[i - 1], "Form", parts[i + 1])
     elif "CommonForms" in parts:
         j = parts.index("CommonForms")
         if j + 1 < len(parts):
-            return _make_id("CommonForm", parts[j + 1])
+            return _make_id(*scope, "CommonForm", parts[j + 1])
     return None
 
 
@@ -1566,10 +1751,12 @@ def _edt_owner_id_from_path(path: Path) -> tuple[str, str] | None:
     (`CommonTemplates/<Name>`) — and returns `(node_id, "Kind.Name")`.
     """
     parts = path.parts
+    scope = _edt_scope_of(path)
     for i, seg in enumerate(parts[:-1]):
         kind = _EDT_COMMON_FOLDER_TO_KIND.get(seg) or _EDT_PLURAL_TO_KIND.get(seg)
         if kind:
-            return _make_id(kind, parts[i + 1]), f"{kind}.{parts[i + 1]}"
+            return (_make_id(*scope, kind, parts[i + 1]),
+                    _edt_scoped_label(scope, f"{kind}.{parts[i + 1]}"))
     return None
 
 
@@ -1583,11 +1770,14 @@ def _edt_owner_id_from_path(path: Path) -> tuple[str, str] | None:
 
 def _edt_cmi_owner(path: Path) -> tuple[str, str] | None:
     """`(node id, label)` of the configuration or subsystem the file belongs to."""
+    scope = _edt_scope_of(path)
     chain = _edt_subsystem_chain(path)
     if chain:
-        return _make_id("Subsystem", *chain), "Subsystem." + ".".join(chain)
+        return (_make_id(*scope, "Subsystem", *chain),
+                _edt_scoped_label(scope, "Subsystem." + ".".join(chain)))
     if "Configuration" in path.parts:
-        return _make_id("Configuration"), "Configuration"
+        return (_make_id(*scope, "Configuration"),
+                _edt_scoped_label(scope, "Configuration"))
     return None
 
 
