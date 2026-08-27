@@ -468,3 +468,177 @@ def test_current_schema_database_syncs_normally(tmp_path_factory):
             arc._server("drop database graphify_newschema_test")
         except Exception:
             pass
+
+
+def _make_unattributed_graph() -> nx.DiGraph:
+    """A graph carrying both spellings of "this node belongs to no file".
+
+    The semantic extractor emits concept/shared-symbol nodes with no source of
+    their own: `source_file` is either the empty string or absent entirely. Both
+    appear in the same real graph, so a fixture with only one of them lets half
+    the defect through.
+    """
+    G = _make_digraph()
+    G.add_node("c1", label="Exception", source_file="", source_location="", community=0)
+    G.add_node("c2", label="TestCase", source_location="", community=0)  # no source_file at all
+    G.add_edge("n1", "c1", relation="uses", confidence="INFERRED")
+    G.add_edge("c2", "n2", relation="uses", confidence="INFERRED")
+    return G
+
+
+def test_sync_graph_inserts_nodes_that_belong_to_no_file(tmp_path_factory):
+    """A node with no source_file must arrive through an incremental sync.
+
+    File dirtiness cannot express such a node: the dirty-source DELETE does not
+    remove it and the changed-source INSERT does not add it, so before this it
+    could only ever reach the DB through a full load. Measured on a real corpus,
+    that was 23.2% of the nodes and every edge with such an endpoint after it.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_unattributed_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g1 = _make_digraph()
+    p = tmp_path_factory.mktemp("unattr") / "g1.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g1, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        g2 = _make_unattributed_graph()
+        g2.nodes["n1"]["label"] = "extractor"
+        st = arc.sync_graph(g2, changed_sources={"extract.py"}, pruned_sources=set())
+
+        assert st["missing_nodes"] == 0, "nodes without a source_file must arrive"
+        assert st["missing_edges"] == 0, "and the edges that end on them with them"
+        assert shortfall_warning(st) is None
+        # both spellings, not just the empty string
+        assert arc.get_node("Exception") is not None
+        assert arc.get_node("TestCase") is not None
+        # the edge whose only unresolved end was such a node exists now
+        jb = JsonBackend(g2)
+        assert {n.label for n in jb.query("Exception", depth=2).nodes} == \
+               {n.label for n in arc.query("Exception", depth=2).nodes}
+    finally:
+        try:
+            arc._server("drop database graphify_unattributed_test")
+        except Exception:
+            pass
+
+
+def test_sync_graph_removes_a_fileless_node_the_graph_dropped(tmp_path_factory):
+    """The other direction: such a node must leave when the graph loses it.
+
+    Until now the incremental path could not delete one either, so a concept that
+    disappeared stayed in the database forever. Deleting is the risky half of the
+    fix - it is the first time this path can remove a node no file names - so the
+    edges incident to it are asserted gone too, not just the node.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_unattributed_drop_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g1 = _make_unattributed_graph()
+    p = tmp_path_factory.mktemp("unattrdrop") / "g1.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g1, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        assert arc.get_node("Exception") is not None, "precondition: it was loaded"
+        g2 = _make_unattributed_graph()
+        g2.remove_node("c1")
+        st = arc.sync_graph(g2, changed_sources={"extract.py"}, pruned_sources=set())
+
+        assert arc.get_node("Exception") is None
+        assert st["missing_nodes"] == 0 and st["missing_edges"] == 0, \
+            "the DB must equal the graph, neither short nor over"
+        assert render_stats(arc.graph_stats()) == render_stats(JsonBackend(g2).graph_stats())
+    finally:
+        try:
+            arc._server("drop database graphify_unattributed_drop_test")
+        except Exception:
+            pass
+
+
+def test_sync_reconciles_fileless_nodes_with_no_dirty_file(tmp_path_factory):
+    """No file changed is not the same as nothing to do.
+
+    The early return on an empty dirty set predates fileless nodes; with them a
+    sync still has a set to reconcile, and returning early leaves the shortfall
+    in place while reporting a clean run.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_unattributed_nodirty_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g1 = _make_digraph()
+    p = tmp_path_factory.mktemp("unattrnodirty") / "g1.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g1, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        g2 = _make_unattributed_graph()
+        st = arc.sync_graph(g2, changed_sources=set(), pruned_sources=set())
+        assert arc.get_node("Exception") is not None
+        assert st.get("missing_nodes") == 0 and st.get("missing_edges") == 0
+    finally:
+        try:
+            arc._server("drop database graphify_unattributed_nodirty_test")
+        except Exception:
+            pass
+
+
+def test_recorded_shortfall_survives_and_clears(tmp_path_factory):
+    """A short load must be remembered, and a clean one must forget it.
+
+    The gate that used to decide "patch or reload" was non-emptiness, which a
+    database missing most of its nodes still satisfies - so the hole was patched
+    around, run after run. Remembering the reconciliation closes that; forgetting
+    it again matters just as much, or one shortfall condemns the project to a
+    full load forever.
+    """
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_shortfall_flag_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g = _make_digraph()
+    p = tmp_path_factory.mktemp("shortflag") / "g.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        assert arc.has_recorded_shortfall() is False, "a load that added up records nothing"
+
+        arc.record_reconciliation({"missing_nodes": 15229, "missing_edges": 33391})
+        assert arc.has_recorded_shortfall() is True
+
+        # a reconciliation that could not run at all counts as a shortfall too
+        arc.record_reconciliation({"reconciled": False})
+        assert arc.has_recorded_shortfall() is True
+
+        arc.record_reconciliation({"missing_nodes": 0, "missing_edges": 0})
+        assert arc.has_recorded_shortfall() is False, "the marker must not stick"
+
+        # and a real sync clears it the same way
+        arc.record_reconciliation({"missing_nodes": 1, "missing_edges": 0})
+        arc.sync_graph(_make_digraph(), changed_sources={"extract.py"}, pruned_sources=set())
+        assert arc.has_recorded_shortfall() is False
+    finally:
+        try:
+            arc._server("drop database graphify_shortfall_flag_test")
+        except Exception:
+            pass
+
+
+def test_shortfall_warning_names_the_right_cause():
+    """Missing nodes and an index miss wear the same symptom but want opposite fixes."""
+    absent = shortfall_warning({"expected_nodes": 65397, "expected_edges": 130523,
+                                "missing_nodes": 15229, "missing_edges": 33391,
+                                "unresolved_endpoint_edges": 33392})
+    assert "not in the database" in absent
+    assert "index" not in absent, "naming the index sends the reader to the wrong defect"
+
+    index_miss = shortfall_warning({"expected_nodes": 4, "expected_edges": 4,
+                                    "missing_nodes": 0, "missing_edges": 1,
+                                    "unresolved_endpoint_edges": 1})
+    assert "index does not find" in index_miss
+    assert "node count matches" in index_miss

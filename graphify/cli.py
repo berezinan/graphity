@@ -3363,7 +3363,9 @@ def dispatch_command(cmd: str) -> None:
         if _db_cfg["kind"] == "arcadedb":
             _db = require_backend(config=_db_cfg, require_database=False)
             _db.ensure_database()
-            if incremental_mode and _db.is_populated():
+            # Non-emptiness alone is not enough: a database whose last
+            # reconciliation came up short must be reloaded, not patched again.
+            if incremental_mode and _db.is_populated() and not _db.has_recorded_shortfall():
                 from graphify.build import _norm_source_file
                 _root = str(target.resolve())
                 _changed = {

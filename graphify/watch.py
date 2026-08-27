@@ -1305,7 +1305,10 @@ def _rebuild_code(
             if _cfg["kind"] == "arcadedb":
                 _db = require_backend(config=_cfg, require_database=False)
                 _db.ensure_database()
-                if changed_paths is not None and _db.is_populated():
+                # Same gate as the CLI build path: a database that reconciled
+                # short is repaired by a full load, not patched again.
+                if (changed_paths is not None and _db.is_populated()
+                        and not _db.has_recorded_shortfall()):
                     _changed = {_nsf(str(p), str(project_root)) for p in extract_targets}
                     _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=set(deleted_paths))
                     print(f"[graphify db] synced ArcadeDB '{_cfg['database']}' "

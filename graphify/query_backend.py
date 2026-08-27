@@ -555,8 +555,18 @@ def shortfall_warning(stats: dict) -> str | None:
     msg = "ArcadeDB load incomplete: " + " and ".join(parts) + " did not arrive"
     unresolved = stats.get("unresolved_endpoint_edges")
     if missing_e and unresolved:
-        msg += (f"; {unresolved} of the missing edges had an endpoint that does not "
-                f"resolve through the index")
+        # Two different causes wear the same symptom and want opposite actions:
+        # a node that is not in the database at all (fix the load), and a node
+        # that is there but the index does not find (rebuild/upgrade the DB - the
+        # ArcadeDB string-index defect). Naming the index while nodes are simply
+        # missing sends the reader to the wrong one, which is how a sync that
+        # could not insert 15k nodes read as an index problem.
+        if missing_n:
+            msg += (f"; {unresolved} of the missing edges name an endpoint that is "
+                    f"not in the database")
+        else:
+            msg += (f"; {unresolved} of the missing edges had an endpoint the index "
+                    f"does not find although the node count matches")
     return msg
 
 
@@ -665,6 +675,46 @@ class ArcadeDBBackend(GraphBackend):
         (i.e. an incremental sync is possible rather than a first full load)."""
         try:
             return bool(self._run("SELECT count(*) AS c FROM Node")[0]["c"])
+        except Exception:
+            return False
+
+    _SHORTFALL_KEY = "sync_shortfall"
+
+    def record_reconciliation(self, stats: dict) -> None:
+        """Remember whether the last load left this database short of the graph.
+
+        `is_populated` answers "is there anything here", but the caller is really
+        asking "can this database be trusted as complete enough to patch". A
+        database that lost most of its nodes still answers yes to the first, so
+        every following run patches the newly-changed files and steps over the
+        hole again - the same shape as the old-schema case, where the way out was
+        also a marker the run could not derive from non-emptiness alone.
+
+        Not swallowed: if the outcome cannot be written, the next run would
+        silently take the incremental path into a database known to be short,
+        which is the defect this exists to close.
+        """
+        import json
+        short = bool(stats.get("missing_nodes") or stats.get("missing_edges")
+                     or stats.get("reconciled") is False)
+        self._run("DELETE FROM Meta WHERE key = :k", params={"k": self._SHORTFALL_KEY})
+        if short:
+            self._run("INSERT INTO Meta CONTENT " + json.dumps(
+                {"key": self._SHORTFALL_KEY,
+                 "value": {"missing_nodes": stats.get("missing_nodes", 0),
+                           "missing_edges": stats.get("missing_edges", 0)}},
+                ensure_ascii=False))
+
+    def has_recorded_shortfall(self) -> bool:
+        """Whether the last reconciliation of this database reported a shortfall.
+
+        Unreadable counts as no shortfall: this gate decides between patching and
+        a full reload, and a database that cannot answer is one a full reload is
+        about to overwrite anyway.
+        """
+        try:
+            return bool(self._run("SELECT value FROM Meta WHERE key = :k LIMIT 1",
+                                  params={"k": self._SHORTFALL_KEY}))
         except Exception:
             return False
 
@@ -842,9 +892,56 @@ class ArcadeDBBackend(GraphBackend):
             self._run(";".join(stmts), language="sqlscript")
 
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
-        return self._reconcile(len(nodes), len(edges),
-                               node_ids=[n["id"] for n in nodes],
-                               edges=[(e["source"], e["target"]) for e in edges])
+        stats = self._reconcile(len(nodes), len(edges),
+                                node_ids=[n["id"] for n in nodes],
+                                edges=[(e["source"], e["target"]) for e in edges])
+        self.record_reconciliation(stats)
+        return stats
+
+    def _absent_ids(self, ids, *, batch=2000) -> list[str]:
+        """Which of ``ids`` the database does not hold, asked by index key.
+
+        By ``id_key`` and not by ``id``: the unique index is over the derived
+        ASCII key, and a lookup by the raw id is the one this backend must never
+        make (see `_id_key`).
+        """
+        out: list[str] = []
+        for i in range(0, len(ids), batch):
+            chunk = ids[i:i + batch]
+            found = {r["id_key"] for r in self._run(
+                "SELECT id_key FROM Node WHERE id_key IN :k",
+                params={"k": [_id_key(x) for x in chunk]})}
+            out.extend(x for x in chunk if _id_key(x) not in found)
+        return out
+
+    def _scan_fileless_ids(self, *, batch=2000) -> list[str]:
+        """Every id in the database whose node carries no source_file.
+
+        Both spellings, because both occur: the property is absent when the node
+        never had a source (the loader only writes keys the node actually has)
+        and empty when it had an empty one. A predicate covering one of them
+        finds half the set.
+
+        Paged rather than fetched in one call: the HTTP API caps a result set,
+        and a truncated page would read here as "the graph no longer has these" -
+        the one reading that deletes data.
+        """
+        out: list[str] = []
+        skip = 0
+        while True:
+            rows = self._run(
+                "SELECT id FROM Node WHERE source_file IS NULL OR source_file = '' "
+                f"SKIP {skip} LIMIT {batch}")
+            if not rows:
+                return out
+            out.extend(r["id"] for r in rows if r.get("id") is not None)
+            skip += len(rows)
+
+    def _delete_by_ids(self, ids, *, batch=2000) -> None:
+        """Drop the named vertices (and, by cascade, their edges)."""
+        for i in range(0, len(ids), batch):
+            self._run("DELETE VERTEX FROM Node WHERE id_key IN :ids",
+                      params={"ids": [_id_key(n) for n in ids[i:i + batch]]})
 
     def sync_graph(self, G, *, changed_sources, pruned_sources, batch=2000) -> dict:
         """Incrementally sync the DB to the updated graph ``G``.
@@ -873,13 +970,34 @@ class ArcadeDBBackend(GraphBackend):
         changed = {s for s in changed_sources if s}
         pruned = {s for s in pruned_sources if s}
         dirty = changed | pruned
-        if not dirty:
+
+        # A node carrying no source_file belongs to no file, so file dirtiness
+        # cannot express it: the dirty-source DELETE below never removes it and
+        # the changed-source INSERT never adds it. Left to that path it can only
+        # ever reach the DB through a full load, and an incremental sync stays
+        # short by however many of them the graph holds - 15 153 of 65 397 nodes
+        # (23.2%) on a measured semantic corpus, and 33 392 edges after them,
+        # because CREATE EDGE over an empty endpoint subquery is a silent no-op.
+        # Reconcile that set directly, in both directions.
+        fileless = [n for n, d in G.nodes(data=True) if not d.get("source_file")]
+        absent = self._absent_ids(fileless, batch=batch)
+        stale = [n for n in self._scan_fileless_ids(batch=batch) if n not in G]
+        # An empty dirty set no longer means "nothing to do": a fileless node may
+        # have appeared or vanished without any file changing.
+        if not (dirty or absent or stale):
             return {"deleted_sources": 0, "upserted_nodes": 0, "upserted_edges": 0}
 
-        self._run("DELETE VERTEX FROM Node WHERE source_file IN :d", params={"d": list(dirty)})
+        if dirty:
+            self._run("DELETE VERTEX FROM Node WHERE source_file IN :d", params={"d": list(dirty)})
+        self._delete_by_ids(stale, batch=batch)
 
         degree = dict(G.degree())
+        # `absent` rides with the changed ids from here on: it needs the same
+        # INSERT and, above all, the same edge rebuild - an inserted node whose
+        # edges are not recreated is exactly the endpoint that made CREATE EDGE
+        # do nothing.
         changed_ids = [n for n, d in G.nodes(data=True) if d.get("source_file") in changed]
+        changed_ids += absent
         changed_set = set(changed_ids)
         # A node id is global to the project, but the dirty-source DELETE above only
         # removes nodes whose stored source_file is dirty. A shared node whose
@@ -941,6 +1059,7 @@ class ArcadeDBBackend(GraphBackend):
             G.number_of_nodes(), G.number_of_edges(),
             node_ids=list(G.nodes()),
             edges=[(d.get("_src") or u, d.get("_tgt") or v) for u, v, d in G.edges(data=True)]))
+        self.record_reconciliation(stats)
         return stats
 
     # ---- scoring / seed resolution (exact parity via shared kernel) ---------
