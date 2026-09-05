@@ -1,5 +1,6 @@
 """Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, Fortran, JS/TS, .NET project files, XAML."""
 from __future__ import annotations
+import os
 from pathlib import Path
 import pytest
 from graphify.extract import (
@@ -2862,6 +2863,112 @@ def test_bsl_onescript_use_directive_imports():
     assert "imports" in _relations(r)
     # Cross-procedure call inside a OneScript module still resolves.
     assert ("ГлавныйМетод()", "Запустить()") in _calls(r)
+
+
+@pytest.mark.skipif(_ilu.find_spec("tree_sitter_bsl") is None,
+                    reason="tree-sitter-bsl not installed")
+def test_bsl_grammar_carries_the_local_delta():
+    """The installed BSL grammar must be the local build, proven by parsing.
+
+    Checking `importlib.metadata.version` would prove nothing: the number lives
+    in the build's pyproject and is unrelated to which grammar the compiler was
+    handed. The published 0.1.6 fails this fragment outright — it has no node for
+    the OneScript header — so a silent fall back to the index is loud here.
+
+    graphify's `uv.lock` pins tree-sitter-bsl to the PyPI release, and only the
+    documented install commands pass the local wheel; whenever an environment is
+    rebuilt without them, this is the test that says so.
+    """
+    tsbsl = pytest.importorskip("tree_sitter_bsl")
+    from tree_sitter import Language, Parser
+
+    src = (
+        "#!/usr/bin/env oscript\n"
+        "#Использовать fs/asserts\n"
+        '#Использовать "../lib"\n'
+        '&Вместо("Метод")\n'
+        "Процедура П()\nКонецПроцедуры\n"
+    ).encode("utf-8")
+    root = Parser(Language(tsbsl.language())).parse(src).root_node
+
+    seen, stack = set(), [root]
+    while stack:
+        n = stack.pop()
+        seen.add(n.type)
+        stack.extend(n.children)
+
+    assert not root.has_error, "installed BSL grammar cannot parse the header"
+    for node_type in ("shebang", "use_directive", "use_path", "annotation_parameters"):
+        assert node_type in seen, (
+            f"installed BSL grammar has no {node_type!r}: this is the published "
+            "release, not the local build"
+        )
+
+
+def _import_count(r):
+    return sum(1 for e in r["edges"] if e["relation"] == "imports")
+
+
+def _write_os(tmp_path, body: str):
+    p = tmp_path / "m.os"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_bsl_use_directive_header_forms_import(tmp_path):
+    """The header forms the grammar models must all become imports."""
+    r = extract_bsl(_write_os(tmp_path,
+        '#Использовать fs/asserts\n'
+        '#Использовать json\n'
+        'Процедура П()\nКонецПроцедуры\n'))
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports"}
+    assert _make_id("fs/asserts") in targets
+    assert _make_id("json") in targets
+
+
+def test_bsl_use_directive_quoted_path_resolves_against_the_file(tmp_path):
+    """Only the quoted form names a file; it resolves relative to the module."""
+    r = extract_bsl(_write_os(tmp_path, '#Использовать "../lib"\n'))
+    expected = _make_id(str(Path(os.path.normpath(tmp_path / ".." / "lib"))))
+    assert expected in {e["target"] for e in r["edges"] if e["relation"] == "imports"}
+
+
+def test_bsl_use_directive_with_dotted_name_is_not_lost(tmp_path):
+    """`use_path` admits no dot, so only the text pass can see this one."""
+    r = extract_bsl(_write_os(tmp_path, '#Использовать v8i.tools\n'))
+    assert _make_id("v8i.tools") in {
+        e["target"] for e in r["edges"] if e["relation"] == "imports"}
+
+
+def test_bsl_use_directive_after_first_definition_is_not_lost(tmp_path):
+    """The grammar admits the directive only in the header; the text pass does not."""
+    r = extract_bsl(_write_os(tmp_path,
+        'Процедура П()\nКонецПроцедуры\n'
+        '#Использовать logos\n'))
+    assert _make_id("logos") in {
+        e["target"] for e in r["edges"] if e["relation"] == "imports"}
+
+
+def test_bsl_use_directive_in_comment_is_not_an_import(tmp_path):
+    """A mention is not a directive. The tree can tell them apart; the regex cannot."""
+    r = extract_bsl(_write_os(tmp_path,
+        '// #Использовать fantom\n'
+        'Процедура П()\nКонецПроцедуры\n'))
+    assert _import_count(r) == 0
+
+
+def test_bsl_use_directive_in_string_literal_is_not_an_import(tmp_path):
+    r = extract_bsl(_write_os(tmp_path,
+        'Процедура П()\n'
+        '    Т = "#Использовать fantom";\n'
+        'КонецПроцедуры\n'))
+    assert _import_count(r) == 0
+
+
+def test_bsl_use_directive_found_by_both_passes_yields_one_edge(tmp_path):
+    """The text pass is a superset of the tree pass; the overlap must not double."""
+    r = extract_bsl(_write_os(tmp_path, '#Использовать json\n'))
+    assert _import_count(r) == 1
 
 
 # ── 1C:EDT metadata (.mdo) ───────────────────────────────────────────────────

@@ -22,9 +22,13 @@ from graphify.extractors.base import (
 # ── BSL (1C / OneScript) extractor (custom walk) ──────────────────────────────
 
 # OneScript `#Использовать <lib>` / `#Использовать "path"` (RU) and the English
-# `#Use` synonym. The tree-sitter-bsl grammar does not model this directive (it
-# parses as an ERROR node), so imports are recovered with a regex pass, mirroring
-# the Lua/Svelte fallbacks elsewhere in this module.
+# `#Use` synonym. Since the grammar was aligned with bsl-parser 0.39 the header
+# form is a real node (`use_directive`, field `library` → `string | use_path`),
+# and that is the primary source. This regex stays for the two forms the grammar
+# does not express: a library name containing a dot — `use_path` admits letters,
+# digits, `_`, `-` and `/`, but not `.` — and a directive placed after the first
+# definition, which the grammar admits only in the module header. It is a
+# superset, so the tree pass runs first and both dedupe on (target, line).
 _BSL_USE_RE = re.compile(
     r'#\s*(?:Использовать|Use)\s+(?:"(?P<path>[^"]+)"|(?P<name>[\w.]+))',
     re.IGNORECASE,
@@ -144,22 +148,74 @@ def extract_bsl(path: Path, source: bytes | None = None,
 
     walk(root)
 
-    # OneScript imports (regex; see _BSL_USE_RE).
+    # OneScript imports. Two sources, in this order (see _BSL_USE_RE).
+    seen_imports: set[tuple[str, int]] = set()
+
+    def add_import(raw: str, line: int, *, quoted: bool) -> None:
+        raw = raw.strip()
+        if not raw:
+            return
+        # Only the quoted form names a file: `#Использовать fs/asserts` is a
+        # library name that happens to contain a slash, not a relative path.
+        if quoted and (raw.startswith(".") or "/" in raw or "\\" in raw):
+            tgt_nid = _make_id(str(Path(os.path.normpath(path.parent / raw))))
+        else:
+            tgt_nid = _make_id(raw)
+        if (tgt_nid, line) in seen_imports:
+            return
+        seen_imports.add((tgt_nid, line))
+        add_edge(file_nid, tgt_nid, "imports", line, context="import")
+
+    # 1. From the parse tree. The grammar models the OneScript module header, so
+    # a directive found here is a real directive — not a mention of one inside a
+    # comment or a string literal, which the regex below cannot tell apart.
+    for child in root.children:
+        if child.type != "use_directive":
+            continue
+        lib = child.child_by_field_name("library")
+        if lib is None:
+            continue
+        raw = lib.text.decode("utf-8", errors="replace")
+        quoted = lib.type == "string"
+        if quoted:
+            raw = raw[1:-1] if len(raw) >= 2 else ""
+        add_import(raw, lib.start_point[0] + 1, quoted=quoted)
+
+    # 2. From the text, for the two forms the grammar does not express: a library
+    # name containing a dot (`use_path` allows letters, digits, _, - and /, but
+    # not .) and a directive placed after the first definition (the grammar
+    # admits it only in the header). Dropping this pass would narrow extraction
+    # silently — the verification corpus holds no OneScript file, so its silence
+    # would not be evidence.
     try:
         text = source.decode("utf-8", errors="replace")
     except Exception:
         text = ""
+
+    def inside_comment_or_string(byte_offset: int) -> bool:
+        """True when this match sits in a comment or string literal.
+
+        The regex cannot tell a directive from a mention of one; the tree can.
+        Without this the text pass would re-introduce exactly the false imports
+        that reading the tree was meant to remove.
+        """
+        node = root.descendant_for_byte_range(byte_offset, byte_offset)
+        while node is not None:
+            if node.type in ("line_comment", "string", "string_content"):
+                return True
+            node = node.parent
+        return False
+
     for m in _BSL_USE_RE.finditer(text):
-        raw = (m.group("path") or m.group("name") or "").strip()
-        if not raw:
+        # str offsets are byte offsets only for ASCII; `#Использовать` is not.
+        byte_start = len(text[: m.start()].encode("utf-8"))
+        if inside_comment_or_string(byte_start):
             continue
-        line = text.count("\n", 0, m.start()) + 1
-        if m.group("path") and (raw.startswith(".") or "/" in raw or "\\" in raw):
-            resolved = Path(os.path.normpath(path.parent / raw))
-            tgt_nid = _make_id(str(resolved))
-        else:
-            tgt_nid = _make_id(raw)
-        add_edge(file_nid, tgt_nid, "imports", line, context="import")
+        add_import(
+            m.group("path") or m.group("name") or "",
+            text.count("\n", 0, m.start()) + 1,
+            quoted=bool(m.group("path")),
+        )
 
     label_to_nid: dict[str, str] = {}
     for n in nodes:

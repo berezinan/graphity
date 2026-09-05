@@ -32,6 +32,7 @@ from typing import Callable, Iterator
 
 from graphify.detect import CODE_EXTENSIONS, classify_file
 from graphify.extractors.bsl import (
+    extract_bsl,
     extract_edt_dcs,
     extract_edt_cmi,
     extract_edt_oform,
@@ -42,10 +43,13 @@ from graphify.extractors.bsl import (
 
 CORPUS_ENV = "GRAPHIFY_EDT_CORPUS"
 
-# The four extractors that read EDT project files. `.bsl` is deliberately absent:
-# it is not EDT-specific, and parsing thousands of modules through tree-sitter
-# would dominate the runtime without telling us anything about EDT parsing. The
-# census still counts `.bsl` files — it reports the whole corpus.
+# The extractors that read EDT project files. `.bsl` is absent from the default
+# set because it is not EDT-specific — not because it is expensive: measured on a
+# 12 335-module configuration, `extract_bsl` costs 6.6 ms per file, ~1.4 min for
+# the whole corpus. Pass `BSL_EXTRACTORS` to `build_snapshot` to include it; a
+# change to the BSL grammar or extractor is invisible without it, since object,
+# manager and common modules reach no EDT-specific extractor. The census counts
+# `.bsl` files either way — it reports the whole corpus.
 EDT_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     ".mdo": extract_edt_mdo,
     ".rights": extract_edt_rights,
@@ -55,6 +59,12 @@ EDT_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     # snapshot has to go through the extractor to see any of it.
     ".oform": extract_edt_oform,
     ".cmi": extract_edt_cmi,
+}
+
+# Opt-in addition for questions about BSL parsing itself:
+# build_snapshot(root, extractors=EDT_EXTRACTORS | BSL_EXTRACTORS).
+BSL_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
+    ".bsl": extract_bsl,
 }
 
 # Never descended into: build output, VCS and IDE state, and — required by the
@@ -114,14 +124,21 @@ def _node_kind(node_id: str) -> str:
     return node_id.split("_", 1)[0] or "?"
 
 
-def build_snapshot(root: Path) -> dict:
+def build_snapshot(root: Path, extractors: "dict[str, Callable[[Path], dict]] | None" = None) -> dict:
     """Run the EDT extractors over `root` and reduce the result to identities.
 
     The snapshot compares *what exists*, not how it is rendered: labels,
     ``source_file``, ``weight`` and ``confidence`` are dropped. They churn with
     cosmetic edits and would drown the one signal worth having — an id that
     disappeared.
+
+    `extractors` selects which file kinds are read; it defaults to
+    :data:`EDT_EXTRACTORS`. Resolve it per call rather than at import time so a
+    test can monkeypatch entries of the module-level map. Pass
+    ``EDT_EXTRACTORS | BSL_EXTRACTORS`` when the question is about BSL parsing.
     """
+    if extractors is None:
+        extractors = EDT_EXTRACTORS
     node_ids: set[str] = set()
     edges: set[tuple[str, str, str]] = set()
     files_by_ext: Counter[str] = Counter()
@@ -130,7 +147,7 @@ def build_snapshot(root: Path) -> dict:
 
     for path in _walk(root):
         ext = path.suffix.lower()
-        extractor = EDT_EXTRACTORS.get(ext)
+        extractor = extractors.get(ext)
         if extractor is None:
             continue
         files_by_ext[ext] += 1
