@@ -32,8 +32,15 @@ _SPLITTABLE_TEXT_SUFFIXES = frozenset({".md", ".mdx", ".markdown", ".txt", ".rst
 
 # Boundary preferences, strongest first. A Markdown heading (``\n#``) keeps a
 # section with its title; a blank line keeps a paragraph intact; a bare newline
-# avoids cutting mid-line. If none is found in the window we hard-cut.
-_BOUNDARY_SEPARATORS = ("\n#", "\n\n", "\n")
+# avoids cutting mid-line; a sentence end is the only boundary prose written
+# without newlines offers. If none is found in the window we hard-cut.
+_BOUNDARY_SEPARATORS = ("\n#", "\n\n", "\n", ". ", "? ", "! ")
+
+# Least of the window a boundary must fill to be taken. Without it the strongest
+# separator wins from anywhere in the window, so a lone blank line after a
+# document header cuts the header off as a slice of its own and leaves the body
+# — which may hold no newline at all — to hard cuts.
+_MIN_FILL = 0.5
 
 
 @dataclass(frozen=True)
@@ -99,18 +106,23 @@ def _best_cut(text: str, start: int, end: int) -> int:
     """Return a cut index in ``(start, end]`` at the strongest nearby boundary.
 
     Searches the window ``text[start:end]`` for the latest heading, then blank
-    line, then newline, and returns the index just *after* it (a heading cuts
-    just *before* the ``#`` so the heading leads the next slice). Falls back to a
-    hard cut at ``end`` when the window has no usable boundary, which still makes
-    forward progress because ``end > start``.
+    line, then newline, then sentence end, and returns the index just *after* it
+    (a heading cuts just *before* the ``#`` so the heading leads the next slice).
+    A boundary counts only when the slice it leaves fills at least ``_MIN_FILL``
+    of the window, so a strong separator near the start loses to a weaker one
+    near the limit. Falls back to a hard cut at ``end`` when no boundary
+    qualifies, which still makes forward progress because ``end > start``.
     """
     window = text[start:end]
+    floor = len(window) * _MIN_FILL
     for sep in _BOUNDARY_SEPARATORS:
         idx = window.rfind(sep)
-        if idx > 0:  # a boundary strictly inside the window (non-empty prev slice)
-            if sep == "\n#":
-                return start + idx + 1  # keep the newline with the previous slice
-            return start + idx + len(sep)
+        if idx <= 0:  # no boundary strictly inside the window (non-empty prev slice)
+            continue
+        # a heading cuts before the ``#``, keeping the newline with this slice
+        cut = idx + 1 if sep == "\n#" else idx + len(sep)
+        if cut >= floor:
+            return start + cut
     return end
 
 

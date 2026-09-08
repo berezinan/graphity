@@ -58,6 +58,46 @@ def test_slice_boundaries_prefers_heading_boundary():
     assert text[second_start:second_start + 3] == "# B"
 
 
+# ── _best_cut: position guard + sentence boundaries ─────────────────────────
+
+def test_slice_boundaries_header_does_not_become_its_own_slice():
+    # The shape of a court act: a short header, one blank line, then a body with
+    # no newline anywhere. The lone blank line used to win the whole window.
+    header = "**Case:** A47-10662/2024 | **Date:** 2026-05-21"
+    text = header + "\n\n" + "The court established the following. " * 2000
+    bounds = slice_boundaries(text, 20_000)
+    assert bounds[0][1] - bounds[0][0] > 10_000  # not the ~50-char header
+    assert "".join(text[s:e] for s, e in bounds) == text
+
+
+def test_slice_boundaries_cuts_prose_between_sentences():
+    text = "The court established the following. " * 500  # not one newline
+    bounds = slice_boundaries(text, 2000)
+    assert len(bounds) > 1
+    for _s, e in bounds[:-1]:
+        assert text[e - 2:e] == ". "  # cut lands after a sentence end
+        assert not (text[e - 1].isalnum() and text[e].isalnum())  # never mid-word
+
+
+def test_slice_boundaries_rejects_strong_separator_near_window_start():
+    # Blank line at 0.6% of the window, bare newline at 91% — the weaker but
+    # far better placed boundary must win.
+    text = "head" + "\n\n" + "a" * 900 + "\n" + "b" * 2000
+    bounds = slice_boundaries(text, 1000)
+    assert bounds[0][1] == 907  # just past the newline, not just past "head"
+
+
+def test_slice_boundaries_lossless_on_prose_without_newlines():
+    text = "One sentence with no line break at all. " * 3000
+    bounds = slice_boundaries(text, 5000)
+    assert bounds[0][0] == 0
+    assert bounds[-1][1] == len(text)
+    for (_s0, e0), (s1, _e1) in zip(bounds, bounds[1:]):
+        assert e0 == s1
+    assert "".join(text[s:e] for s, e in bounds) == text
+    assert all((e - s) <= 5000 for s, e in bounds)
+
+
 # ── expand_oversized_files ──────────────────────────────────────────────────
 
 def _write(p: Path, text: str) -> Path:
