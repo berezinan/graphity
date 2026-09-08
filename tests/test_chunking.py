@@ -8,7 +8,7 @@ import pytest
 
 @pytest.fixture(autouse=False)
 def no_tokenizer():
-    """Force the chars/4 fallback so packing math is deterministic regardless
+    """Force the char-ratio fallback so packing math is deterministic regardless
     of whether tiktoken is installed in the test environment. tiktoken's BPE
     compresses repeated/synthetic content heavily, which would make pack-size
     assertions tied to specific input sizes flaky."""
@@ -37,10 +37,11 @@ def test_pack_chunks_packs_small_files_together(tmp_path):
 def test_pack_chunks_starts_new_chunk_when_budget_would_overflow(tmp_path, no_tokenizer):
     """When the next file would push the chunk past the budget, start a new chunk.
 
-    With chars/4 fallback: each 10,000-char file = (10000+80)/4 = 2520 tokens.
-    Budget 6000 fits two (5040 < 6000) but not three (7560 > 6000).
-    Five files → 2/2/1 = three chunks.
+    The per-file cost is derived from the fallback constants rather than
+    hardcoded, so the test tracks them instead of drifting when they change.
+    The budget is set to hold two files but not three, so five files → 2/2/1.
     """
+    from graphify import llm
     from graphify.llm import _pack_chunks_by_tokens
 
     files = []
@@ -49,7 +50,9 @@ def test_pack_chunks_starts_new_chunk_when_budget_would_overflow(tmp_path, no_to
         f.write_text("x" * 10_000)
         files.append(f)
 
-    chunks = _pack_chunks_by_tokens(files, token_budget=6_000)
+    per_file = int((10_000 + llm._PER_FILE_OVERHEAD_CHARS) / llm._FALLBACK_CHARS_PER_TOKEN)
+    budget = per_file * 2 + per_file // 2  # two fit, three overflow
+    chunks = _pack_chunks_by_tokens(files, token_budget=budget)
     sizes = [len(c) for c in chunks]
     assert sizes == [2, 2, 1], f"expected [2, 2, 1], got {sizes}"
     assert sum(sizes) == 5  # all files accounted for
@@ -127,7 +130,11 @@ def test_estimate_file_tokens_uses_tiktoken_when_available(tmp_path):
 
 
 def test_estimate_file_tokens_falls_back_to_chars_when_no_tokenizer(tmp_path):
-    """Without tiktoken installed, the estimator falls back to chars/4."""
+    """Without tiktoken installed, the estimator falls back to a char ratio.
+
+    The fallback divides by `_FALLBACK_CHARS_PER_TOKEN`, not `_CHARS_PER_TOKEN`
+    — Cyrillic-heavy sources tokenize denser than the generic chars/4 heuristic.
+    """
     from graphify import llm
 
     f = tmp_path / "sample.py"
@@ -135,8 +142,7 @@ def test_estimate_file_tokens_falls_back_to_chars_when_no_tokenizer(tmp_path):
 
     with patch.object(llm, "_TOKENIZER", None):
         n = llm._estimate_file_tokens(f)
-    # 1000 chars + 80 overhead = 1080 / 4 = 270 tokens
-    assert n == (1000 + llm._PER_FILE_OVERHEAD_CHARS) // llm._CHARS_PER_TOKEN
+    assert n == int((1000 + llm._PER_FILE_OVERHEAD_CHARS) / llm._FALLBACK_CHARS_PER_TOKEN)
 
 
 # ---- Parallel execution ------------------------------------------------------
