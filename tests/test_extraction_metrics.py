@@ -6,6 +6,8 @@ metric definitions, not any particular model's score.
 """
 from __future__ import annotations
 
+import pytest
+
 from graphify.extraction_metrics import (
     EDGE_RELATIONS,
     HYPEREDGE_RELATIONS,
@@ -14,7 +16,9 @@ from graphify.extraction_metrics import (
     NODE_FILE_TYPES,
     GraphMetrics,
     aggregate_cell,
+    cache_flush_prompt,
     completion_rate,
+    isolated_runs,
     measure_graph,
     strip_metadata_header,
 )
@@ -359,3 +363,55 @@ def test_schema_constants_still_match_the_extraction_prompt():
 
     for value in NODE_FILE_TYPES | EDGE_RELATIONS | HYPEREDGE_RELATIONS:
         assert value in llm._EXTRACTION_SYSTEM, value
+
+
+# ── runs of a cell must not share warm server state ──────────────────────────
+
+def test_flush_separates_the_runs_and_never_brackets_them():
+    """A flush belongs *between* runs: leading or trailing ones evict nothing."""
+    log: list[str] = []
+    isolated_runs(
+        lambda p: log.append(f"run:{p}"),
+        "measured",
+        runs=3,
+        flush=lambda p: log.append("flush"),
+    )
+    assert log == ["run:measured", "flush", "run:measured", "flush", "run:measured"]
+
+
+def test_consecutive_flushes_differ():
+    """A flush repeated verbatim is served from cache and evicts nothing."""
+    seen = [cache_flush_prompt(i, 500) for i in range(1, 4)]
+    assert len(set(seen)) == len(seen)
+
+
+def test_flush_is_at_least_as_long_as_what_it_evicts():
+    """A flush shorter than its target leaves the target's prefix resident."""
+    for length in (500, 6_000, 20_000):
+        assert len(cache_flush_prompt(1, length)) >= length
+
+
+def test_flush_is_sized_from_the_measured_prompt():
+    """`isolated_runs` must size the flush from the prompt, not a constant."""
+    sizes: list[int] = []
+    isolated_runs(lambda p: None, "x" * 9_000, runs=2, flush=lambda p: sizes.append(len(p)))
+    assert sizes and min(sizes) >= 9_000
+
+
+def test_without_a_flush_the_runs_are_back_to_back():
+    """Opting out is allowed, but then the runs share state — no flush is faked."""
+    log: list[str] = []
+    out = isolated_runs(lambda p: log.append("run") or "x", "measured", runs=3)
+    assert log == ["run", "run", "run"]
+    assert out == ["x", "x", "x"]
+
+
+def test_cell_defaults_to_the_minimum_that_carries_a_verdict():
+    calls = []
+    isolated_runs(lambda p: calls.append(p), "measured")
+    assert len(calls) == MIN_RUNS
+
+
+def test_zero_runs_is_a_programming_error_not_an_empty_cell():
+    with pytest.raises(ValueError):
+        isolated_runs(lambda p: p, "measured", runs=0)

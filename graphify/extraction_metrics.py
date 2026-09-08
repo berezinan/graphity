@@ -222,6 +222,67 @@ def aggregate_cell(runs: list[GraphMetrics]) -> CellSummary:
     return CellSummary(stats=stats, runs=len(runs), underpowered=len(runs) < MIN_RUNS)
 
 
+# A flush prompt has to do two things: be at least as long as the prompt it is
+# meant to evict, and differ from the previous flush — a repeated flush is
+# itself cached and stops evicting anything.
+_FLUSH_SENTENCE = "Опиши подробно устройство паровой турбины. "
+_FLUSH_STEP = 7
+
+
+def cache_flush_prompt(index: int, min_chars: int = 0) -> str:
+    """Filler text that evicts a measured prompt from the server's KV cache.
+
+    ``min_chars`` must be the length of the prompt being evicted. A flush
+    shorter than its target does not displace it: measured against a 6 000-char
+    document, an ~800-char flush moved the answer once and then let two runs
+    repeat byte for byte, because the document's prefix was still resident.
+
+    Length also grows with ``index`` so consecutive flushes differ; a flush
+    repeated verbatim is served from cache and evicts nothing.
+    """
+    repeats = -(-max(min_chars, 1) // len(_FLUSH_SENTENCE)) + index * _FLUSH_STEP
+    return _FLUSH_SENTENCE * repeats
+
+
+def isolated_runs(call, prompt, runs: int = MIN_RUNS, *, flush=None) -> list:
+    """Run one cell ``runs`` times, clearing server state between the runs.
+
+    ``call(text)`` performs one request and returns whatever the caller wants
+    collected; ``flush(text)`` performs a throwaway request whose only job is to
+    evict state. Both are injected, so this module stays free of network code.
+
+    Runs are issued **sequentially and never concurrently**, and the flush is
+    what separates them. Both halves were measured against the local Open WebUI
+    (qwen3.6-35b-a3b, `temperature = 0`), and both are counter-intuitive:
+
+    * Three runs back to back are identical **byte for byte** — and stay
+      identical at ``temperature = 1``, so this is not sampling determinism, it
+      is a warm prefix being replayed. Reporting such a series as a stable cell
+      states a property of the cache, not of the model.
+    * Four *concurrent* copies of the same request return four *different*
+      answers, and even two concurrent copies sometimes diverge. Batching, not
+      sampling, is what moves the numbers here — so a cell whose runs overlap in
+      time measures scheduling noise instead of the model.
+
+    With a flush between them the same three sequential runs produced two
+    distinct answers, which is the distribution the cell is supposed to expose.
+
+    Model unload/reload — the mechanism the task originally assumed — is not
+    used: llama-swap sits on an internal docker network, its passthrough is
+    disabled (`ENABLE_OPENAI_API_PASSTHROUGH`), and only one of its eleven
+    models is published, so nothing can evict the resident model. Eviction by
+    cache pressure needs none of that access.
+    """
+    if runs < 1:
+        raise ValueError(f"runs must be positive, got {runs}")
+    results = []
+    for i in range(runs):
+        if i and flush is not None:
+            flush(cache_flush_prompt(i, len(prompt)))
+        results.append(call(prompt))
+    return results
+
+
 def strip_metadata_header(text: str) -> str:
     """Text after a leading metadata block, or the text unchanged.
 
