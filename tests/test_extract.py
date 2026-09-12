@@ -1261,6 +1261,54 @@ def test_extract_parallel_returns_false_on_broken_pool(tmp_path, monkeypatch, ca
     assert "__main__" in out, "warning must hint at the Windows __main__ guard idiom"
 
 
+def test_extract_parallel_returns_false_when_pool_dies_per_future(
+    tmp_path, monkeypatch, capsys
+):
+    """A pool that breaks AFTER submit must also fall back, not warn per file.
+
+    Submitting can succeed and the pool die while the work runs — a worker killed
+    mid-file, or (on Windows) workers that re-import a __main__ without a guard.
+    Then every future raises BrokenProcessPool individually, and treating that as
+    a per-file failure turned a dead pool into one warning per file and an EMPTY
+    graph reported as a successful run: measured 1 904 warnings and 0 nodes on a
+    1C configuration.
+    """
+    from concurrent.futures.process import BrokenProcessPool
+    import concurrent.futures
+    from graphify import extract as extract_mod
+
+    class DeadFuture:
+        def result(self):
+            raise BrokenProcessPool("terminated abruptly")
+
+        def cancel(self):
+            return True
+
+    class FakePool:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def submit(self, *a, **kw): return DeadFuture()
+
+    monkeypatch.setattr(
+        concurrent.futures, "ProcessPoolExecutor", lambda *a, **kw: FakePool()
+    )
+    monkeypatch.setattr(
+        concurrent.futures, "as_completed", lambda fs, **kw: list(fs)
+    )
+
+    uncached = [(i, FIXTURES / "sample.py") for i in range(3)]
+    per_file: list = [None, None, None]
+    ok = extract_mod._extract_parallel(uncached, per_file, tmp_path, 2, 3)
+
+    assert ok is False, "a dead pool must hand the work to the sequential path"
+    out = capsys.readouterr().out
+    assert "BrokenProcessPool" in out
+    assert out.count("worker failed") == 0, (
+        "a dead pool must not be reported as N per-file failures"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bash extractor tests (#866)
 # ---------------------------------------------------------------------------

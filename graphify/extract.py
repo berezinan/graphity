@@ -4225,6 +4225,27 @@ def _extract_parallel(
                 try:
                     idx, result = future.result()
                     per_file[idx] = result
+                except concurrent.futures.process.BrokenProcessPool:
+                    # The POOL died, not this file: every other future — the ones
+                    # still pending included — fails with the same error, so the
+                    # per-file warning below would fire once per file and the run
+                    # would finish "successfully" with an empty graph. Bail to the
+                    # sequential path instead, exactly as the handler below does
+                    # when the pool dies before any work starts. Reached whenever
+                    # the break surfaces per future rather than at pool level,
+                    # which is what a missing `__main__` guard does on Windows and
+                    # what a worker killed mid-file does anywhere.
+                    for pending in futures:
+                        pending.cancel()
+                    print(
+                        "  warning: parallel extraction died mid-run "
+                        "(BrokenProcessPool); falling back to sequential. On "
+                        "Windows this usually means the caller is missing an "
+                        '`if __name__ == "__main__":` guard. Pass parallel=False '
+                        "to extract() to skip the pool entirely.",
+                        flush=True,
+                    )
+                    return False
                 except Exception as exc:
                     pos = futures[future]
                     print(
