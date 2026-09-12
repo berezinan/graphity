@@ -22,6 +22,7 @@ from .resolver_registry import (
 )
 from .ruby_resolution import resolve_ruby_member_calls
 from .pascal_resolution import resolve_pascal_inherited_calls
+from .bsl_resolution import resolve_bsl_module_calls
 
 # --- migrated to graphify/extractors/ (see graphify/extractors/MIGRATION.md) ---
 from graphify.extractors.base import (  # noqa: F401
@@ -2857,6 +2858,16 @@ register_language_resolver(
 # e.g. Sistec's Th0Xxx/Th5Xxx) falls outside the per-file extractor's own
 # scope. Lives in graphify.pascal_resolution; registered here as a consumer
 # of the framework, same as the Ruby resolver above.
+# 1C/BSL: every cross-module call is written with a receiver naming the module,
+# so it reaches here as a member call the shared pass skipped. Lives in
+# graphify.bsl_resolution; registered here like the Ruby and Pascal passes.
+register_language_resolver(
+    LanguageResolver(
+        "bsl_module_calls",
+        frozenset({".bsl", ".os", ".osl"}),
+        resolve_bsl_module_calls,
+    )
+)
 register_language_resolver(
     LanguageResolver(
         "pascal_inherited_calls",
@@ -4821,6 +4832,14 @@ def extract(
         # Skip member-call callees: obj.log() → "log" has no import evidence
         # and collides with any top-level function named "log" in the corpus.
         if rc.get("is_member_call"):
+            continue
+        # 1C/BSL owns ALL of its call policy (graphify.bsl_resolution), bare calls
+        # included: an unqualified call there is legal outside its own module only
+        # into a global common module, so name-matching across files is wrong by
+        # construction. It was also wrong in fact — 120 of 157 cross-file BSL
+        # `calls` edges in a measured configuration pointed at .mdo attributes and
+        # form elements that share a name with a platform global.
+        if rc.get("lang") == "bsl":
             continue
         # Skip Ruby include/extend/prepend mixin markers: they carry a module
         # name as `callee` but are not calls — the Ruby resolver turns them into

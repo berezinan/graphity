@@ -588,10 +588,14 @@ def _disambiguate_colliding_node_ids(
     source_files. Those are the *same* module, not distinct same-named symbols,
     so they must collapse to one shared node — disambiguating them by path would
     scatter a single module across N file-qualified duplicates.
+
+    ``shared_anchor`` marks the same situation for an extractor that knows its
+    ids are globally unique by construction: a 1C metadata FQN (``Catalog.X``)
+    names ONE object no matter how many .mdo files reference it.
     """
     by_id: dict[str, list[dict]] = {}
     for node in nodes:
-        if node.get("type") in ("module", "namespace"):
+        if node.get("type") in ("module", "namespace") or node.get("shared_anchor"):
             continue
         nid = node.get("id")
         if isinstance(nid, str) and nid:

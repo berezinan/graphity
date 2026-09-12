@@ -34,6 +34,35 @@ _BSL_USE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# BSP idiom: a common module is fetched as an object and its methods are called
+# through the variable — `Модуль = ОбщегоНазначения.ОбщийМодуль("Имя")`. The
+# getter's OWN name is the marker, never its receiver: the receiver differs per
+# library (ОбщегоНазначения, ОбщегоНазначенияКлиент, ОбщегоНазначенияБПО, … —
+# nine spellings in УНФ, a different set in other configs), while the function
+# name is fixed by convention. That also covers the unqualified call written
+# inside ОбщегоНазначения itself and the getter reached through another module
+# variable, with no extra branch.
+_MODULE_GETTER_NAMES: frozenset[str] = frozenset({"общиймодуль", "commonmodule"})
+
+# Receivers that denote the module being extracted, so `ЭтотОбъект.Метод()` in a
+# form/object module is a call to that same module's own procedure.
+_SELF_RECEIVERS: frozenset[str] = frozenset({
+    "этотобъект", "thisobject", "этаформа", "thisform",
+})
+
+
+def _is_metadata_fqn(label: str) -> bool:
+    """True for a metadata FQN label (`Catalog.Клиенты`, `Document.X.Attribute.A`).
+
+    Such a label names ONE object of the configuration, so every file that
+    mentions it must land on the same node — the id is already unique by
+    construction (kind + name, plus the project scope for an extension). Marking
+    these as shared anchors keeps the collision pass from salting them apart by
+    source path, which would scatter one catalog across every .mdo that names it.
+    """
+    head, _, rest = label.partition(".")
+    return bool(rest) and head in _EDT_KIND_PREFIXES
+
 
 def extract_bsl(path: Path, source: bytes | None = None,
                 line_offset: int = 0) -> dict:
@@ -79,13 +108,16 @@ def extract_bsl(path: Path, source: bytes | None = None,
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({
+            node = {
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
                 "source_location": f"L{line + line_offset}",
-            })
+            }
+            if _is_metadata_fqn(label):
+                node["shared_anchor"] = True
+            nodes.append(node)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
@@ -247,36 +279,150 @@ def extract_bsl(path: Path, source: bytes | None = None,
             return None
         return kind, _read_text(prop, source)
 
-    def walk_calls(node, caller_nid: str) -> None:
+    def _string_literal_arg(call_node) -> str | None:
+        """The single string-literal argument of a method_call, else None."""
+        args = next((c for c in call_node.children if c.type == "arguments"), None)
+        if args is None:
+            return None
+        exprs = [c for c in args.children if c.type == "expression"]
+        if len(exprs) != 1:
+            return None
+        node = exprs[0]
+        for wanted in ("const_expression", "string", "string_content"):
+            node = next((c for c in node.children if c.type == wanted), None)
+            if node is None:
+                return None
+        return _read_text(node, source)
+
+    def _getter_module(call_node) -> str | None:
+        """Module name if `call_node` is `ОбщийМодуль("Имя")`, else None."""
+        if call_node.type != "method_call":
+            return None
+        name_node = _named_field(call_node, "name")
+        if name_node is None:
+            return None
+        if _read_text(name_node, source).lower() not in _MODULE_GETTER_NAMES:
+            return None
+        return _string_literal_arg(call_node) or None
+
+    def _module_from_expression(expr_node) -> str | None:
+        """Module name when the expression IS a getter call, qualified or not."""
+        for child in expr_node.children:
+            if child.type == "method_call":
+                return _getter_module(child)
+            if child.type == "call_expression":
+                for inner in child.children:
+                    if inner.type == "method_call":
+                        return _getter_module(inner)
+        return None
+
+    def _classify_receiver(access_node, aliases: dict):
+        """(module, (kind, name), is_self, bound) for a member call's receiver.
+
+        `bound` says the module name came from a `ОбщийМодуль("Имя")` binding
+        rather than from the call itself; it travels as data, so the cross-file
+        resolver can label the edge without knowing the idiom exists.
+        """
+        idents = [c for c in access_node.children if c.type == "identifier"]
+        if len(access_node.children) == 1 and idents:
+            name = _read_text(idents[0], source)
+            if name.lower() in _SELF_RECEIVERS:
+                return None, None, True, False
+            bound = aliases.get(name)
+            if bound:
+                return bound, None, False, True
+            # Any other bare name is offered as a module name and simply finds no
+            # module when it is an object or a local variable.
+            return name, None, False, False
+        ref = _manager_object_ref(access_node)
+        if ref:
+            return None, ref, False, False
+        # `ОбщегоНазначения.ОбщийМодуль("Имя").Метод()` — no variable in between.
+        for child in access_node.children:
+            if child.type == "method_call":
+                module = _getter_module(child)
+                if module:
+                    return module, None, False, True
+        return None, None, False, False
+
+    def walk_calls(node, caller_nid: str, aliases: dict) -> None:
         t = node.type
         if t in ("procedure_definition", "function_definition"):
             return  # defensive: BSL has no nested definitions
+
+        if t == "assignment_statement":
+            target = next((c for c in node.children if c.type == "identifier"), None)
+            expr = next((c for c in node.children if c.type == "expression"), None)
+            if target is not None and expr is not None:
+                module = _module_from_expression(expr)
+                if module:
+                    var = _read_text(target, source)
+                    # Re-binding the same variable to a different module drops it:
+                    # variable names repeat across the corpus (`Модуль` 507 times in
+                    # УНФ), so a wrong binding would resolve calls to the wrong file.
+                    aliases[var] = None if var in aliases and aliases[var] != module \
+                        else module
+                    line = node.start_point[0] + 1
+                    meta_id = _make_id("CommonModule", module)
+                    pair = (caller_nid, meta_id)
+                    if meta_id != caller_nid and pair not in seen_meta_refs:
+                        seen_meta_refs.add(pair)
+                        add_node(meta_id, f"CommonModule.{module}", line)
+                        add_edge(caller_nid, meta_id, "references", line,
+                                 context="dynamic_module")
 
         if t == "method_call":
             name_node = _named_field(node, "name")
             if name_node is not None:
                 callee_name = _read_text(name_node, source)
                 # `Объект.Метод()` nests the method_call inside a call_expression /
-                # property_access after an `access` receiver — treat as a member
-                # call so it is not resolved cross-module (it's a platform/object
-                # method, not a free procedure).
+                # property_access after an `access` receiver. In 1C that same shape
+                # is ALSO how every cross-module call is written, so the receiver
+                # decides: a module name (directly, through a bound variable or a
+                # metadata manager) is carried into raw_calls for the cross-file
+                # resolver; anything else stays unresolved rather than binding to a
+                # same-named procedure that happens to exist somewhere.
+                parent = node.parent
                 is_member_call = (
-                    node.parent is not None
-                    and node.parent.type in ("call_expression", "property_access")
+                    parent is not None
+                    and parent.type in ("call_expression", "property_access")
                 )
+                receiver = receiver_object = None
+                is_self_call = receiver_bound = False
+                if is_member_call:
+                    access = next(
+                        (c for c in parent.children if c.type == "access"), None)
+                    if access is not None:
+                        receiver, receiver_object, is_self_call, receiver_bound = \
+                            _classify_receiver(access, aliases)
                 if callee_name and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
-                    tgt_nid = label_to_nid.get(callee_name)
-                    if tgt_nid and tgt_nid != caller_nid:
-                        pair = (caller_nid, tgt_nid)
-                        if pair not in seen_call_pairs:
-                            seen_call_pairs.add(pair)
-                            add_edge(caller_nid, tgt_nid, "calls",
-                                     node.start_point[0] + 1, context="call")
-                    elif not tgt_nid:
+                    if not is_member_call or is_self_call:
+                        tgt_nid = label_to_nid.get(callee_name)
+                        if tgt_nid and tgt_nid != caller_nid:
+                            pair = (caller_nid, tgt_nid)
+                            if pair not in seen_call_pairs:
+                                seen_call_pairs.add(pair)
+                                add_edge(caller_nid, tgt_nid, "calls",
+                                         node.start_point[0] + 1, context="call")
+                        elif not tgt_nid and not is_self_call:
+                            raw_calls.append({
+                                "caller_nid": caller_nid,
+                                "callee": callee_name,
+                                "is_member_call": False,
+                                "lang": "bsl",
+                                "source_file": str_path,
+                                "source_location":
+                                    f"L{node.start_point[0] + 1 + line_offset}",
+                            })
+                    elif receiver or receiver_object:
                         raw_calls.append({
                             "caller_nid": caller_nid,
                             "callee": callee_name,
-                            "is_member_call": is_member_call,
+                            "is_member_call": True,
+                            "lang": "bsl",
+                            "receiver": receiver,
+                            "receiver_object": receiver_object,
+                            "receiver_bound": receiver_bound,
                             "source_file": str_path,
                             "source_location":
                                 f"L{node.start_point[0] + 1 + line_offset}",
@@ -312,11 +458,13 @@ def extract_bsl(path: Path, source: bytes | None = None,
                                  context="metadata")
 
         for child in node.children:
-            walk_calls(child, caller_nid)
+            walk_calls(child, caller_nid, aliases)
 
     for caller_nid, def_node in function_bodies:
+        # Module bindings live exactly as long as the body that made them.
+        aliases: dict = {}
         for child in def_node.children:
-            walk_calls(child, caller_nid)
+            walk_calls(child, caller_nid, aliases)
 
     valid_ids = seen_ids
     clean_edges = []
@@ -919,6 +1067,9 @@ def extract_edt_mdo(path: Path) -> dict:
             # instead of being unaskable.
             if object_belonging:
                 node["object_belonging"] = object_belonging
+            # One metadata object, one node — see _is_metadata_fqn.
+            if _is_metadata_fqn(label):
+                node["shared_anchor"] = True
             nodes.append(node)
 
     def add_edge(src_id: str, tgt_id: str, relation: str) -> None:
@@ -1068,6 +1219,16 @@ def extract_edt_mdo(path: Path) -> dict:
             obj_label = _edt_scoped_label(scope, ".".join(chain))
             parent_id = _make_id(*scope, *chain[:-2])
     add_node(obj_id, obj_label, uuid=root.get("uuid"), object_belonging=belonging)
+    # A global common module is the ONE case where an unqualified call may cross a
+    # module boundary, so the flag decides whether such a call resolves at all
+    # (bsl-call-resolution). EDT writes a scalar only when it is not the default,
+    # so a missing <global> means false — not "unset". Rare by design: 2 of 184
+    # common modules in the measured configuration.
+    if kind == "CommonModule":
+        for node in nodes:
+            if node["id"] == obj_id:
+                node["bsl_global"] = child_text(root, "global") == "true"
+                break
     # An adopted object IS the base object, seen from inside the extension. The
     # link is by kind and name, not by the `extendedConfigurationObject` uuid:
     # resolving that uuid needs an index of the base project, which may not be

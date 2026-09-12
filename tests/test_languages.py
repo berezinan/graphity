@@ -2905,6 +2905,275 @@ def test_bsl_grammar_carries_the_local_delta():
         )
 
 
+# ── BSL cross-module call resolution (capability: bsl-call-resolution) ─────────
+#
+# In 1C every call that leaves a module names the module it calls into — directly
+# (`ОплатыОбщееСервер.Метод()`), through a metadata manager
+# (`Документы.Счет.Метод()`) or through a variable bound by
+# `ОбщегоНазначения.ОбщийМодуль("Имя")`. These exercise the whole path: the
+# extractor records the receiver, graphify.bsl_resolution turns it into a file and
+# looks the method up in THAT file.
+
+def _bsl_corpus(tmp_path, files: dict) -> list[Path]:
+    written = []
+    for rel, text in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        written.append(p)
+    return written
+
+
+def _common_module_mdo(name: str, *, is_global: bool = False) -> str:
+    flag = "<global>true</global>" if is_global else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mdclass:CommonModule xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"'
+        f' uuid="u-{name}"><name>{name}</name>{flag}<server>true</server>'
+        "</mdclass:CommonModule>"
+    )
+
+
+def _bsl_call_edges(r):
+    """{(caller label, callee label): context} for every `calls` edge."""
+    by_id = {n["id"]: n for n in r["nodes"]}
+    return {
+        (by_id[e["source"]]["label"], by_id[e["target"]]["label"]): e.get("context")
+        for e in r["edges"]
+        if e["relation"] == "calls"
+        and e["source"] in by_id and e["target"] in by_id
+    }
+
+
+@pytest.mark.skipif(_ilu.find_spec("tree_sitter_bsl") is None,
+                    reason="tree-sitter-bsl not installed")
+def test_bsl_tree_shape_of_qualified_calls():
+    """The grammar shape the receiver is read from, pinned.
+
+    Receiver extraction reads `call_expression` -> first `access` child. If the
+    grammar ever nests these differently, every cross-module edge disappears
+    silently; this fails loudly instead.
+    """
+    tsbsl = pytest.importorskip("tree_sitter_bsl")
+    from tree_sitter import Language, Parser
+
+    src = (
+        "Процедура П()\n"
+        "\tА = ОплатыСервер.Метод(Д);\n"
+        "\tБ = Документы.Счет.Метод(Д);\n"
+        "КонецПроцедуры\n"
+    ).encode("utf-8")
+    root = Parser(Language(tsbsl.language())).parse(src).root_node
+
+    calls, stack = [], [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "call_expression":
+            calls.append(n)
+        stack.extend(n.children)
+    assert len(calls) == 2
+    for node in calls:
+        kinds = [c.type for c in node.children if c.type != "."]
+        assert kinds == ["access", "method_call"], kinds
+    # The manager form nests one more access + property inside the receiver.
+    nested = [c for c in calls[0].children + calls[1].children if c.type == "access"]
+    assert any(
+        [g.type for g in a.children if g.type != "."] == ["access", "property"]
+        for a in nested
+    )
+
+
+@pytest.mark.skipif(_ilu.find_spec("tree_sitter_bsl") is None,
+                    reason="tree-sitter-bsl not installed")
+def test_bsl_extractor_records_call_receivers(tmp_path):
+    src = tmp_path / "Module.bsl"
+    src.write_text(
+        "Процедура П()\n"
+        "\tОплатыСервер.Метод(Д);\n"
+        "\tДокументы.Счет.Метод(Д);\n"
+        "\tОбъект.Записать();\n"
+        "КонецПроцедуры\n",
+        encoding="utf-8",
+    )
+    raw = {rc["callee"]: rc for rc in extract_bsl(src)["raw_calls"]}
+    assert all(rc["lang"] == "bsl" for rc in raw.values())
+    assert raw["Метод"]["receiver"] in ("ОплатыСервер", None)
+    receivers = {(rc.get("receiver"), rc.get("receiver_object"))
+                 for rc in extract_bsl(src)["raw_calls"] if rc["callee"] == "Метод"}
+    assert ("ОплатыСервер", None) in receivers
+    assert (None, ("Document", "Счет")) in receivers
+    assert raw["Записать"]["receiver"] == "Объект"
+
+
+@pytest.mark.skipif(_ilu.find_spec("tree_sitter_bsl") is None,
+                    reason="tree-sitter-bsl not installed")
+def test_bsl_cross_module_calls_resolve(tmp_path):
+    paths = _bsl_corpus(tmp_path, {
+        "src/CommonModules/ОплатыСервер/Module.bsl":
+            "Функция Остаток(Д) Экспорт\n\tВозврат 0;\nКонецФункции\n"
+            "Процедура ТолькоЗдесь() Экспорт\nКонецПроцедуры\n",
+        "src/CommonModules/ОплатыСервер/ОплатыСервер.mdo":
+            _common_module_mdo("ОплатыСервер"),
+        "src/CommonModules/РаботаСФайлами/Module.bsl":
+            "Процедура ПриСоздании(Ф) Экспорт\nКонецПроцедуры\n",
+        "src/CommonModules/РаботаСФайлами/РаботаСФайлами.mdo":
+            _common_module_mdo("РаботаСФайлами"),
+        "src/CommonModules/ОборудованиеГлобальный/Module.bsl":
+            "Процедура Подключить() Экспорт\nКонецПроцедуры\n",
+        "src/CommonModules/ОборудованиеГлобальный/ОборудованиеГлобальный.mdo":
+            _common_module_mdo("ОборудованиеГлобальный", is_global=True),
+        "src/Documents/Счет/ManagerModule.bsl":
+            "Функция Сумма(С) Экспорт\n\tВозврат 0;\nКонецФункции\n",
+        "src/Documents/Счет/Счет.mdo":
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<mdclass:Document xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"'
+            ' uuid="u-doc"><name>Счет</name><attributes uuid="a1">'
+            "<name>ТолькоЗдесь</name></attributes></mdclass:Document>",
+        "src/Documents/Касса/ObjectModule.bsl":
+            "Процедура Проведение(Отказ)\n"
+            "\tО = ОплатыСервер.Остаток(ЭтотОбъект);\n"
+            "\tС = Документы.Счет.Сумма(Ссылка);\n"
+            '\tМ = ОбщегоНазначения.ОбщийМодуль("РаботаСФайлами");\n'
+            "\tМ.ПриСоздании(ЭтотОбъект);\n"
+            "\tПодключить();\n"
+            "\tТолькоЗдесь();\n"
+            "\tОбъект.Записать();\n"
+            "\tОплатыСервер.НетТакого();\n"
+            "КонецПроцедуры\n",
+    })
+    from graphify.extract import extract
+    r = extract(paths, root=tmp_path, parallel=False)
+    calls = _bsl_call_edges(r)
+
+    # Receiver names the module -> the method is looked up in THAT module's file.
+    assert calls[("Проведение()", "Остаток()")] == "module_qualified_call"
+    assert calls[("Проведение()", "Сумма()")] == "module_qualified_call"
+    # Bound variable behaves exactly like a written module name.
+    assert calls[("Проведение()", "ПриСоздании()")] == "module_alias_call"
+    # A bare call crosses a module boundary only into a global common module.
+    assert calls[("Проведение()", "Подключить()")] == "global_module_call"
+    # `ТолькоЗдесь` exists in a NON-global module and as a .mdo attribute: neither
+    # may be called by bare name from another module.
+    assert not any(callee == "ТолькоЗдесь()" for _, callee in calls)
+    assert not any(callee == "ТолькоЗдесь" for _, callee in calls)
+    # Unresolvable receiver and a method the named module does not define.
+    assert not any(callee.startswith("Записать") for _, callee in calls)
+    assert not any(callee.startswith("НетТакого") for _, callee in calls)
+    # The fetched module is a dependency even where no call resolved.
+    assert any(
+        e.get("context") == "dynamic_module"
+        and e["target"].endswith("commonmodule_работасфайлами")
+        for e in r["edges"]
+    )
+
+
+@pytest.mark.skipif(_ilu.find_spec("tree_sitter_bsl") is None,
+                    reason="tree-sitter-bsl not installed")
+def test_bsl_module_binding_forms_and_limits(tmp_path):
+    paths = _bsl_corpus(tmp_path, {
+        "src/CommonModules/А/Module.bsl":
+            "Процедура ЦельА() Экспорт\nКонецПроцедуры\n"
+            "Процедура Общая() Экспорт\nКонецПроцедуры\n",
+        "src/CommonModules/А/А.mdo": _common_module_mdo("А"),
+        "src/CommonModules/Б/Module.bsl":
+            "Процедура ЦельБ() Экспорт\nКонецПроцедуры\n"
+            "Процедура Общая() Экспорт\nКонецПроцедуры\n",
+        "src/CommonModules/Б/Б.mdo": _common_module_mdo("Б"),
+        "src/CommonModules/Вызывающий/Module.bsl":
+            "Процедура Формы()\n"
+            '\tМ = ОбщийМодуль("А");\n'              # unqualified getter
+            "\tМ.ЦельА();\n"
+            '\tОбщегоНазначенияБПОКлиент.ОбщийМодуль("Б").ЦельБ();\n'  # inline
+            "КонецПроцедуры\n"
+            "Процедура Переприсвоение()\n"
+            '\tП = ОбщийМодуль("А");\n'
+            '\tП = ОбщийМодуль("Б");\n'
+            "\tП.Общая();\n"
+            "КонецПроцедуры\n"
+            "Процедура Динамика(ИмяМодуля)\n"
+            "\tД = ОбщегоНазначения.ОбщийМодуль(ИмяМодуля);\n"
+            "\tД.ЦельА();\n"
+            "КонецПроцедуры\n"
+            "Процедура ЧужоеТело()\n"
+            "\tМ.ЦельА();\n"                          # М bound in another body
+            "КонецПроцедуры\n",
+        "src/CommonModules/Вызывающий/Вызывающий.mdo": _common_module_mdo("Вызывающий"),
+    })
+    from graphify.extract import extract
+    calls = _bsl_call_edges(extract(paths, root=tmp_path, parallel=False))
+
+    assert calls[("Формы()", "ЦельА()")] == "module_alias_call"
+    assert calls[("Формы()", "ЦельБ()")] == "module_alias_call"
+    # Re-bound variable is ambiguous; a non-literal argument binds nothing; a
+    # binding never leaves the body that made it.
+    assert ("Переприсвоение()", "Общая()") not in calls
+    assert ("Динамика()", "ЦельА()") not in calls
+    assert ("ЧужоеТело()", "ЦельА()") not in calls
+
+
+@pytest.mark.skipif(_ilu.find_spec("tree_sitter_bsl") is None,
+                    reason="tree-sitter-bsl not installed")
+def test_bsl_metadata_object_is_one_node_across_files(tmp_path):
+    """A metadata FQN names ONE object however many files mention it.
+
+    The id-collision pass salts same-id nodes apart by source path. That is right
+    for two same-named local symbols and wrong for `Catalog.Клиенты`, whose id is
+    already unique by construction: the audited configuration ended up with 106
+    separate `Catalog.Клиенты` nodes, one per referencing .mdo, so references
+    from code and from metadata never met on the same node.
+    """
+    from graphify.extract import extract
+    catalog_mdo = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"'
+        ' uuid="u-cat"><name>Клиенты</name></mdclass:Catalog>'
+    )
+
+    def referencing_report(name):
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<mdclass:Report xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass"'
+            f' uuid="u-{name}"><name>{name}</name><attributes uuid="a-{name}">'
+            "<name>Клиент</name><type><types>CatalogRef.Клиенты</types></type>"
+            "</attributes></mdclass:Report>"
+        )
+
+    paths = _bsl_corpus(tmp_path, {
+        "src/Catalogs/Клиенты/Клиенты.mdo": catalog_mdo,
+        "src/Reports/Первый/Первый.mdo": referencing_report("Первый"),
+        "src/Reports/Второй/Второй.mdo": referencing_report("Второй"),
+        "src/CommonModules/Сервер/Module.bsl":
+            "Процедура П() Экспорт\n\tС = Справочники.Клиенты.ПустаяСсылка();\nКонецПроцедуры\n",
+        "src/CommonModules/Сервер/Сервер.mdo": _common_module_mdo("Сервер"),
+    })
+    r = extract(paths, root=tmp_path, parallel=False)
+
+    ids = {n["id"] for n in r["nodes"] if n["label"] == "Catalog.Клиенты"}
+    assert len(ids) == 1, f"catalog scattered across {len(ids)} nodes: {ids}"
+    # Every reference — from both reports and from the code — lands on it.
+    target = ids.pop()
+    sources = {e["source"] for e in r["edges"]
+               if e["target"] == target and e["relation"] == "references"}
+    assert len(sources) >= 3
+
+
+def test_bsl_mdo_global_flag(tmp_path):
+    plain = tmp_path / "Обычный.mdo"
+    plain.write_text(_common_module_mdo("Обычный"), encoding="utf-8")
+    glob = tmp_path / "Глобальный.mdo"
+    glob.write_text(_common_module_mdo("Глобальный", is_global=True), encoding="utf-8")
+
+    def flag(path):
+        nodes = [n for n in extract_edt_mdo(path)["nodes"]
+                 if n["label"].startswith("CommonModule.")]
+        return nodes[0]["bsl_global"]
+
+    # EDT writes a scalar only when it is not the default, so a missing tag is
+    # `false` — not "unset".
+    assert flag(glob) is True
+    assert flag(plain) is False
+
+
 def _import_count(r):
     return sum(1 for e in r["edges"] if e["relation"] == "imports")
 
