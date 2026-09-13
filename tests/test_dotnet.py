@@ -273,6 +273,40 @@ def test_xaml_prism_autowire_false_does_not_infer_from_filename(tmp_path):
     assert _view_model_edges(r) == []
 
 
+def test_xaml_cs_scan_prunes_noise_dirs_and_stays_bounded(tmp_path):
+    """The code-behind/.cs scan prunes noise dirs (node_modules/.venv/.git/...)
+    during traversal and is bounded, so it links the real ViewModel while a decoy
+    .cs buried in node_modules is never scanned — and it can't rglob a huge tree
+    and hang (the standalone-root escape that stalled the suite)."""
+    proj = tmp_path / "App"
+    (proj / "Views").mkdir(parents=True)
+    (proj / "ViewModels").mkdir()
+    (proj / "App.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk" />', encoding="utf-8")
+    (proj / "Views" / "MainWindow.xaml").write_text(
+        '<Window x:Class="App.Views.MainWindow"\n'
+        '  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"\n'
+        '  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"\n'
+        '  xmlns:vm="clr-namespace:App.ViewModels">\n'
+        '  <Window.DataContext><vm:MainWindowViewModel/></Window.DataContext>\n'
+        "</Window>\n", encoding="utf-8")
+    (proj / "ViewModels" / "MainWindowViewModel.cs").write_text(
+        "namespace App.ViewModels { public class MainWindowViewModel {} }\n", encoding="utf-8")
+    # A decoy with the SAME class name inside a noise dir: if pruning failed it
+    # would be scanned and make the link ambiguous/wrong.
+    nm = proj / "node_modules" / "pkg"
+    nm.mkdir(parents=True)
+    (nm / "Decoy.cs").write_text(
+        "namespace App.ViewModels { public class MainWindowViewModel {} }\n", encoding="utf-8")
+    r = extract_xaml(proj / "Views" / "MainWindow.xaml")
+    assert "error" not in r
+    nodes = {n["id"]: n for n in r["nodes"]}
+    edges = _view_model_edges(r)
+    assert len(edges) == 1
+    tgt = nodes[edges[0]["target"]]
+    assert tgt["label"] == "MainWindowViewModel"
+    assert "node_modules" not in (tgt.get("source_file") or ""), "decoy in node_modules was scanned"
+
+
 def test_xaml_links_communitytoolkit_generated_members_and_event_to_command():
     r = extract_xaml(FIXTURES / "xaml_viewmodel" / "Views" / "ToolkitView.xaml")
     nodes = {n["id"]: n for n in r["nodes"]}
@@ -485,14 +519,169 @@ def test_xaml_viewmodel_with_non_utf8_codebehind_does_not_crash(tmp_path):
     assert nodes[edges[0]["target"]]["label"] == "SettingsViewModel"
 
 
+def test_csharp_members_in_preprocessor_blocks_are_extracted_and_resolved(tmp_path):
+    """C# preprocessor wrappers must preserve class ownership for members (#2631)."""
+    helper = tmp_path / "Helper.cs"
+    helper.write_text(
+        """namespace Probe.Lib;
+public static class Gated
+{
+    public static void Outside(string a) { }
+#if NET8_0_OR_GREATER
+    public static void InsideIf(string a) { }
+#else
+    public static void InsideElse(string a) { }
+#endif
+#if DEBUG
+    public static void InsideDebug(string a) { }
+#endif
+}
+"""
+    )
+    caller = tmp_path / "Caller.cs"
+    caller.write_text(
+        """namespace Probe.Lib;
+public static class Caller
+{
+    public static void Drive()
+    {
+        Gated.Outside(\"x\");
+        Gated.InsideIf(\"x\");
+        Gated.InsideDebug(\"x\");
+    }
+}
+"""
+    )
+
+    result = extract([helper, caller], cache_root=tmp_path)
+    by_label = {node["label"]: node["id"] for node in result["nodes"]}
+
+    for label in (".Outside()", ".InsideIf()", ".InsideElse()", ".InsideDebug()"):
+        assert label in by_label
+
+    calls = {
+        (edge["source"], edge["target"])
+        for edge in result["edges"]
+        if edge["relation"] == "calls"
+    }
+    assert (by_label[".Drive()"], by_label[".Outside()"]) in calls
+    assert (by_label[".Drive()"], by_label[".InsideIf()"]) in calls
+    assert (by_label[".Drive()"], by_label[".InsideDebug()"]) in calls
+
+
 # ── .razor ───────────────────────────────────────────────────────────────────
 
 def test_razor_using_and_inject():
     r = extract_razor(FIXTURES / "sample.razor")
     assert "error" not in r
-    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports"}
-    assert any("microsoft" in t for t in targets)
-    assert any("counterservice" in t.lower() for t in targets)
+    imports = {e["target"] for e in r["edges"] if e["relation"] == "imports"}
+    assert any("microsoft" in t for t in imports)
+    references = {e["target"] for e in r["edges"] if e["relation"] == "references"}
+    assert any("counterservice" in t.lower() for t in references)
+
+
+def test_razor_inject_cross_file_resolution(tmp_path: Path):
+    # A. Project-defined service resolution
+    svc = tmp_path / "WidgetService.cs"
+    svc.write_text("public class WidgetService {}\n", encoding="utf-8")
+    page = tmp_path / "AlphaPage.razor"
+    page.write_text("@page \"/alpha\"\n@inject WidgetService _widgets\n", encoding="utf-8")
+
+    result = extract([svc, page], cache_root=tmp_path)
+    svc_def = next(n for n in result["nodes"] if n.get("label") == "WidgetService" and n.get("source_file"))
+    page_node = next(n for n in result["nodes"] if n.get("label") == "AlphaPage.razor")
+
+    ref_edges = [
+        e for e in result["edges"]
+        if e.get("source") == page_node["id"] and e.get("relation") == "references"
+    ]
+    assert any(e.get("target") == svc_def["id"] for e in ref_edges)
+
+
+def test_razor_inject_multiple_razor_files_and_csharp_control(tmp_path: Path):
+    # B. Multiple Razor files referencing same canonical node
+    # C. Existing C# control pointing to same canonical node
+    services_dir = tmp_path / "Services"
+    pages_dir = tmp_path / "Pages"
+    services_dir.mkdir(parents=True, exist_ok=True)
+    pages_dir.mkdir(parents=True, exist_ok=True)
+
+    svc = services_dir / "WidgetService.cs"
+    svc.write_text("public class WidgetService {}\n", encoding="utf-8")
+    consumer = services_dir / "Consumer.cs"
+    consumer.write_text("public class Consumer(WidgetService widgets) {}\n", encoding="utf-8")
+    alpha = pages_dir / "AlphaPage.razor"
+    alpha.write_text("@inject WidgetService _widgets\n", encoding="utf-8")
+    beta = pages_dir / "BetaPage.razor"
+    beta.write_text("@inject WidgetService _widgets\n", encoding="utf-8")
+    gamma = pages_dir / "GammaPage.razor"
+    gamma.write_text("@inject WidgetService _widgets\n", encoding="utf-8")
+
+    result = extract([svc, consumer, alpha, beta, gamma], cache_root=tmp_path)
+    svc_def = next(n for n in result["nodes"] if n.get("label") == "WidgetService" and n.get("source_file"))
+
+    # Assert no sourceless stubs left behind for WidgetService
+    widget_nodes = [n for n in result["nodes"] if n.get("label") == "WidgetService"]
+    assert len(widget_nodes) == 1
+    assert widget_nodes[0]["id"] == svc_def["id"]
+
+    alpha_node = next(n for n in result["nodes"] if n.get("label") == "AlphaPage.razor")
+    beta_node = next(n for n in result["nodes"] if n.get("label") == "BetaPage.razor")
+    gamma_node = next(n for n in result["nodes"] if n.get("label") == "GammaPage.razor")
+    consumer_node = next(n for n in result["nodes"] if n.get("label") == "Consumer" and n.get("file_type") == "code")
+
+    for src_id in (alpha_node["id"], beta_node["id"], gamma_node["id"], consumer_node["id"]):
+        refs = [e for e in result["edges"] if e.get("source") == src_id and e.get("relation") == "references"]
+        assert any(e.get("target") == svc_def["id"] for e in refs)
+
+    cs_refs = [e for e in result["edges"] if e.get("relation") == "references" and e.get("target") == svc_def["id"]]
+    assert len(cs_refs) >= 4  # alpha, beta, gamma, consumer
+
+
+def test_razor_inject_with_explicit_using(tmp_path: Path):
+    # D. Explicit Razor @using with namespace scope
+    svc = tmp_path / "WidgetService.cs"
+    svc.write_text("namespace Demo.Services {\n    public class WidgetService {}\n}\n", encoding="utf-8")
+    page = tmp_path / "AlphaPage.razor"
+    page.write_text("@using Demo.Services\n@inject WidgetService _widgets\n", encoding="utf-8")
+
+    result = extract([svc, page], cache_root=tmp_path)
+    svc_def = next(n for n in result["nodes"] if n.get("label") == "WidgetService" and n.get("source_file"))
+    page_node = next(n for n in result["nodes"] if n.get("label") == "AlphaPage.razor")
+
+    # @using must remain an imports edge
+    using_edges = [
+        e for e in result["edges"]
+        if e.get("source") == page_node["id"] and e.get("relation") == "imports"
+    ]
+    assert using_edges
+
+    # @inject must resolve to WidgetService definition
+    ref_edges = [
+        e for e in result["edges"]
+        if e.get("source") == page_node["id"] and e.get("relation") == "references"
+    ]
+    assert any(e.get("target") == svc_def["id"] for e in ref_edges)
+
+
+def test_razor_inject_qualified_namespace(tmp_path: Path):
+    # Qualified @inject Demo.Services.WidgetService _widgets
+    svc = tmp_path / "Services" / "WidgetService.cs"
+    svc.parent.mkdir(parents=True, exist_ok=True)
+    svc.write_text("namespace Demo.Services {\n    public class WidgetService {}\n}\n", encoding="utf-8")
+    page = tmp_path / "Pages" / "AlphaPage.razor"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text("@inject Demo.Services.WidgetService _widgets\n", encoding="utf-8")
+
+    result = extract([svc, page], cache_root=tmp_path)
+    svc_def = next(n for n in result["nodes"] if n.get("label") == "WidgetService" and n.get("source_file"))
+    page_node = next(n for n in result["nodes"] if n.get("label") == "AlphaPage.razor")
+
+    ref_edges = [
+        e for e in result["edges"]
+        if e.get("source") == page_node["id"] and e.get("relation") == "references"
+    ]
+    assert any(e.get("target") == svc_def["id"] for e in ref_edges)
 
 
 def test_razor_components():

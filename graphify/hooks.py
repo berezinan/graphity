@@ -41,7 +41,7 @@ if [ -z "$GRAPHIFY_PYTHON" ]; then
     if [ -f "$_GFY_PYTHON_FILE" ]; then
         _FROM_FILE=$(cat "$_GFY_PYTHON_FILE" 2>/dev/null | tr -d '[:space:]')
         case "$_FROM_FILE" in
-            *[!a-zA-Z0-9/_.@:\\-]*) _FROM_FILE="" ;;  # allowlist (covers Windows paths)
+            *[!a-zA-Z0-9/_.@:\\\\-]*) _FROM_FILE="" ;;  # allowlist (covers Windows paths)
         esac
         if [ -n "$_FROM_FILE" ] && [ -x "$_FROM_FILE" ] && "$_FROM_FILE" -c "$_GFY_PROBE" 2>/dev/null; then
             GRAPHIFY_PYTHON="$_FROM_FILE"
@@ -67,10 +67,17 @@ if [ -z "$GRAPHIFY_PYTHON" ]; then
         # POSIX launcher: parse the shebang. head -c + tr strip NUL bytes first —
         # when the launcher is a Windows binary reached without its .exe suffix,
         # a raw `head -1` reads binary into the command substitution and the
-        # shell warns about ignored null bytes on every commit.
+        # shell warns about ignored null bytes on every commit. Gate on a
+        # leading '#!': a launcher can also be a binary trampoline with no
+        # shebang at all (uv tool installs on Windows), and its bytes must
+        # never reach the shebang parse (#2852).
         case "$GRAPHIFY_BIN" in
-            *.exe) _SHEBANG="" ;;
-            *)     _SHEBANG=$(head -c 256 "$GRAPHIFY_BIN" 2>/dev/null | tr -d '\\000' | head -n 1 | sed 's/^#![[:space:]]*//') ;;
+            *.exe) _GFY_HEAD="" ;;
+            *)     _GFY_HEAD=$(head -c 256 "$GRAPHIFY_BIN" 2>/dev/null | tr -d '\\000') ;;
+        esac
+        case "$_GFY_HEAD" in
+            '#!'*) _SHEBANG=$(printf '%s\\n' "$_GFY_HEAD" | head -n 1 | sed 's/^#![[:space:]]*//') ;;
+            *)     _SHEBANG="" ;;
         esac
         case "$_SHEBANG" in
             */env\\ *) GRAPHIFY_PYTHON="${_SHEBANG#*/env }" ;;
@@ -79,12 +86,43 @@ if [ -z "$GRAPHIFY_PYTHON" ]; then
         # Allowlist: only keep characters valid in a filesystem path to prevent
         # injection if the shebang contains shell metacharacters.
         case "$GRAPHIFY_PYTHON" in
-            *[!a-zA-Z0-9/_.@-]*) GRAPHIFY_PYTHON="" ;;
+            *[!a-zA-Z0-9/_.@:\\\\-]*) GRAPHIFY_PYTHON="" ;;
         esac
         if [ -n "$GRAPHIFY_PYTHON" ] && ! "$GRAPHIFY_PYTHON" -c "$_GFY_PROBE" 2>/dev/null; then
             GRAPHIFY_PYTHON=""
         fi
     fi
+fi
+# Fourth probe: uv tool environments. `uv tool install` (the README's
+# recommended method) puts graphify in an isolated venv that no ambient
+# python can import, and on Windows its launcher on PATH is a binary
+# trampoline with no shebang to parse — so the probes above can all miss a
+# healthy install and the hook dies at the last-resort fallback (#2852).
+# Scan the uv tool envs directly; UV_TOOL_DIR overrides the default
+# location. A tool env is adopted only if its python passes the probe, so a
+# co-installed tool without graphify never satisfies it.
+#
+# The snap roots matter because an install made from inside a snap-confined
+# editor lands in that snap's private HOME, which the plain $HOME roots above
+# never see once the hook runs from an ordinary shell. Revisions are globbed
+# rather than pinned: snap rotates them on update, which is exactly what makes
+# a pinned path unsafe (see _is_rotating_prefix).
+if [ -z "$GRAPHIFY_PYTHON" ]; then
+    for _GFY_TOOLS in \
+        "${UV_TOOL_DIR:-}" \
+        "$HOME/.local/share/uv/tools" \
+        "$HOME/AppData/Roaming/uv/tools" \
+        "$HOME"/snap/*/current/.local/share/uv/tools \
+        "$HOME"/snap/*/[0-9]*/.local/share/uv/tools; do
+        [ -n "$_GFY_TOOLS" ] || continue
+        for _GFY_CAND in "$_GFY_TOOLS"/*/bin/python "$_GFY_TOOLS"/*/Scripts/python.exe; do
+            [ -x "$_GFY_CAND" ] || continue
+            if "$_GFY_CAND" -c "$_GFY_PROBE" 2>/dev/null; then
+                GRAPHIFY_PYTHON="$_GFY_CAND"
+                break 2
+            fi
+        done
+    done
 fi
 # Last resort: try python3 / python (works for system/venv installs on PATH).
 if [ -z "$GRAPHIFY_PYTHON" ]; then
@@ -104,7 +142,7 @@ fi
 # double-quote, $, backtick or backslash characters: it is carried inside a
 # shell double-quoted `-c "..."` argument (see _detached_launch).
 _REBUILD_BODY_COMMIT = """\
-import os, signal, sys
+import os, signal, sys, threading, multiprocessing
 from pathlib import Path
 
 changed_raw = os.environ.get('GRAPHIFY_CHANGED', '')
@@ -119,17 +157,51 @@ try:
     from graphify.watch import _rebuild_code, _apply_resource_limits
     _apply_resource_limits()
     _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
-    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
-        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
-        signal.alarm(_timeout)
+    if _timeout > 0:
+        if hasattr(signal, 'SIGALRM'):
+            def _sigalrm_bail(*_a):
+                # Killing here, before the exception unwinds, matters: once
+                # TimeoutError starts propagating it passes straight through
+                # the ProcessPoolExecutor with-block's own __exit__, which
+                # calls shutdown(wait=True) and blocks until every worker
+                # exits -- forever, for a worker stuck the way #3341 was,
+                # since the alarm firing never actually stops it. Killing the
+                # workers first means shutdown has nothing left to wait for.
+                for _child in multiprocessing.active_children():
+                    _child.kill()
+                raise TimeoutError(f'graphify rebuild exceeded {_timeout}s')
+            signal.signal(signal.SIGALRM, _sigalrm_bail)
+            signal.alarm(_timeout)
+        else:
+            def _bail():
+                print(f'[graphify hook] graphify rebuild exceeded {_timeout}s', flush=True)
+                for _child in multiprocessing.active_children():
+                    _child.kill()
+                os._exit(1)
+            _watchdog = threading.Timer(_timeout, _bail)
+            _watchdog.daemon = True
+            _watchdog.start()
     _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
     _root = Path('.')
     _out = os.environ.get('GRAPHIFY_OUT', 'graphify-out')
     _saved = Path(_out) / '.graphify_root'
     if _saved.exists():
-        _txt = _saved.read_text(encoding='utf-8').strip()
+        _txt = _saved.read_text(encoding='utf-8-sig').strip()
         if _txt:
-            _root = Path(_txt)
+            _candidate = Path(_txt)
+            try:
+                _cwd = Path.cwd().resolve()
+                _resolved = _candidate.resolve()
+                # Python 3.13 no longer raises on a symlink loop (resolve returns
+                # the path unresolved), so require a real directory: a loop or a
+                # dangling target is not a dir and correctly falls back.
+                _in_repo = (_resolved == _cwd or _cwd in _resolved.parents) and _resolved.is_dir()
+            except (OSError, RuntimeError):
+                _in_repo = False
+            if _in_repo:
+                _root = _candidate
+            else:
+                print(f'[graphify hook] ignoring out-of-repo .graphify_root: {_txt}')
     _rebuild_code(_root, changed_paths=changed, force=_force)
     # Refresh the work-memory lessons doc when saved Q&A outcomes exist
     # (best-effort; never fails the hook).
@@ -153,13 +225,34 @@ except Exception as exc:
 _REBUILD_BODY_CHECKOUT = """\
 from graphify.watch import _rebuild_code, _apply_resource_limits
 from pathlib import Path
-import os, signal, sys
+import os, signal, sys, threading, multiprocessing
 try:
     _apply_resource_limits()
     _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
-    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
-        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
-        signal.alarm(_timeout)
+    if _timeout > 0:
+        if hasattr(signal, 'SIGALRM'):
+            def _sigalrm_bail(*_a):
+                # Killing here, before the exception unwinds, matters: once
+                # TimeoutError starts propagating it passes straight through
+                # the ProcessPoolExecutor with-block's own __exit__, which
+                # calls shutdown(wait=True) and blocks until every worker
+                # exits -- forever, for a worker stuck the way #3341 was,
+                # since the alarm firing never actually stops it. Killing the
+                # workers first means shutdown has nothing left to wait for.
+                for _child in multiprocessing.active_children():
+                    _child.kill()
+                raise TimeoutError(f'graphify rebuild exceeded {_timeout}s')
+            signal.signal(signal.SIGALRM, _sigalrm_bail)
+            signal.alarm(_timeout)
+        else:
+            def _bail():
+                print(f'[graphify] graphify rebuild exceeded {_timeout}s', flush=True)
+                for _child in multiprocessing.active_children():
+                    _child.kill()
+                os._exit(1)
+            _watchdog = threading.Timer(_timeout, _bail)
+            _watchdog.daemon = True
+            _watchdog.start()
     _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
     # post-checkout: branch switch can touch arbitrary files; full rebuild path
     # (no changed_paths) is correct here. The flock inside _rebuild_code still
@@ -168,9 +261,22 @@ try:
     _out = os.environ.get('GRAPHIFY_OUT', 'graphify-out')
     _saved = Path(_out) / '.graphify_root'
     if _saved.exists():
-        _txt = _saved.read_text(encoding='utf-8').strip()
+        _txt = _saved.read_text(encoding='utf-8-sig').strip()
         if _txt:
-            _root = Path(_txt)
+            _candidate = Path(_txt)
+            try:
+                _cwd = Path.cwd().resolve()
+                _resolved = _candidate.resolve()
+                # Python 3.13 no longer raises on a symlink loop (resolve returns
+                # the path unresolved), so require a real directory: a loop or a
+                # dangling target is not a dir and correctly falls back.
+                _in_repo = (_resolved == _cwd or _cwd in _resolved.parents) and _resolved.is_dir()
+            except (OSError, RuntimeError):
+                _in_repo = False
+            if _in_repo:
+                _root = _candidate
+            else:
+                print(f'[graphify] ignoring out-of-repo .graphify_root: {_txt}')
     _rebuild_code(_root, force=_force)
     # Refresh the work-memory lessons doc when saved Q&A outcomes exist
     # (best-effort; never fails the hook).
@@ -199,8 +305,15 @@ except Exception as exc:
 # requires Python, so we let Python do the detaching: a tiny outer process spawns
 # the real rebuild fully detached and returns immediately, so the hook never
 # blocks. POSIX uses start_new_session (the setsid equivalent); Windows uses
-# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, breaking away from any job object
-# when allowed. This payload is carried inside a shell double-quoted -c argument,
+# CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, breaking away from any job object
+# when allowed. Do NOT 'simplify' CREATE_NO_WINDOW back into DETACHED_PROCESS:
+# on Windows 11 with Windows Terminal as the default console host, a
+# console-less python still gets a VISIBLE console allocated when its runtime
+# touches the console API during startup (ctrl-handler installation), popping
+# an empty Terminal window over whatever the user is doing - once per commit,
+# for the whole rebuild. Reproduced via GetConsoleWindow(): DETACHED_PROCESS
+# child reports a visible hwnd, CREATE_NO_WINDOW child reports none (3bac3df).
+# This payload is carried inside a shell double-quoted -c argument,
 # so it deliberately uses only single-quoted Python strings (no ", $, ` or \\).
 _LAUNCHER_TEMPLATE = """\
 import os, subprocess, sys
@@ -216,7 +329,7 @@ except OSError:
 _kw = dict(stdout=_out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=os.getcwd(), close_fds=True)
 _cmd = [sys.executable, '-c', _src]
 if os.name == 'nt':
-    _flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    _flags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     try:
         subprocess.Popen(_cmd, creationflags=_flags | 0x01000000, **_kw)  # + CREATE_BREAKAWAY_FROM_JOB
     except OSError:
@@ -258,16 +371,26 @@ fi
 """
 
 
+# Both hook bodies run inside a subshell `( ... )`. The generated block is
+# appended to whatever post-commit / post-checkout already exists, and other
+# tools chain their own logic after it; every skip condition in the block is a
+# bare `exit 0`, which in a flat script ends the WHOLE hook, silently dropping
+# anything after graphify's end marker - on every root commit (HEAD~1 does
+# not exist), every rebase/merge, every linked worktree, every
+# GRAPHIFY_SKIP_HOOK=1 (#2986). Inside the subshell an `exit` ends only
+# graphify's section; the detached rebuild launch is unaffected, and the
+# hook's own exit status stays 0 as before.
 _HOOK_SCRIPT = """\
 # graphify-hook-start
 # Auto-rebuilds the knowledge graph after each commit (code files only, no LLM needed).
 # Installed by: graphify hook install
+(
 
 # Deterministic clustering: networkx louvain iterates string-keyed sets whose
 # order is randomized per-process by PYTHONHASHSEED, so community assignments
 # churn run-to-run. Pinning it makes graphify-out reproducible.
 export PYTHONHASHSEED=0
-
+__VIZ_LIMIT_EXPORT__
 # Git for Windows/MSYS hooks can inherit fragile pipe handles from GUI clients
 # and agent shells. Keep hook-triggered rebuilds sequential by default there;
 # explicit GRAPHIFY_MAX_WORKERS still wins for users who want parallelism.
@@ -309,7 +432,8 @@ _GRAPHIFY_LOG="${HOME}/.cache/graphify-rebuild.log"
 mkdir -p "$(dirname "$_GRAPHIFY_LOG")"
 export GRAPHIFY_REBUILD_LOG="$_GRAPHIFY_LOG"
 echo "[graphify hook] launching background rebuild (log: $_GRAPHIFY_LOG)"
-""" + _detached_launch(_REBUILD_BODY_COMMIT) + """# graphify-hook-end
+""" + _detached_launch(_REBUILD_BODY_COMMIT) + """)
+# graphify-hook-end
 """
 
 
@@ -317,12 +441,13 @@ _CHECKOUT_SCRIPT = """\
 # graphify-checkout-hook-start
 # Auto-rebuilds the knowledge graph (code only) when switching branches.
 # Installed by: graphify hook install
+(
 
 # Deterministic clustering: networkx louvain iterates string-keyed sets whose
 # order is randomized per-process by PYTHONHASHSEED, so community assignments
 # churn run-to-run. Pinning it makes graphify-out reproducible.
 export PYTHONHASHSEED=0
-
+__VIZ_LIMIT_EXPORT__
 # Git for Windows/MSYS hooks can inherit fragile pipe handles from GUI clients
 # and agent shells. Keep hook-triggered rebuilds sequential by default there;
 # explicit GRAPHIFY_MAX_WORKERS still wins for users who want parallelism.
@@ -338,6 +463,10 @@ BRANCH_SWITCH=$3
 if [ "$BRANCH_SWITCH" != "1" ]; then
     exit 0
 fi
+
+# A no-op checkout (e.g. `git checkout -b` with no start point) reports a
+# branch switch but leaves the tree unchanged ΓÇö nothing to rebuild (#2421).
+[ "$PREV_HEAD" = "$NEW_HEAD" ] && exit 0
 
 # Only run if graphify-out/ exists (graph has been built before)
 if [ ! -d "graphify-out" ]; then
@@ -362,8 +491,44 @@ _GRAPHIFY_LOG="${HOME}/.cache/graphify-rebuild.log"
 mkdir -p "$(dirname "$_GRAPHIFY_LOG")"
 export GRAPHIFY_REBUILD_LOG="$_GRAPHIFY_LOG"
 echo "[graphify] Branch switched - launching background rebuild (log: $_GRAPHIFY_LOG)"
-""" + _detached_launch(_REBUILD_BODY_CHECKOUT) + """# graphify-checkout-hook-end
+""" + _detached_launch(_REBUILD_BODY_CHECKOUT) + """)
+# graphify-checkout-hook-end
 """
+
+
+def _load_graphifyrc(root: Path) -> dict[str, str | int]:
+    """Load key/value options from <root>/.graphifyrc if present.
+
+    Supported options:
+      viz_node_limit: integer >= 0 (e.g. viz_node_limit=0)
+    """
+    rc_path = root / ".graphifyrc"
+    if not rc_path.is_file():
+        return {}
+
+    cfg: dict[str, str | int] = {}
+    content = rc_path.read_text(encoding="utf-8")
+    for line_num, raw in enumerate(content.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"Invalid line {line_num} in {rc_path}: {raw!r} (expected key=value)")
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if key == "viz_node_limit":
+            try:
+                parsed_val = int(val)
+                if parsed_val < 0:
+                    raise ValueError("must be a non-negative integer")
+                cfg["viz_node_limit"] = parsed_val
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid viz_node_limit in {rc_path} at line {line_num}: {val!r}. "
+                    f"Must be a non-negative integer."
+                ) from exc
+    return cfg
 
 
 def _git_root(path: Path) -> Path | None:
@@ -445,12 +610,29 @@ def _hooks_dir(root: Path) -> Path:
     return d
 
 
-def _install_hook(hooks_dir: Path, name: str, script: str, marker: str) -> str:
-    """Install a single git hook, appending if an existing hook is present."""
+def _install_hook(
+    hooks_dir: Path,
+    name: str,
+    script: str,
+    marker: str,
+    marker_end: str = "",
+) -> str:
+    """Install a single git hook, appending if an existing hook is present, or updating
+    an existing graphify block in-place."""
     hook_path = hooks_dir / name
     if hook_path.exists():
         content = hook_path.read_text(encoding="utf-8")
         if marker in content:
+            if marker_end and marker_end in content:
+                start_idx = content.find(marker)
+                end_idx = content.find(marker_end)
+                if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+                    end_idx += len(marker_end)
+                    new_content = content[:start_idx] + script.rstrip() + content[end_idx:]
+                    if new_content == content:
+                        return f"already installed at {hook_path}"
+                    hook_path.write_text(new_content, encoding="utf-8", newline="\n")
+                    return f"updated existing {name} hook at {hook_path}"
             return f"already installed at {hook_path}"
         hook_path.write_text(content.rstrip() + "\n\n" + script, encoding="utf-8", newline="\n")
         return f"appended to existing {name} hook at {hook_path}"
@@ -487,12 +669,41 @@ def _pinned_python() -> str:
     that is not a valid plain filesystem path character, preventing $(...),
     backtick, double-quote, semicolon, etc. from being injected into generated
     shell scripts or the merge-driver command line. The allowlist includes ':'
-    and '\\' so Windows paths (C:\\...) are accepted. An empty return means
-    callers must fall back to the `graphify` launcher on PATH — safe degradation.
+    and '\\' so Windows paths (C:\\...) are accepted, and a plain space so
+    Windows profile paths (C:\\Users\\First Last\\...) are too — a space cannot
+    start a substitution or a new command, and every consumer quotes the value:
+    the hook scripts embed it as '$_PINNED' (single-quoted, then referenced as
+    "$_PINNED") and _register_merge_driver double-quotes it (#2166). Before that
+    a space rejected the whole path, so hooks installed under any Windows user
+    whose profile name contains a space silently pinned nothing. An empty return
+    means callers must fall back to the `graphify` launcher on PATH — safe
+    degradation.
     """
-    if re.search(r"[^a-zA-Z0-9/_.@:\\-]", sys.executable):
+    if re.search(r"[^a-zA-Z0-9/_.@: \\-]", sys.executable):
+        return ""
+    if _is_rotating_prefix(sys.executable):
         return ""
     return sys.executable
+
+
+# ``~/snap/<app>/<revision>/`` — snap swaps <revision> on every package update and
+# prunes the old tree, so anything under it is a path with an expiry date.
+_ROTATING_PREFIX_RE = re.compile(r"/snap/[^/]+/(\d+|current)/")
+
+
+def _is_rotating_prefix(path: str) -> bool:
+    """True if `path` lives under a directory the packaging system rotates.
+
+    A pin is only worth writing if it will still resolve tomorrow. An interpreter
+    inside a snap revision will not: the revision number changes on update and the
+    old tree is removed, which silently kills every hook pinned to it — observed
+    across 15 repositories at once when an editor snap moved past its revision.
+
+    Returning "" here is the documented safe degradation: the hook falls through to
+    its other probes, including the uv-tools scan, which searches snap-confined
+    homes too.
+    """
+    return bool(_ROTATING_PREFIX_RE.search(path.replace("\\", "/")))
 
 
 def _merge_attr_line() -> str:
@@ -535,7 +746,12 @@ def _register_merge_driver(root: Path) -> str:
     import subprocess as _sp
     pinned = _pinned_python()
     if pinned:
-        driver = f"{pinned} -m graphify merge-driver %O %A %B"
+        # Double-quoted: the allowlist in _pinned_python() permits a space (Windows
+        # profile paths), and git runs this driver string through a shell, so an
+        # unquoted "C:\\Users\\First Last\\...\\python.exe" would split into two
+        # words and the driver would never run (#2166). The same allowlist keeps
+        # '$' and backticks out, so double quotes cannot introduce expansion.
+        driver = f'"{pinned}" -m graphify merge-driver %O %A %B'
     else:
         driver = "graphify merge-driver %O %A %B"
     try:
@@ -638,20 +854,23 @@ def install(path: Path = Path(".")) -> str:
 
     hooks_dir = _user_hooks_dir(_hooks_dir(root))
 
-    # Pin the current interpreter so the hook works even when the graphify
-    # launcher is not on PATH at git-trigger time (uv tool / pipx isolation).
-    # sys.executable is the Python running this very install command, so it is
-    # always the correct isolated-venv interpreter.  The placeholder is replaced
-    # in both scripts before writing; the allowlist in _pinned_python() strips
-    # any characters unsafe in a shell path (empty result -> the pinned probe is
-    # skipped), and import-verification catches a stale pinned path so it safely
-    # falls through to the dynamic detection.
-    pinned = _pinned_python()
-    hook = _HOOK_SCRIPT.replace("__PINNED_PYTHON__", pinned)
-    checkout = _CHECKOUT_SCRIPT.replace("__PINNED_PYTHON__", pinned)
+    cfg = _load_graphifyrc(root)
+    viz_limit = cfg.get("viz_node_limit")
+    if viz_limit is not None:
+        # Use the `:-` default form (like GRAPHIFY_MAX_WORKERS below) so an
+        # explicit `GRAPHIFY_VIZ_NODE_LIMIT=... git commit` still wins over the
+        # baked project default — persisting config must not clobber a per-run
+        # override.
+        viz_export = f'export GRAPHIFY_VIZ_NODE_LIMIT="${{GRAPHIFY_VIZ_NODE_LIMIT:-{viz_limit}}}"\n'
+    else:
+        viz_export = ""
 
-    commit_msg = _install_hook(hooks_dir, "post-commit", hook, _HOOK_MARKER)
-    checkout_msg = _install_hook(hooks_dir, "post-checkout", checkout, _CHECKOUT_MARKER)
+    pinned = _pinned_python()
+    hook = _HOOK_SCRIPT.replace("__PINNED_PYTHON__", pinned).replace("__VIZ_LIMIT_EXPORT__", viz_export)
+    checkout = _CHECKOUT_SCRIPT.replace("__PINNED_PYTHON__", pinned).replace("__VIZ_LIMIT_EXPORT__", viz_export)
+
+    commit_msg = _install_hook(hooks_dir, "post-commit", hook, _HOOK_MARKER, _HOOK_MARKER_END)
+    checkout_msg = _install_hook(hooks_dir, "post-checkout", checkout, _CHECKOUT_MARKER, _CHECKOUT_MARKER_END)
     merge_msg = _register_merge_driver(root)
 
     return f"post-commit: {commit_msg}\npost-checkout: {checkout_msg}\nmerge driver: {merge_msg}"
@@ -677,14 +896,44 @@ def status(path: Path = Path(".")) -> str:
     if root is None:
         return "Not in a git repository."
     hooks_dir = _user_hooks_dir(_hooks_dir(root))
+    # status is a read-only diagnostic: a malformed .graphifyrc must not turn it
+    # into a traceback. Report the config problem and continue with no limit.
+    try:
+        cfg = _load_graphifyrc(root)
+    except ValueError as exc:
+        cfg = {}
+        print(f"  warning: {exc}")
+    cfg_limit = cfg.get("viz_node_limit")
 
     def _check(name: str, marker: str) -> str:
         p = hooks_dir / name
         if not p.exists():
             return "not installed"
-        return "installed" if marker in p.read_text(encoding="utf-8") else "not installed (hook exists but graphify not found)"
+        text = p.read_text(encoding="utf-8")
+        if marker not in text:
+            return "not installed (hook exists but graphify not found)"
+        if cfg_limit is not None:
+            # Baked as `"${GRAPHIFY_VIZ_NODE_LIMIT:-<n>}"` so a per-run override
+            # wins; match the default <n>, and still accept the older bare
+            # `"<n>"` form from hooks installed before that change.
+            m = re.search(
+                r'export GRAPHIFY_VIZ_NODE_LIMIT="(?:\$\{GRAPHIFY_VIZ_NODE_LIMIT:-(\d+)\}|(\d+))"',
+                text,
+            )
+            installed_limit = int(m.group(1) or m.group(2)) if m else None
+            if installed_limit != cfg_limit:
+                return (
+                    f"installed (out of date: hook has limit "
+                    f"{installed_limit if installed_limit is not None else 'unset'}, "
+                    f".graphifyrc has {cfg_limit})"
+                )
+        return "installed"
 
     commit = _check("post-commit", _HOOK_MARKER)
     checkout = _check("post-checkout", _CHECKOUT_MARKER)
     merge = _merge_driver_status(root)
-    return f"post-commit: {commit}\npost-checkout: {checkout}\nmerge driver: {merge}"
+
+    res = f"post-commit: {commit}\npost-checkout: {checkout}\nmerge driver: {merge}"
+    if cfg_limit is not None:
+        res += f"\nviz node limit: {cfg_limit}"
+    return res

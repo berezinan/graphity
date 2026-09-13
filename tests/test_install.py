@@ -40,6 +40,165 @@ def test_install_default_claude(tmp_path):
     assert (tmp_path / ".claude" / "skills" / "graphify" / "SKILL.md").exists()
 
 
+def test_install_survives_a_winerror_17_replace(tmp_path, monkeypatch):
+    """#3508: installing SKILL.md failed on some Windows setups with WinError
+    17 ("cannot move to a different disk drive") from `os.replace`, even with
+    the temp file and destination in the same directory on the same drive.
+    WinError 17 is a plain OSError, not PermissionError, so the install's
+    atomic replace must fall back to copy-then-delete for it too.
+
+    Uses "aider" (a monolith platform, no references/ sidecar) so the only
+    os.replace this install performs is the SKILL.md file replace under test
+    -- a progressive platform's separate directory replace for references/
+    isn't covered by the same fallback and would fail this test for an
+    unrelated reason.
+    """
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        exc = OSError("cannot move to a different disk drive")
+        exc.winerror = 17
+        raise exc
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    try:
+        _install(tmp_path, "aider")
+    finally:
+        monkeypatch.setattr(os, "replace", real_replace)
+
+    skill = tmp_path / ".aider" / "graphify" / "SKILL.md"
+    assert skill.exists()
+    assert not any(p.name.endswith(".tmp") for p in skill.parent.iterdir())
+
+
+def test_install_claude_md_honors_claude_config_dir(tmp_path, monkeypatch):
+    """#2694: with CLAUDE_CONFIG_DIR set, the always-on registration lands in
+    $CLAUDE_CONFIG_DIR/CLAUDE.md — not the default ~/.claude/CLAUDE.md, which the
+    old code mutated regardless of the relocated profile."""
+    from graphify.__main__ import install
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "cfg"
+    config.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    old = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        with patch("graphify.__main__.Path.home", return_value=home):
+            install(platform="claude")
+    finally:
+        os.chdir(old)
+
+    cfg_md = config / "CLAUDE.md"
+    assert cfg_md.exists(), "registration did not land in $CLAUDE_CONFIG_DIR"
+    text = cfg_md.read_text()
+    assert "# graphify" in text
+    assert str(config) in text, "skill reference does not point into the config dir"
+    assert not (home / ".claude" / "CLAUDE.md").exists(), "default profile was mutated"
+
+
+def test_install_claude_md_defaults_to_home_when_config_dir_unset(tmp_path, monkeypatch):
+    """Env unset: behavior is unchanged — the block lands in ~/.claude/CLAUDE.md
+    with the tilde skill reference."""
+    from graphify.__main__ import install
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    old = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        with patch("graphify.__main__.Path.home", return_value=tmp_path):
+            install(platform="claude")
+    finally:
+        os.chdir(old)
+
+    md = tmp_path / ".claude" / "CLAUDE.md"
+    assert md.exists()
+    assert "~/.claude/skills/graphify/SKILL.md" in md.read_text()
+
+
+def _deny_writes_to(target: Path, monkeypatch):
+    """Make write_text raise PermissionError for *target* only (simulates a
+    dotfile symlinked into a read-only store, e.g. /nix/store)."""
+    real_write_text = Path.write_text
+
+    def guarded(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", guarded)
+
+
+def test_install_survives_unwritable_claude_md(tmp_path, monkeypatch, capsys):
+    """#3474: a read-only ~/.claude/CLAUDE.md must not abort the install.
+
+    install() copies the skill files first and registers the always-on block
+    afterwards, so an unguarded write left a half-completed install plus a
+    traceback on nix/home-manager, chezmoi and stow-with-read-only-sources.
+    """
+    from graphify.__main__ import install
+
+    home = tmp_path / "home"
+    home.mkdir()
+    target = home / ".claude" / "CLAUDE.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# my rules\n")
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with patch("graphify.__main__.Path.home", return_value=home):
+        _deny_writes_to(target, monkeypatch)
+        install(platform="claude")  # must not raise
+
+    assert (home / ".claude" / "skills" / "graphify" / "SKILL.md").exists(), (
+        "skill files should still be installed"
+    )
+    assert target.read_text() == "# my rules\n", "unwritable file must be untouched"
+    err = capsys.readouterr().err
+    assert "skipped" in err
+    assert "PermissionError" in err
+
+
+def test_install_survives_unwritable_codebuddy_md(tmp_path, monkeypatch, capsys):
+    """#3474 (same shape): an unwritable CODEBUDDY.md must not abort the install."""
+    from graphify.__main__ import install
+
+    home = tmp_path / "home"
+    home.mkdir()
+    target = home / ".codebuddy" / "CODEBUDDY.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# my rules\n")
+
+    monkeypatch.chdir(tmp_path)
+    with patch("graphify.__main__.Path.home", return_value=home):
+        _deny_writes_to(target, monkeypatch)
+        install(platform="codebuddy")  # must not raise
+
+    assert (home / ".codebuddy" / "skills" / "graphify" / "SKILL.md").exists()
+    assert target.read_text() == "# my rules\n"
+    assert "skipped" in capsys.readouterr().err
+
+
+def test_install_claude_md_success_output_unchanged(tmp_path, monkeypatch, capsys):
+    """Regression guard: the writable path still reports the same messages."""
+    from graphify.__main__ import install
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    with patch("graphify.__main__.Path.home", return_value=home):
+        install(platform="claude")
+        first = capsys.readouterr().out
+        install(platform="claude")
+        second = capsys.readouterr().out
+
+    assert "  CLAUDE.md        ->  created at " in first
+    assert "  CLAUDE.md        ->  already registered (no change)" in second
+
+
 def test_install_codebuddy(tmp_path):
     _install(tmp_path, "codebuddy")
     assert (tmp_path / ".codebuddy" / "skills" / "graphify" / "SKILL.md").exists()
@@ -623,6 +782,65 @@ def test_agents_uninstall_no_op_when_not_installed(tmp_path, capsys):
     assert "nothing to do" in out
 
 
+def test_remove_marker_section_matches_exact_heading_only(tmp_path):
+    """#2062: the strip helper must match graphify's own `## graphify` heading
+    exactly, never a substring inside a user's `### graphify` H3."""
+    from graphify.install import _remove_marker_section
+    m = "## graphify"
+
+    # Only a user H3 mention -> no exact marker line -> None (file left untouched).
+    assert _remove_marker_section("# Doc\n\n### graphify\n\nmy notes\n", m) is None
+    # An inline/bullet mention is likewise not a section.
+    assert _remove_marker_section("see the ## graphify bullet\n", m) is None
+
+    # A real H2 section alongside a user H3: remove only the H2 section.
+    content = "# Doc\n\n### graphify\n\nmy notes\n\n## graphify\n\ngraphify stuff\n"
+    out = _remove_marker_section(content, m)
+    assert out is not None
+    assert "### graphify" in out and "my notes" in out
+    assert not any(l.strip() == "## graphify" for l in out.splitlines())
+    assert "graphify stuff" not in out
+
+    # The section runs to the next H2 (not stopping at a `###` inside it).
+    c2 = "## graphify\n\nintro\n\n### sub\n\ninner\n\n## Keep\n\nkeep me\n"
+    out2 = _remove_marker_section(c2, m)
+    assert "## Keep" in out2 and "keep me" in out2
+    assert "inner" not in out2 and "intro" not in out2
+
+
+def test_agents_uninstall_preserves_user_h3_graphify_heading(tmp_path):
+    """#2062 end-to-end: uninstall strips graphify's own H2 section but leaves a
+    user-authored `### graphify` H3 (and everything else) byte-intact."""
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text(
+        "# My rules\n\n"
+        "### graphify\n\n"
+        "My own notes on how I use graphify. Keep this.\n\n"
+        "## Other\n\nUnrelated content.\n"
+    )
+    _agents_install(tmp_path, "codex")  # appends a genuine `## graphify` H2 section
+    assert "## graphify" in agents_md.read_text()
+
+    _agents_uninstall(tmp_path)
+    content = agents_md.read_text()
+    assert "### graphify" in content, "user's H3 heading was deleted (#2062)"
+    assert "My own notes on how I use graphify. Keep this." in content
+    assert "## Other" in content and "Unrelated content." in content
+    assert not any(l.strip() == "## graphify" for l in content.splitlines())
+
+
+def test_uninstall_untouched_when_only_user_h3_present(tmp_path, capsys):
+    """#2062: a file with only a user `### graphify` H3 (graphify never installed)
+    must be left byte-identical, not stripped."""
+    agents_md = tmp_path / "AGENTS.md"
+    original = "# My rules\n\n### graphify\n\nHand-written. Do not touch.\n"
+    agents_md.write_text(original)
+    before = agents_md.read_bytes()
+    _agents_uninstall(tmp_path)
+    assert agents_md.read_bytes() == before
+    assert "nothing to do" in capsys.readouterr().out
+
+
 # --- OpenCode plugin tests ---
 
 
@@ -1057,3 +1275,182 @@ def test_hermes_skill_destination_posix_uses_home():
     with patch("graphify.__main__.platform.system", return_value="Linux"):
         dst = _platform_skill_destination("hermes", project=False)
     assert str(dst).endswith(".hermes/skills/graphify/SKILL.md"), dst
+
+
+def _cli_dispatched_commands() -> set[str]:
+    """Subcommand names the CLI actually dispatches.
+
+    `graphify`'s dispatcher is an `elif cmd == "..."` chain rather than a declarative
+    table, so the set is read back out of the source. Used to prove a hook command
+    written by an installer is not a stale/renamed subcommand (#2165).
+    """
+    import re
+    from graphify import cli
+
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    names = set(re.findall(r'cmd\s*==\s*"([a-z0-9][a-z0-9-]*)"', source))
+    names |= {
+        m
+        for group in re.findall(r'cmd\s+in\s+\(([^)]*)\)', source)
+        for m in re.findall(r'"([a-z0-9][a-z0-9-]*)"', group)
+    }
+    return names
+
+
+def test_codex_hook_command_is_a_real_cli_subcommand(tmp_path):
+    """#2165: the PreToolUse command in .codex/hooks.json must be a command the CLI
+    dispatches, so a renamed subcommand can never leave a permanently dead hook.
+
+    `hook-check` is intentionally a no-op on Codex (Codex Desktop rejects
+    additionalContext on PreToolUse), but it must still be a *recognized* command --
+    an unrecognized one exits non-zero and would break every Bash tool call.
+    """
+    import json
+
+    from graphify.install import _install_codex_hook
+
+    _install_codex_hook(tmp_path)
+    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+
+    entries = [
+        h
+        for group in hooks["hooks"]["PreToolUse"]
+        for h in group["hooks"]
+        if "graphify" in h.get("command", "")
+    ]
+    assert entries, "codex install must register a graphify PreToolUse hook"
+
+    dispatched = _cli_dispatched_commands()
+    assert "hook-check" in dispatched, "sanity: parser must find known commands"
+
+    for entry in entries:
+        # command is "<abs exe path> <subcommand> [args...]"
+        parts = entry["command"].split()
+        subcommand = parts[1] if len(parts) > 1 else ""
+        assert subcommand in dispatched, (
+            f"codex hook registers {subcommand!r}, which the CLI does not dispatch "
+            f"(#2165). Known commands: {sorted(dispatched)}"
+        )
+
+
+# --- #3129: project-scoped installs must not embed a machine-absolute path ----
+#
+# `--project` writes hook config that the installer then tells the user to
+# commit ("Add to version control: git add ..."). An exe path resolved from the
+# installing machine is wrong in every other clone, and the drive letter and
+# .EXE casing do not even survive between two Windows checkouts. The committed
+# hook must name `graphify` and let PATH resolve it, the way the git-hook layer
+# already does with `command -v graphify` (hooks.py). The user-profile install
+# is deliberately left alone: it stays on the machine that wrote it, and an
+# absolute path is what makes the hook work where the venv Scripts/ dir is not
+# on PATH (e.g. the VS Code Codex extension on Windows).
+
+_PROJECT_HOOK_FILES = {
+    "claude": ".claude/settings.json",
+    "codex": ".codex/hooks.json",
+    "gemini": ".gemini/settings.json",
+}
+
+
+def _hook_commands(text: str) -> list:
+    """Every hook command string in a settings/hooks JSON document."""
+    import json as _json
+
+    doc = _json.loads(text)
+    found = []
+    for groups in doc.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                if "command" in hook:
+                    found.append(hook["command"])
+    return found
+
+
+def _run_project_install(project, home, platform):
+    from graphify.__main__ import main
+
+    with patch("graphify.__main__.Path.home", return_value=home):
+        with patch("sys.argv", ["graphify", "install", "--project", "--platform", platform]):
+            main()
+
+
+@pytest.mark.parametrize("platform", sorted(_PROJECT_HOOK_FILES))
+def test_project_install_hook_command_is_portable(tmp_path, monkeypatch, platform):
+    """A committed hook must carry no absolute path, drive letter or .EXE casing."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    # Resolution would otherwise find a real graphify on this machine; pin it so
+    # the assertion fails loudly if the project path ever resolves again.
+    monkeypatch.setattr("shutil.which", lambda _name: r"C:\Users\installer\graphify.EXE")
+
+    _run_project_install(project, home, platform)
+
+    commands = _hook_commands((project / _PROJECT_HOOK_FILES[platform]).read_text(encoding="utf-8"))
+    assert commands, f"{platform} project install registered no hook command"
+    for command in commands:
+        assert command.startswith("graphify "), command
+        assert ":" not in command, f"drive letter / absolute path leaked: {command}"
+        assert "\\" not in command, f"backslash path leaked: {command}"
+        assert ".exe" not in command.lower(), f"platform exe casing leaked: {command}"
+        assert "installer" not in command, f"installing user's path leaked: {command}"
+
+
+@pytest.mark.parametrize("platform", sorted(_PROJECT_HOOK_FILES))
+def test_user_profile_install_still_resolves_absolute_path(tmp_path, monkeypatch, platform):
+    """The non-project install keeps the resolved path (#522/#1987 behaviour)."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setattr("shutil.which", lambda _name: r"C:\Users\installer\graphify.EXE")
+
+    from graphify.__main__ import main
+
+    with patch("graphify.__main__.Path.home", return_value=home):
+        with patch("sys.argv", ["graphify", platform, "install"]):
+            main()
+
+    commands = _hook_commands((project / _PROJECT_HOOK_FILES[platform]).read_text(encoding="utf-8"))
+    assert commands, f"{platform} install registered no hook command"
+    for command in commands:
+        assert command.startswith("C:/Users/installer/graphify.EXE "), command
+
+
+@pytest.mark.parametrize("platform", sorted(_PROJECT_HOOK_FILES))
+def test_project_install_is_idempotent(tmp_path, monkeypatch, platform):
+    """Installing twice leaves byte-identical config (no churn on re-install)."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setattr("shutil.which", lambda _name: r"C:\Users\installer\graphify.EXE")
+    target = project / _PROJECT_HOOK_FILES[platform]
+
+    _run_project_install(project, home, platform)
+    first = target.read_text(encoding="utf-8")
+    _run_project_install(project, home, platform)
+
+    assert target.read_text(encoding="utf-8") == first
+
+
+def test_project_uninstall_removes_the_bare_hook_command(tmp_path, monkeypatch):
+    """The uninstall filter matches on "graphify", so a bare command still goes."""
+    from graphify.__main__ import main
+
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setattr("shutil.which", lambda _name: r"C:\Users\installer\graphify.EXE")
+
+    _run_project_install(project, home, "claude")
+    settings = project / ".claude" / "settings.json"
+    assert any("hook-guard" in c for c in _hook_commands(settings.read_text(encoding="utf-8")))
+
+    with patch("graphify.__main__.Path.home", return_value=home):
+        with patch("sys.argv", ["graphify", "claude", "uninstall", "--project"]):
+            main()
+
+    assert not [c for c in _hook_commands(settings.read_text(encoding="utf-8")) if "graphify" in c]

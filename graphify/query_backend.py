@@ -28,6 +28,7 @@ from graphify.security import sanitize_label
 from graphify.serve import (
     _bfs,
     _bfs_core,
+    _complete_induced_edges,
     _dfs,
     _dfs_core,
     _filter_graph_by_context,
@@ -43,6 +44,7 @@ from graphify.serve import (
     _score_terms,
     _search_tokens,
     _strip_diacritics,
+    _traversal_view,
 )
 
 
@@ -76,6 +78,7 @@ class QueryResult:
     edges: list[EdgeRecord]
     filters: list[str] = field(default_factory=list)
     filter_source: str | None = None
+    graph_nodes: int | None = None         # size of the WHOLE graph, for the header
 
 
 @dataclass
@@ -215,12 +218,45 @@ class JsonBackend(GraphBackend):
         if not seeds:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
         filters, fsource = _resolve_context_filters(question, context_filters)
-        TG = _filter_graph_by_context(G, filters)
+        # Through _traversal_view, exactly as serve._query_graph_text does: on a
+        # DiGraph `neighbors()` yields successors only, so a leaf that is merely
+        # called/imported expands to nothing and the answer silently loses its
+        # callers. Direction survives per-edge via _src/_tgt, so rendering is
+        # unaffected; an undirected graph is returned as-is.
+        TG = _filter_graph_by_context(_traversal_view(G), filters)
         visited, edges = (_dfs if mode == "dfs" else _bfs)(TG, seeds, depth)
 
-        # Match _subgraph_to_text exactly: the query path calls it WITHOUT seeds,
-        # so nodes are ordered purely by degree desc (no seeds-first promotion).
-        ordered = sorted(visited, key=lambda n: TG.degree(n), reverse=True)
+        # Match _subgraph_to_text exactly. It no longer orders by degree alone:
+        # the query path now passes its seeds (#BUG2), so the queried symbol
+        # renders first and the rest rank by hop distance from it — otherwise an
+        # incidental high-degree hub pushes the node that answers the question
+        # past the budget cut. Distance is recomputed over BOTH edge directions
+        # because _bfs/_dfs return a set and discovery order is gone.
+        seed_set = set(seeds)
+        seed_hits = [n for n in seeds if n in visited]
+
+        def _adj(n):
+            if TG.is_directed():
+                yield from TG.successors(n)
+                yield from TG.predecessors(n)
+            else:
+                yield from TG.neighbors(n)
+
+        dist: dict[str, int] = {n: 0 for n in seed_hits}
+        frontier, hop = seed_hits, 0
+        while frontier:
+            hop += 1
+            nxt = []
+            for n in frontier:
+                for nb in _adj(n):
+                    if nb in visited and nb not in dist:
+                        dist[nb] = hop
+                        nxt.append(nb)
+            frontier = nxt
+        ordered = seed_hits + sorted(
+            visited - seed_set,
+            key=lambda n: (dist.get(n, 1 << 30), -TG.degree(n), str(n)),
+        )
         node_recs = [
             NodeRecord(
                 label=TG.nodes[n].get("label", n),
@@ -234,9 +270,18 @@ class JsonBackend(GraphBackend):
         for u, v in edges:
             if u in visited and v in visited:
                 d = edge_data(TG, u, v)
+                # (u, v) is visit order, not direction: traversing undirected
+                # walks callers and callees alike, so a caller->callee edge
+                # renders backwards whenever the callee is reached first.
+                # _src/_tgt (stashed by _traversal_view and the query loader)
+                # carry the real direction; trust them only when they name THIS
+                # edge's endpoints, else a stray marker would KeyError below.
+                src, tgt = d.get("_src", u), d.get("_tgt", v)
+                if {src, tgt} != {u, v}:
+                    src, tgt = u, v
                 edge_recs.append(EdgeRecord(
-                    source_label=TG.nodes[u].get("label", u),
-                    target_label=TG.nodes[v].get("label", v),
+                    source_label=TG.nodes[src].get("label", src),
+                    target_label=TG.nodes[tgt].get("label", tgt),
                     relation=str(d.get("relation", "")),
                     confidence=str(d.get("confidence", "")),
                     context=str(d.get("context", "") or ""),
@@ -246,6 +291,7 @@ class JsonBackend(GraphBackend):
             seeds=[G.nodes[n].get("label", n) for n in seeds],
             total_nodes=len(visited), nodes=node_recs, edges=edge_recs,
             filters=filters, filter_source=fsource,
+            graph_nodes=G.number_of_nodes(),
         )
 
     def get_node(self, label) -> NodeDetail | None:
@@ -331,10 +377,51 @@ class JsonBackend(GraphBackend):
                 top, runner = scored[0][0], scored[1][0]
                 if top > 0 and (top - runner) / top < 0.10:
                     warnings.append(f"warning: {name} match was ambiguous (top score {top:g}, runner-up {runner:g})")
+        # Honour the graph's own directedness instead of always flattening it
+        # (#2487): the CLI loads directed by default and undirected only on
+        # --undirected, so forcing to_undirected() here made the flag a no-op and
+        # reported a backwards walk as a real path.
+        directed = G.is_directed()
+        if directed:
+            # Walk by the stored markers, not the arc order: on a canonicalized
+            # graph a link can be persisted flipped, with `_src`/`_tgt` carrying
+            # the truth (#2309). Searching the raw arcs then reports "no directed
+            # path" for an edge that does point the asked-for way.
+            search_g = nx.DiGraph()
+            search_g.add_nodes_from(G.nodes())
+            for u, v in G.edges():
+                e = edge_data(G, u, v)
+                s, tg = e.get("_src", u), e.get("_tgt", v)
+                if {s, tg} != {u, v}:
+                    s, tg = u, v
+                search_g.add_edge(s, tg)
+        else:
+            search_g = G.to_undirected(as_view=True)
         try:
-            path_nodes = nx.shortest_path(G.to_undirected(as_view=True), s_id, t_id)
+            # All shortest paths, then the lexicographically smallest by node id:
+            # several routes of equal length are common (#2074) and nx returns
+            # whichever adjacency order yields first, so the same question
+            # answered differently between runs under a different hash seed.
+            path_nodes = min(
+                (list(p) for p in nx.all_shortest_paths(search_g, s_id, t_id)),
+                key=lambda p: [str(n) for n in p],
+            )
         except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return PathResult(found=False, reason="no-path", warnings=warnings,
+            # "No path at all" and "no path THAT WAY" are different answers, and
+            # only the second one is fixed by --undirected. Suggesting the flag
+            # for genuinely disconnected nodes sends the caller down a retry that
+            # cannot work, so ask the undirected question before choosing.
+            blocked_by_direction = False
+            if directed:
+                try:
+                    nx.shortest_path(G.to_undirected(as_view=True), s_id, t_id)
+                    blocked_by_direction = True
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    pass
+            return PathResult(found=False,
+                              reason=("no-path-directed" if blocked_by_direction
+                                      else "no-path-directed-none" if directed else "no-path"),
+                              warnings=warnings,
                               start_label=G.nodes[s_id].get("label", s_id),
                               end_label=G.nodes[t_id].get("label", t_id))
         hops = len(path_nodes) - 1
@@ -343,10 +430,16 @@ class JsonBackend(GraphBackend):
         segments: list[PathSegment] = []
         for i in range(len(path_nodes) - 1):
             u, v = path_nodes[i], path_nodes[i + 1]
-            if G.has_edge(u, v):
-                d, outgoing = edge_data(G, u, v), True
-            else:
-                d, outgoing = edge_data(G, v, u), False
+            d = edge_data(G, u, v) if G.has_edge(u, v) else edge_data(G, v, u)
+            # Direction from the stored markers, not from which way the walk
+            # crossed the edge: on an undirected load has_edge() is true both
+            # ways, so every segment rendered as outgoing and a caller was shown
+            # as the callee (#2309). Markers are trusted only when they name
+            # this edge's endpoints.
+            src, tgt = d.get("_src", u), d.get("_tgt", v)
+            if {src, tgt} != {u, v}:
+                src, tgt = (u, v) if G.has_edge(u, v) else (v, u)
+            outgoing = src == u
             segments.append(PathSegment(outgoing=outgoing, relation=d.get("relation", ""),
                                         confidence=d.get("confidence", ""),
                                         label=G.nodes[v].get("label", v)))
@@ -366,13 +459,27 @@ class JsonBackend(GraphBackend):
             degree=self.G.degree(nid),
         )
         conns: list[Connection] = []
+
+        def _outgoing(e: dict, other: str, default: bool) -> bool:
+            """Whether this edge leaves `nid`, by the stored markers.
+
+            Arc order alone is not the truth: a link persisted in flipped
+            endpoint order carries its direction in `_src` (#2309), so
+            classifying by which adjacency list it came from showed a caller as
+            a callee. Markers are trusted only when they name this edge.
+            """
+            src, tgt = e.get("_src"), e.get("_tgt")
+            if src is None or tgt is None or {src, tgt} != {nid, other}:
+                return default          # which adjacency list it came from
+            return src == nid
+
         for nb in self.G.successors(nid):
             e = edge_data(self.G, nid, nb)
-            conns.append(Connection(True, self.G.nodes[nb].get("label", nb),
+            conns.append(Connection(_outgoing(e, nb, True), self.G.nodes[nb].get("label", nb),
                                     str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb)))
         for nb in self.G.predecessors(nid):
             e = edge_data(self.G, nb, nid)
-            conns.append(Connection(False, self.G.nodes[nb].get("label", nb),
+            conns.append(Connection(_outgoing(e, nb, False), self.G.nodes[nb].get("label", nb),
                                     str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb)))
         return ExplainResult(detail=detail, connections=conns)
 
@@ -384,13 +491,30 @@ class JsonBackend(GraphBackend):
 # --------------------------------------------------------------------------- #
 # Renderers - the single place text is formatted + sanitized (F-010)
 # --------------------------------------------------------------------------- #
-def render_query(r: QueryResult, token_budget: int = 2000) -> str:
+def render_query(r: QueryResult, token_budget: int = 2000, *,
+                 context_filters=None, graph_path: str | None = None) -> str:
+    """Render a query answer.
+
+    ``graph_path`` prefixes the header with the graph the answer came from
+    (#2789), matching `serve._query_graph_text`: `graphify-out/` resolves
+    against the CWD, so an answer taken from a parent project's graph is
+    otherwise indistinguishable from the one you meant. ``context_filters`` is
+    accepted so the CLI can show what it resolved even when the backend
+    reported none.
+    """
     if not r.seeds:
         return "No matching nodes found."
     parts = [f"Traversal: {r.mode.upper()} depth={r.depth}", f"Start: {r.seeds}"]
-    if r.filters:
-        parts.append(f"Context: {', '.join(r.filters)} ({r.filter_source})")
+    filters = r.filters or (list(context_filters) if context_filters else [])
+    if filters:
+        parts.append(f"Context: {', '.join(filters)} ({r.filter_source})")
     parts.append(f"{r.total_nodes} nodes found")
+    if graph_path:
+        from graphify.serve import _display_graph_path
+        # Размер ГРАФА, не обхода: «355 nodes» против «3178 nodes» — обычно
+        # первое, что выдаёт ответ из чужого корпуса (#2789).
+        _n = r.graph_nodes if r.graph_nodes is not None else r.total_nodes
+        parts.insert(0, f"Graph: {_display_graph_path(graph_path)} ({_n} nodes)")
     header = " | ".join(parts) + "\n\n"
 
     lines = [
@@ -410,11 +534,44 @@ def render_query(r: QueryResult, token_budget: int = 2000) -> str:
     if len(output) > char_budget:
         cut_at = output[:char_budget].rfind("\n")
         cut_at = cut_at if cut_at > 0 else char_budget
+        # Never cut the seed nodes: they render first, so if the budget lands
+        # inside the seed block, extend the cut to cover it. The symbol the
+        # question named must always be in the answer (#BUG2).
+        n_seed_lines = min(len(r.seeds), len(lines))
+        if n_seed_lines:
+            seed_block_end = sum(len(lines[i]) + 1 for i in range(n_seed_lines)) - 1
+            cut_at = max(cut_at, min(seed_block_end, len(output)))
         total_nodes = sum(1 for l in lines if l.startswith("NODE "))
         shown = output[:cut_at].count("\nNODE ") + (1 if output.startswith("NODE ") else 0)
+        cut_count = total_nodes - shown
+        if cut_count == 0:
+            # Every node fits but nodes+edges do not. Edges are never dropped
+            # once every node fits, so this is the complete answer — say it is
+            # over budget rather than warning about nodes that were never cut
+            # (#2601, #2784).
+            total_edges = sum(1 for l in lines if l.startswith("EDGE "))
+            est_tokens = len(output) // 3
+            return header + (
+                f"[i] Complete answer over budget: all {total_nodes} nodes and "
+                f"{total_edges} edges shown (~{est_tokens} tokens vs the "
+                f"requested ~{token_budget}-token budget). Edges are never "
+                f"dropped once every node fits, so this is already the full "
+                f"answer — raising --budget further will not shrink it. Narrow "
+                f"with context_filter=['call'] or use get_node for a specific "
+                f"symbol to reduce size instead.\n\n"
+            ) + output
+        # Prominent notice at the TOP as well as the end marker, mirroring
+        # `serve._subgraph_to_text`: silence reads as absence, so a truncated
+        # answer must never be mistakable for a complete one. Both wrapper lines
+        # sit OUTSIDE char_budget by design.
         output = (
-            output[:cut_at]
-            + f"\n... (truncated — {total_nodes - shown} more nodes cut by ~{token_budget}-token budget."
+            f"[!] TRUNCATED: showing {shown} of {total_nodes} nodes "
+            f"(~{token_budget}-token budget). The answer may be among the "
+            f"{cut_count} cut nodes — raise the token budget (CLI: --budget) or "
+            f"narrow the query (e.g. context_filter=['call'], or get_node for a "
+            f"specific symbol).\n\n"
+            + output[:cut_at]
+            + f"\n... (truncated — {cut_count} more nodes cut by ~{token_budget}-token budget."
             f" Narrow with context_filter=['call'] or use get_node for a specific symbol)"
         )
     return header + output
@@ -487,7 +644,19 @@ def render_path(p: PathResult, source: str, target: str, max_hops: int = 8) -> s
         if p.reason == "same-node":
             return (f"'{source}' and '{target}' both resolved to the same node "
                     f"'{p.start_label}'. Use a more specific label or the exact node ID.")
-        if p.reason == "no-path":
+        if p.reason == "no-path" or p.reason.startswith("no-path-directed"):
+            # Name the direction when the search respected it (#2487): otherwise
+            # "no path" reads as "these are unrelated" when the real answer is
+            # "not in that direction — try --undirected".
+            if p.reason.startswith("no-path-directed"):
+                # The mode that was searched is named either way (#2487), but the
+                # --undirected hint is added only when an undirected path really
+                # exists: advising a retry that cannot succeed is worse than
+                # silence for two genuinely disconnected nodes.
+                hint = (" Retry with --undirected to walk edges in either direction."
+                        if p.reason == "no-path-directed" else "")
+                return (f"No directed path found between '{p.start_label}' and "
+                        f"'{p.end_label or target}'.{hint}")
             return f"No path found between '{p.start_label}' and '{p.end_label or target}'."
         if p.reason.startswith("too-long:"):
             return f"Path exceeds max_hops={max_hops} ({p.reason.split(':', 1)[1]} hops found)."
@@ -495,10 +664,13 @@ def render_path(p: PathResult, source: str, target: str, max_hops: int = 8) -> s
     segments = [p.start_label]
     for seg in p.segments:
         conf = f" [{seg.confidence}]" if seg.confidence else ""
+        # An edge with no stored relation prints an honest "related" rather than
+        # an empty "---->" arrow, which read as a rendering bug (#2074).
+        rel = seg.relation or "related"
         if seg.outgoing:
-            segments.append(f"--{seg.relation}{conf}--> {seg.label}")
+            segments.append(f"--{rel}{conf}--> {seg.label}")
         else:
-            segments.append(f"<--{seg.relation}{conf}-- {seg.label}")
+            segments.append(f"<--{rel}{conf}-- {seg.label}")
     prefix = ("\n".join(p.warnings) + "\n") if p.warnings else ""
     return prefix + f"Shortest path ({p.hops} hops):\n  " + " ".join(segments)
 
@@ -1105,7 +1277,12 @@ class ArcadeDBBackend(GraphBackend):
     def _neighborhood(self, seeds: list[str], depth: int):
         rows = self._run(
             "SELECT id, label, source_file, source_location, community, degree FROM "
-            f"(TRAVERSE out('Rel') FROM (SELECT FROM Node WHERE id_key IN :s) MAXDEPTH {depth}) WHERE @type = 'Node'",
+            # both(), not out(): the JSON path traverses through
+            # `serve._traversal_view`, which walks callers as well as callees, so
+            # fetching only the out-neighbourhood here makes the same query
+            # return fewer nodes on this backend than on the other. Direction is
+            # still recovered per edge when rendering.
+            f"(TRAVERSE both('Rel') FROM (SELECT FROM Node WHERE id_key IN :s) MAXDEPTH {depth}) WHERE @type = 'Node'",
             params={"s": [_id_key(s) for s in seeds]},
         )
         vids = {r["id"] for r in rows}
@@ -1187,9 +1364,55 @@ class ArcadeDBBackend(GraphBackend):
         # fetched neighborhood.
         threshold, deg = self._degree_model(node_attrs, fset)
         core = _dfs_core if mode == "dfs" else _bfs_core
-        visited, edges = core(lambda n: list(H.successors(n)) if n in H else [], deg, seeds, depth, threshold)
+        # Both directions, mirroring `serve._traversal_view` on the JSON path: H
+        # is a DiGraph so rendering can recover caller->callee, but successors
+        # alone expand a leaf that is merely called into nothing, and the two
+        # backends would then answer differently for the same graph.
+        def _neighbors(n):
+            if n not in H:
+                return []
+            seen, out = set(), []
+            for nb in list(H.successors(n)) + list(H.predecessors(n)):
+                if nb not in seen:
+                    seen.add(nb)
+                    out.append(nb)
+            return out
 
-        ordered = sorted(visited, key=deg, reverse=True)
+        visited, edges = core(_neighbors, deg, seeds, depth, threshold)
+        # Same induced-subgraph completion the JSON path gets via _bfs/_dfs (#2323):
+        # the traversal records only discovering edges, so an edge between two
+        # visited nodes would render as a missing link. H is the fetched
+        # neighborhood, already context-filtered above.
+        _complete_induced_edges(H, visited, edges)
+
+        # Same seeds-first, hop-distance ordering JsonBackend and
+        # `serve._subgraph_to_text` use (#BUG2). Ordering by degree alone lets an
+        # incidental hub push the node that answers the question past the budget
+        # cut — and it would diverge from the JSON path, which parity tests pin.
+        seed_set = set(seeds)
+        seed_hits = [n for n in seeds if n in visited]
+
+        def _adj(n):
+            if n not in H:
+                return
+            yield from H.successors(n)
+            yield from H.predecessors(n)
+
+        dist: dict[str, int] = {n: 0 for n in seed_hits}
+        frontier, hop = seed_hits, 0
+        while frontier:
+            hop += 1
+            nxt = []
+            for n in frontier:
+                for nb in _adj(n):
+                    if nb in visited and nb not in dist:
+                        dist[nb] = hop
+                        nxt.append(nb)
+            frontier = nxt
+        ordered = seed_hits + sorted(
+            visited - seed_set,
+            key=lambda n: (dist.get(n, 1 << 30), -deg(n), str(n)),
+        )
         nodes_rec = [
             NodeRecord(label=node_attrs[n].get("label", n), source_file=str(node_attrs[n].get("source_file", "") or ""),
                        source_location=str(node_attrs[n].get("source_location", "") or ""),
@@ -1207,7 +1430,8 @@ class ArcadeDBBackend(GraphBackend):
                 ))
         seed_labels = [node_attrs.get(s, {}).get("label", s) for s in seeds]
         return QueryResult(mode=mode, depth=depth, seeds=seed_labels, total_nodes=len(visited),
-                           nodes=nodes_rec, edges=edge_rec, filters=filters, filter_source=fsource)
+                           nodes=nodes_rec, edges=edge_rec, filters=filters, filter_source=fsource,
+                           graph_nodes=self._node_count())
 
     # ---- point lookups ------------------------------------------------------
     def get_node(self, label) -> NodeDetail | None:

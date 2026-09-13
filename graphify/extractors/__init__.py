@@ -22,6 +22,7 @@ from graphify.extractors.bsl import (
     extract_edt_oform,
     extract_edt_rights,
 )
+from graphify.extractors.commonlisp import extract_commonlisp
 from graphify.extractors.dart import extract_dart
 from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract_dmm
 from graphify.extractors.elixir import extract_elixir
@@ -47,6 +48,7 @@ LANGUAGE_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     "bash": extract_bash,
     "blade": extract_blade,
     "bsl": extract_bsl,
+    "commonlisp": extract_commonlisp,
     "dart": extract_dart,
     "delphi_form": extract_delphi_form,
     "dm": extract_dm,

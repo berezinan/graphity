@@ -60,7 +60,10 @@ def test_path_no_path(monkeypatch, tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         _run(monkeypatch, ["graphify", "path", "extract", "island", "--graph", str(gp)])
     assert exc.value.code == 0
-    assert capsys.readouterr().out == "No path found between 'extract' and 'island'.\n"
+    # #2487 (апстрим 0.9.61): path по умолчанию направленный, поэтому сообщение
+    # называет режим, в котором шёл поиск. Подсказки про --undirected здесь нет:
+    # цель действительно разъединена, обход в обе стороны её тоже не найдёт.
+    assert capsys.readouterr().out == "No directed path found between 'extract' and 'island'.\n"
 
 
 def test_explain(monkeypatch, tmp_path, capsys):
