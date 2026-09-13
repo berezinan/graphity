@@ -1610,11 +1610,6 @@ def dispatch_command(cmd: str) -> None:
         if _cfg["kind"] == "arcadedb":
             backend = require_backend(config=_cfg)
             _corpus = _cfg["database"]
-            if undirected:
-                # Сказать прямо, а не проигнорировать молча: направление
-                # задаётся при загрузке графа, а у ArcadeDB загрузки нет.
-                print("note: --undirected is not supported on the arcadedb "
-                      "backend; traversing as stored.", file=sys.stderr)
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -1652,7 +1647,8 @@ def dispatch_command(cmd: str) -> None:
             backend = JsonBackend(G)
             _corpus = str(gp)
         # CLI path is unbounded (unlike the MCP tool's max_hops default).
-        result = backend.shortest_path(source_label, target_label, max_hops=10**9)
+        result = backend.shortest_path(source_label, target_label,
+                                       max_hops=10**9, undirected=undirected)
         if not result.found:
             if result.reason == "no-source":
                 print(f"No node matching '{source_label}' found.", file=sys.stderr)
@@ -1731,6 +1727,11 @@ def dispatch_command(cmd: str) -> None:
             print(f"No node matching '{label}' found.")
             sys.exit(0)
         print(render_explain(result, label))
+        if result.ambiguous:
+            # Ненулевой код: ответ не получен, а не получен один из нескольких.
+            # Нулевой выход здесь читается вызывающим скриптом как успех, и
+            # подсказка про path::symbol остаётся незамеченной.
+            sys.exit(1)
         # Work-memory overlay: a derived experiential hint from `graphify reflect`,
         # merged in display-only from the .graphify_learning.json sidecar next to
         # graph.json. No line when the node has no overlay entry.

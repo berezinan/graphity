@@ -142,7 +142,10 @@ def test_shortest_path_no_path_parity(backends):
     j = render_path(jb.shortest_path("extract", "isolated"), "extract", "isolated")
     a = render_path(arc.shortest_path("extract", "isolated"), "extract", "isolated")
     assert j == a
-    assert "No path found" in a
+    # #2487: поиск направленный по умолчанию, поэтому сообщение называет режим.
+    # Подсказки про --undirected нет — n5 изолирован, обход в обе стороны его
+    # тоже не найдёт.
+    assert "No directed path found" in a
 
 
 @pytest.mark.parametrize("label", ["build", "cluster", "extract"])

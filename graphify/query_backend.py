@@ -33,6 +33,7 @@ from graphify.serve import (
     _dfs_core,
     _filter_graph_by_context,
     _find_node,
+    find_node_ambiguity,
     _hub_threshold,
     _idf_value,
     _pick_scored_endpoint,
@@ -90,6 +91,11 @@ class NodeDetail:
     file_type: str = ""
     community: str = ""
     degree: int = 0
+    # C/C++/ObjC: символ, объявленный в заголовке и определённый в соседнем
+    # файле, — ОДИН узел, привязанный к заголовку, поэтому Source указывает на
+    # объявление. Называем и место определения, когда оно известно.
+    definition_file: str = ""
+    definition_location: str = ""
 
 
 @dataclass
@@ -155,12 +161,21 @@ class Connection:
     relation: str = ""
     confidence: str = ""
     degree: int = 0                        # neighbour degree, used to rank connections
+    # Место САМОЙ связи (строка вызова/импорта в файле источника), а не строка
+    # определения соседа: на вопрос «кто это вызывает» нужна кликабельная точка
+    # вызова, а не def вызывающего (#BUG1).
+    source_file: str = ""
+    source_location: str = ""
 
 
 @dataclass
 class ExplainResult:
     detail: NodeDetail
     connections: list[Connection] = field(default_factory=list)
+    # Кандидаты (source_file, id), когда метка попадает в несколько файлов.
+    # Непустой список означает, что ответ ненадёжен: молча взятый первый
+    # кандидат читается как единственный.
+    ambiguous: list[tuple[str, str]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +204,8 @@ class GraphBackend(ABC):
     def graph_stats(self) -> GraphStats: ...
 
     @abstractmethod
-    def shortest_path(self, source: str, target: str, *, max_hops: int = 8) -> PathResult: ...
+    def shortest_path(self, source: str, target: str, *, max_hops: int = 8,
+                      undirected: bool = False) -> PathResult: ...
 
     @abstractmethod
     def explain(self, label: str) -> ExplainResult | None: ...
@@ -356,7 +372,7 @@ class JsonBackend(GraphBackend):
             ambiguous_pct=round(confs.count("AMBIGUOUS") / total * 100),
         )
 
-    def shortest_path(self, source, target, *, max_hops=8) -> PathResult:
+    def shortest_path(self, source, target, *, max_hops=8, undirected=False) -> PathResult:
         G = self.G
         src_scored = _score_nodes(G, [t.lower() for t in source.split()])
         tgt_scored = _score_nodes(G, [t.lower() for t in target.split()])
@@ -381,7 +397,9 @@ class JsonBackend(GraphBackend):
         # (#2487): the CLI loads directed by default and undirected only on
         # --undirected, so forcing to_undirected() here made the flag a no-op and
         # reported a backwards walk as a real path.
-        directed = G.is_directed()
+        # Направление — намерение вызывающего, а не свойство загрузки: иначе
+        # тот же флаг приходится кодировать дважды, и бэкенды расходятся.
+        directed = G.is_directed() and not undirected
         if directed:
             # Walk by the stored markers, not the arc order: on a canonicalized
             # graph a link can be persisted flipped, with `_src`/`_tgt` carrying
@@ -457,7 +475,14 @@ class JsonBackend(GraphBackend):
             source_file=str(d.get("source_file", "")), source_location=str(d.get("source_location", "")),
             file_type=str(d.get("file_type", "")), community=str(d.get("community", "")),
             degree=self.G.degree(nid),
+            definition_file=str(d.get("definition_file", "") or ""),
+            definition_location=str(d.get("definition_location", "") or ""),
         )
+        # Взятый молча первый кандидат читается как единственный: две рабочих
+        # области, каждая со своим MetricsPort, попадают в один тир и
+        # различаются только порядком обхода графа.
+        rivals = find_node_ambiguity(self.G, label)
+        ambiguous = [(str(self.G.nodes[r].get("source_file") or r), r) for r in rivals]
         conns: list[Connection] = []
 
         def _outgoing(e: dict, other: str, default: bool) -> bool:
@@ -476,12 +501,16 @@ class JsonBackend(GraphBackend):
         for nb in self.G.successors(nid):
             e = edge_data(self.G, nid, nb)
             conns.append(Connection(_outgoing(e, nb, True), self.G.nodes[nb].get("label", nb),
-                                    str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb)))
+                                    str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
+                                    source_file=str(e.get("source_file", "") or ""),
+                                    source_location=str(e.get("source_location", "") or "")))
         for nb in self.G.predecessors(nid):
             e = edge_data(self.G, nb, nid)
             conns.append(Connection(_outgoing(e, nb, False), self.G.nodes[nb].get("label", nb),
-                                    str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb)))
-        return ExplainResult(detail=detail, connections=conns)
+                                    str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
+                                    source_file=str(e.get("source_file", "") or ""),
+                                    source_location=str(e.get("source_location", "") or "")))
+        return ExplainResult(detail=detail, connections=conns, ambiguous=ambiguous)
 
     def pr_impact(self, files) -> tuple[list[int], int]:
         from graphify.prs import compute_pr_impact
@@ -590,17 +619,30 @@ def render_node(d: NodeDetail | None, label: str) -> str:
     ])
 
 
-def render_neighbors(n: Neighbors | None, label: str) -> str:
+def render_neighbors(n: Neighbors | None, label: str,
+                     token_budget: int | None = None) -> str:
+    """Соседи узла; при заданном бюджете вывод режется по границе строки.
+
+    Бюджет живёт здесь, а не в бэкенде: узел-хаб на большом корпусе иначе
+    заливает контекст вызывающего целиком, и оба бэкенда обязаны обрезать
+    одинаково (#2069).
+    """
     if n is None:
         return f"No node matching '{label}' found."
     lines = [f"Neighbors of {sanitize_label(n.label)}:"]
     for nb in n.neighbors:
         arrow = "  -->" if nb.outgoing else "  <--"
         lines.append(f"{arrow} {sanitize_label(nb.label)} [{sanitize_label(nb.relation)}] [{sanitize_label(nb.confidence)}]")
+    if token_budget:
+        from graphify.serve import _cut_lines_to_budget
+        return _cut_lines_to_budget(
+            lines, token_budget,
+            "Narrow with relation_filter or use get_node for a specific symbol.")
     return "\n".join(lines)
 
 
-def render_community(c: CommunityRecord | None, cid: int) -> str:
+def render_community(c: CommunityRecord | None, cid: int,
+                     token_budget: int | None = None) -> str:
     if c is None:
         return f"Community {cid} not found."
     # Header "Community N — Name" (#1448); skip the name when it is just the
@@ -615,6 +657,11 @@ def render_community(c: CommunityRecord | None, cid: int) -> str:
     lines = [f"{header} ({len(c.members)} nodes):"]
     for m in c.members:
         lines.append(f"  {sanitize_label(m.label)} [{sanitize_label(m.source_file)}]")
+    if token_budget:
+        from graphify.serve import _cut_lines_to_budget
+        return _cut_lines_to_budget(
+            lines, token_budget,
+            "Use get_node for a specific symbol or query for a focused subgraph.")
     return "\n".join(lines)
 
 
@@ -679,23 +726,54 @@ def render_explain(r: ExplainResult | None, label: str, *, max_connections: int 
     """Reproduce the `graphify explain` node card + degree-ranked connections."""
     if r is None:
         return f"No node matching '{label}' found."
+    if r.ambiguous:
+        # Печатаем ВСЕХ кандидатов, а не молча берём первого: иначе один
+        # произвольный файл подаётся как ответ, и уверенность вывода ничем не
+        # отличается от случая, когда совпадение единственное.
+        out = [f"Ambiguous: '{label}' matches {len(r.ambiguous)} nodes in different files."]
+        for source_file, nid in r.ambiguous:
+            out.append(f"  {source_file}")
+            out.append(f"    id: {nid}")
+        out.append(f"Retry with path::symbol using one of the paths above "
+                   f"(e.g. <path>::{label}) or the full node id.")
+        return "\n".join(out)
     d = r.detail
     lines = [
         f"Node: {d.label}",
         f"  ID:        {d.id}",
         f"  Source:    {d.source_file} {d.source_location}".rstrip(),
+    ]
+    if d.definition_file:
+        lines.append(f"  Defined in: {d.definition_file} {d.definition_location}".rstrip())
+    lines += [
         f"  Type:      {d.file_type}",
         f"  Community: {d.community}",
         f"  Degree:    {d.degree}",
     ]
     conns = r.connections
     if conns:
+        ranked = sorted(conns, key=lambda c: c.degree, reverse=True)
         lines.append(f"\nConnections ({len(conns)}):")
-        for c in sorted(conns, key=lambda c: c.degree, reverse=True)[:max_connections]:
+        for c in ranked[:max_connections]:
             arrow = "-->" if c.outgoing else "<--"
-            lines.append(f"  {arrow} {c.label} [{c.relation}] [{c.confidence}]")
-        if len(conns) > max_connections:
-            lines.append(f"  ... and {len(conns) - max_connections} more")
+            # Место РЕБРА — точка вызова в файле источника, а не def соседа.
+            at = f" {c.source_file}:{c.source_location}" if c.source_location else ""
+            lines.append(f"  {arrow} {c.label} [{c.relation}] [{c.confidence}]{at}")
+        cut = ranked[max_connections:]
+        if cut:
+            lines.append(f"  ... and {len(cut)} more")
+            # Голое «и ещё N» прячет ответ на вопрос «кто это вызывает» на узле
+            # высокой степени и отправляет обратно к grep. Сводим срезанное по
+            # файлам — счётчики обязаны сходиться к len(cut).
+            groups: dict[tuple[bool, str], int] = {}
+            for c in cut:
+                key = (c.outgoing, c.source_file or "<unknown>")
+                groups[key] = groups.get(key, 0) + 1
+            lines.append("  Grouped by file:")
+            for (outgoing, sfile), n in sorted(
+                    groups.items(), key=lambda kv: (-kv[1], kv[0][1], kv[0][0])):
+                arrow = "-->" if outgoing else "<--"
+                lines.append(f"    {arrow} {sfile}: {n} connection{'s' if n != 1 else ''}")
     return "\n".join(lines)
 
 
@@ -1528,7 +1606,7 @@ class ArcadeDBBackend(GraphBackend):
                           inferred_pct=round(counts.get("INFERRED", 0) / total * 100),
                           ambiguous_pct=round(counts.get("AMBIGUOUS", 0) / total * 100))
 
-    def shortest_path(self, source, target, *, max_hops=8) -> PathResult:
+    def shortest_path(self, source, target, *, max_hops=8, undirected=False) -> PathResult:
         src = self._score([t.lower() for t in source.split()])
         tgt = self._score([t.lower() for t in target.split()])
         if not src:
@@ -1546,13 +1624,25 @@ class ArcadeDBBackend(GraphBackend):
         # Clamp the variable-length upper bound so an "unlimited" caller can't ask
         # ArcadeDB for a pathological `*..1000000000` expansion.
         bound = min(max(max_hops, 1), 64)
-        rows = self._run(
-            f"MATCH (a:Node {{id_key:$s}}),(b:Node {{id_key:$t}}), p=shortestPath((a)-[:Rel*..{bound}]-(b)) "
-            "RETURN [n IN nodes(p) | n.id] AS ids",
-            kind="query", language="cypher", params={"s": _id_key(s_id), "t": _id_key(t_id)})
-        ids = rows[0]["ids"] if rows and rows[0].get("ids") else None
+        # Стрелка в шаблоне ребра — это и есть направленность поиска. Без неё
+        # --undirected на этом бэкенде молча игнорировался, и тот же вопрос
+        # получал разные ответы на JSON- и DB-пути.
+        arrow = f"-[:Rel*..{bound}]-" if undirected else f"-[:Rel*..{bound}]->"
+        def _find(edge_pattern: str):
+            rows = self._run(
+                f"MATCH (a:Node {{id_key:$s}}),(b:Node {{id_key:$t}}), "
+                f"p=shortestPath((a){edge_pattern}(b)) RETURN [n IN nodes(p) | n.id] AS ids",
+                kind="query", language="cypher",
+                params={"s": _id_key(s_id), "t": _id_key(t_id)})
+            return rows[0]["ids"] if rows and rows[0].get("ids") else None
+        ids = _find(arrow)
         if not ids:
-            return PathResult(found=False, reason="no-path", start_label=s_label,
+            # Как на JSON-пути: «нет пути вовсе» и «нет пути в эту сторону» —
+            # разные ответы, и только второй лечится флагом --undirected.
+            blocked = bool(not undirected and _find(f"-[:Rel*..{bound}]-"))
+            reason = ("no-path-directed" if blocked
+                      else "no-path-directed-none" if not undirected else "no-path")
+            return PathResult(found=False, reason=reason, start_label=s_label,
                               end_label=self._label_of(t_id), warnings=warnings)
         hops = len(ids) - 1
         if hops > max_hops:
@@ -1584,7 +1674,8 @@ class ArcadeDBBackend(GraphBackend):
         if node is None:
             return None
         nid = node["id"]
-        rows = self._run("SELECT id, label, source_file, source_location, file_type, community, degree "
+        rows = self._run("SELECT id, label, source_file, source_location, file_type, community, degree, "
+                        "definition_file, definition_location "
                         "FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})
         if not rows:
             return None
@@ -1595,20 +1686,37 @@ class ArcadeDBBackend(GraphBackend):
             file_type=str(r.get("file_type", "") or ""),
             community=str(r.get("community") if r.get("community") is not None else ""),
             degree=int(r.get("degree") or 0),
+            definition_file=str(r.get("definition_file", "") or ""),
+            definition_location=str(r.get("definition_location", "") or ""),
         )
         out = self._run(
             "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
-            "RETURN b.label AS lbl, b.degree AS deg, r.relation AS relation, r.confidence AS confidence",
+            "RETURN b.label AS lbl, b.degree AS deg, r.relation AS relation, r.confidence AS confidence, "
+            "r.source_file AS sfile, r.source_location AS sloc",
             kind="query", language="cypher", params={"id": _id_key(nid)})
         inc = self._run(
             "MATCH (a:Node)-[r:Rel]->(b:Node {id_key:$id}) "
-            "RETURN a.label AS lbl, a.degree AS deg, r.relation AS relation, r.confidence AS confidence",
+            "RETURN a.label AS lbl, a.degree AS deg, r.relation AS relation, r.confidence AS confidence, "
+            "r.source_file AS sfile, r.source_location AS sloc",
             kind="query", language="cypher", params={"id": _id_key(nid)})
-        conns = [Connection(True, x.get("lbl", ""), str(x.get("relation", "")), str(x.get("confidence", "")),
-                            int(x.get("deg") or 0)) for x in out]
-        conns += [Connection(False, x.get("lbl", ""), str(x.get("relation", "")), str(x.get("confidence", "")),
-                             int(x.get("deg") or 0)) for x in inc]
-        return ExplainResult(detail=detail, connections=conns)
+        def _conn(x, outgoing):
+            return Connection(outgoing, x.get("lbl", ""), str(x.get("relation", "")),
+                              str(x.get("confidence", "")), int(x.get("deg") or 0),
+                              source_file=str(x.get("sfile", "") or ""),
+                              source_location=str(x.get("sloc", "") or ""))
+        conns = [_conn(x, True) for x in out] + [_conn(x, False) for x in inc]
+        # Неоднозначность решается по узлам базы тем же правилом, что в
+        # JsonBackend: несколько кандидатов ОДНОГО тира в РАЗНЫХ файлах.
+        # Несколько совпадений внутри одного файла — обычное старшинство.
+        rows_amb = self._run(
+            "SELECT id, source_file FROM Node WHERE norm_label = :l",
+            params={"l": _strip_diacritics(str(label)).lower()})
+        by_file: dict[str, str] = {}
+        for row in rows_amb:
+            sf = str(row.get("source_file") or "")
+            by_file.setdefault(sf, row["id"])
+        ambiguous = sorted(by_file.items()) if len(by_file) > 1 else []
+        return ExplainResult(detail=detail, connections=conns, ambiguous=ambiguous)
 
     def pr_impact(self, files) -> tuple[list[int], int]:
         from graphify.prs import _path_match

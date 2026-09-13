@@ -2125,11 +2125,15 @@ def _build_server(graph_path: str):
     def _tool_get_neighbors(arguments: dict) -> str:
         label = arguments["label"]
         rel_filter = arguments.get("relation_filter", "")
-        return render_neighbors(backend.get_neighbors(label, rel_filter), label.lower())
+        budget = arguments.get("token_budget")
+        return render_neighbors(backend.get_neighbors(label, rel_filter), label.lower(),
+                                int(budget) if budget else None)
 
     def _tool_get_community(arguments: dict) -> str:
         cid = int(arguments["community_id"])
-        return render_community(backend.get_community(cid), cid)
+        budget = arguments.get("token_budget")
+        return render_community(backend.get_community(cid), cid,
+                                int(budget) if budget else None)
 
     def _tool_god_nodes(arguments: dict) -> str:
         return render_god_nodes(backend.god_nodes(top_n=int(arguments.get("top_n", 10))))
