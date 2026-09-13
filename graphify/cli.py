@@ -4530,9 +4530,14 @@ def dispatch_command(cmd: str) -> None:
                 }
                 _pruned = {_norm_source_file(str(p), _root) for p in deleted_files}
                 _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=_pruned)
+                _pruned_stale = _st.get("pruned_stale_sources", 0)
+                _stale_note = (f", {_pruned_stale} stale sources pruned"
+                               if _pruned_stale else "")
                 print(f"[graphify db] synced ArcadeDB '{_db_cfg['database']}' "
                       f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
-                      f"{_st['deleted_sources']} dirty sources).")
+                      f"{_st['deleted_sources']} dirty sources{_stale_note}).")
+                if _st.get("prune_blocked"):
+                    print(f"[graphify db] warning: {_st['prune_blocked']}", file=sys.stderr)
             else:
                 _db.ensure_database(drop=True)
                 _st = _db.load_from_graph_json(str(graph_json_path))

@@ -1047,7 +1047,14 @@ class ArcadeDBBackend(GraphBackend):
         out = {"nodes": got_n, "edges": got_e,
                "expected_nodes": expected_nodes, "expected_edges": expected_edges,
                "missing_nodes": max(0, expected_nodes - got_n),
-               "missing_edges": max(0, expected_edges - got_e)}
+               "missing_edges": max(0, expected_edges - got_e),
+               # A SURPLUS is the other half of "the DB does not equal G", and
+               # clamping is why it stayed invisible: 144 extra nodes passed
+               # through this check on every run and read as a clean bill of
+               # health. Missing says the load fell short; extra says something
+               # the graph no longer has is still being served.
+               "extra_nodes": max(0, got_n - expected_nodes),
+               "extra_edges": max(0, got_e - expected_edges)}
         if not (out["missing_nodes"] or out["missing_edges"]):
             return out
 
@@ -1187,6 +1194,108 @@ class ArcadeDBBackend(GraphBackend):
             out.extend(r["id"] for r in rows if r.get("id") is not None)
             skip += len(rows)
 
+    def _scan_nodes(self, *, batch=5000) -> "tuple[set[str], set[str], bool]":
+        """Every node id and distinct ``source_file`` in the database, plus
+        whether the read was complete.
+
+        Scans NODES, not groups. The obvious implementation is a paged
+        ``SELECT source_file ... GROUP BY source_file`` — 11 498 rows instead of
+        74 457 on the measured corpus — and it is not trustworthy: measured on a
+        live database, the paged aggregate returned 11 498 sources against
+        11 499 from a single un-paged query, losing a source that exists.
+        ``SKIP``/``LIMIT`` apply to the aggregate, whose order is not guaranteed
+        between requests. A lost row here is not destructive (the source simply
+        misses the deletion candidates) but it is UNDETECTABLE: the garbage stays
+        and the run reports success.
+
+        Un-paged reading is rejected for the opposite reason: it passes at the
+        current size and silently truncates at a larger one — the exact failure
+        this guards against.
+
+        The completeness flag compares rows read against ``count()`` (a scan, not
+        the cached counter ``count(*)`` answers from). A short read must never be
+        mistaken for "these sources are gone from the graph".
+
+        Fileless nodes are excluded under BOTH spellings, for the same reason
+        `_scan_fileless_ids` covers both: 198 nodes carry no ``source_file`` at
+        all and 15 126 carry an empty one on the measured corpus, and neither is
+        a source.
+        """
+        sources: set[str] = set()
+        ids: set[str] = set()
+        seen = 0
+        skip = 0
+        while True:
+            rows = self._run(
+                "SELECT id, source_file FROM Node "
+                f"SKIP {skip} LIMIT {batch}")
+            if not rows:
+                break
+            seen += len(rows)
+            for r in rows:
+                sf = r.get("source_file")
+                if sf:
+                    sources.add(str(sf))
+                nid = r.get("id")
+                if nid is not None:
+                    ids.add(str(nid))
+            skip += len(rows)
+        try:
+            total = int(self._run("SELECT count() AS c FROM Node")[0]["c"] or 0)
+        except Exception:
+            return sources, ids, False
+        return sources, ids, seen == total
+
+    # Share of the database's sources that may disappear from the graph in one
+    # incremental sync before the prune refuses to act.
+    #
+    # Calibrated, not rounded to taste. Measured 2026-09-13 on the live
+    # databases that have one:
+    #     proj_konturlogistics   103 stale / 11 497 sources = 0.90%
+    #     proj_hotel             127 stale /  2 476 sources = 5.13%
+    # Against the one catastrophe this project actually suffered: `graphify
+    # update` after an ignore-rule change rebuilt the graph as 431 nodes from
+    # 78 123, which reaches here as ~99% of sources "missing from the graph".
+    #
+    # 0.5 sits an order of magnitude above the observed accumulation (9.7x the
+    # Hotel figure) and half an order below the observed ruin. The midpoint is
+    # also the point where the operation stops being incremental: a run that
+    # drops more than half the corpus is a re-scope, and the honest answer to a
+    # re-scope is a full `arcade reload`, not a patch.
+    _PRUNE_MAX_STALE_SHARE = 0.5
+
+    def _prune_veto(self, G, db_sources: set, stale_sources: list) -> str:
+        """Why the stale-source prune must not run, or "" when it may.
+
+        The predicate "absent from the graph" degenerates dangerously: hand it an
+        empty or half-loaded graph and EVERY source is stale, so the sync would
+        wipe the database and report success. The guard is therefore about
+        trusting the graph, not about the sources themselves.
+        """
+        if G.number_of_nodes() == 0:
+            return ("graph has no nodes; stale-source prune skipped "
+                    "(an empty graph would mark every source stale)")
+        share = len(stale_sources) / max(1, len(db_sources))
+        if share > self._PRUNE_MAX_STALE_SHARE:
+            return (f"{len(stale_sources)} of {len(db_sources)} sources "
+                    f"({share:.1%}) are missing from the graph, above the "
+                    f"{self._PRUNE_MAX_STALE_SHARE:.0%} prune ceiling; "
+                    f"stale-source prune skipped — rebuild with "
+                    f"`graphify arcade reload` if the loss is intended")
+        return ""
+
+    def _delete_by_sources(self, sources, *, batch=200) -> None:
+        """Drop every node of the named sources, cascading to their edges.
+
+        By ``source_file`` rather than by collected ids: a stale source has no
+        nodes left in the graph, so there is nothing to spare, and one DELETE per
+        batch is cheaper than one per node.
+        """
+        sources = list(sources)
+        for i in range(0, len(sources), batch):
+            self._run("DELETE VERTEX FROM Node WHERE source_file IN :s",
+                      params={"s": sources[i:i + batch]})
+
     def _delete_by_ids(self, ids, *, batch=2000) -> None:
         """Drop the named vertices (and, by cascade, their edges)."""
         for i in range(0, len(ids), batch):
@@ -1229,17 +1338,101 @@ class ArcadeDBBackend(GraphBackend):
         # (23.2%) on a measured semantic corpus, and 33 392 edges after them,
         # because CREATE EDGE over an empty endpoint subquery is a silent no-op.
         # Reconcile that set directly, in both directions.
-        fileless = [n for n, d in G.nodes(data=True) if not d.get("source_file")]
-        absent = self._absent_ids(fileless, batch=batch)
-        stale = [n for n in self._scan_fileless_ids(batch=batch) if n not in G]
+        db_fileless = self._scan_fileless_ids(batch=batch)
+        stale = [n for n in db_fileless if n not in G]
+        # The same guard covers the fileless half. It used to delete unguarded,
+        # which left the catastrophe fully open on exactly the nodes that make up
+        # 20.6% of one measured database (15 324 of 74 457) and 1.1% of another:
+        # hand this path an empty graph and every one of them is "gone from the
+        # graph" too. Guarding one half and not the other would only make the
+        # wipe smaller, not prevent it.
+        fileless_blocked = ""
+        if stale:
+            fileless_blocked = self._prune_veto(G, set(db_fileless), stale)
+            if fileless_blocked:
+                stale = []
+
+        # The same reconciliation for nodes that DO carry a source_file, which
+        # until now ran in one direction only: deletion followed the run's delta
+        # (`changed | pruned`), so a source that left the graph any other way was
+        # never removed. Directories are the everyday case — the graph stopped
+        # minting nodes for them, and they never appear in `deleted_files`
+        # because a directory is not a file. Measured on a real database: 103
+        # sources / 128 nodes present in the DB and absent from the graph, and
+        # the count does not shrink on its own.
+        #
+        # Staleness is read from the GRAPH, never from the disk: 30 of those 103
+        # DO exist on disk (as directories), so a disk check would solve less
+        # than a third of it — and it would delete the nodes of a file that is
+        # merely unreadable right now (unmounted share, wrong case) but present
+        # in the graph.
+        graph_sources = {str(d["source_file"]) for _, d in G.nodes(data=True)
+                         if d.get("source_file")}
+        db_sources, db_ids, scan_complete = self._scan_nodes()
+        stale_sources = sorted(db_sources - graph_sources)
+
+        # Third category, found by verifying this change on a real database:
+        # a node whose SOURCE is still alive in the graph but which the graph no
+        # longer holds. The source was re-extracted into fewer nodes and the
+        # leftovers survived because that source was not dirty in the run that
+        # dropped them. Neither reconciliation above sees it — not a stale
+        # source, not source-less — and `_reconcile` cannot report it either,
+        # since it clamps to `max(0, expected - got)` and a SURPLUS reads as
+        # zero. Measured after the source prune: 128 of the 144 surplus nodes
+        # were stale sources, 18 were this.
+        graph_ids = set(G.nodes())
+        stale_ids = [n for n in (db_ids - graph_ids)
+                     if n not in set(stale)]        # fileless half handles those
+
+        # ...and the mirror of it. The proposal's symmetry table credited
+        # `changed` with covering graph -> DB for sourced nodes, which measurement
+        # disproves: a node whose source was not dirty in the run that should
+        # have inserted it stays missing, and no later run reconsiders it. Two
+        # such nodes on the measured database — small, but the same one-way
+        # reconciliation that let 144 surplus nodes accumulate.
+        #
+        # The set difference only nominates candidates; `_absent_ids` confirms
+        # them. Uniqueness in the database is over the derived ASCII key, not the
+        # raw id (see `_id_key`), so on a Cyrillic corpus two distinct raw ids can
+        # share one key — the DB physically holds one of them, the raw-id
+        # difference would call the other missing, and the INSERT would hit the
+        # UNIQUE index. The candidate set is small, so the confirming lookup is
+        # one query, not a scan.
+        absent = self._absent_ids(sorted(graph_ids - db_ids), batch=batch)
+
+        prune_blocked = fileless_blocked
+        if (stale_sources or stale_ids) and not scan_complete:
+            # A short read looks exactly like "these left the graph".
+            prune_blocked = ("; ".join(x for x in (
+                fileless_blocked,
+                "node scan incomplete (rows read != count()); "
+                "stale prune skipped") if x))
+            stale_sources, stale_ids = [], []
+        elif stale_sources or stale_ids:
+            # One verdict for both: they answer the same question about the same
+            # graph, so letting one through while vetoing the other would leave
+            # the database in a state neither reconciliation intended.
+            veto = self._prune_veto(G, db_ids, stale_ids) or \
+                self._prune_veto(G, db_sources, stale_sources)
+            if veto:
+                stale_sources, stale_ids = [], []
+                prune_blocked = "; ".join(x for x in (fileless_blocked, veto) if x)
+
         # An empty dirty set no longer means "nothing to do": a fileless node may
-        # have appeared or vanished without any file changing.
-        if not (dirty or absent or stale):
-            return {"deleted_sources": 0, "upserted_nodes": 0, "upserted_edges": 0}
+        # have appeared or vanished without any file changing, and so may a whole
+        # source or a single node inside a live one.
+        if not (dirty or absent or stale or stale_sources or stale_ids):
+            return {"deleted_sources": 0, "upserted_nodes": 0, "upserted_edges": 0,
+                    "pruned_stale_sources": 0, "pruned_stale_nodes": 0,
+                    **({"prune_blocked": prune_blocked} if prune_blocked else {})}
 
         if dirty:
             self._run("DELETE VERTEX FROM Node WHERE source_file IN :d", params={"d": list(dirty)})
         self._delete_by_ids(stale, batch=batch)
+        if stale_sources:
+            self._delete_by_sources(stale_sources)
+        if stale_ids:
+            self._delete_by_ids(stale_ids, batch=batch)
 
         degree = dict(G.degree())
         # `absent` rides with the changed ids from here on: it needs the same
@@ -1247,7 +1440,13 @@ class ArcadeDBBackend(GraphBackend):
         # edges are not recreated is exactly the endpoint that made CREATE EDGE
         # do nothing.
         changed_ids = [n for n, d in G.nodes(data=True) if d.get("source_file") in changed]
-        changed_ids += absent
+        changed_set = set(changed_ids)
+        # Deduplicated, not concatenated: `absent` used to hold only source-less
+        # nodes, which can never appear among the changed sources, so appending it
+        # blindly was safe. Now that it is every id the DB lacks, a node of a
+        # CHANGED source is in both lists, and inserting it twice raises
+        # DuplicatedKeyException on the id_key index.
+        changed_ids += [n for n in absent if n not in changed_set]
         changed_set = set(changed_ids)
         # A node id is global to the project, but the dirty-source DELETE above only
         # removes nodes whose stored source_file is dirty. A shared node whose
@@ -1301,8 +1500,17 @@ class ArcadeDBBackend(GraphBackend):
         gods = _god(G, top_n=64)
         self._run("DELETE FROM Meta WHERE key = 'god_nodes'")
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
+        # `pruned_stale_sources` is reported apart from `deleted_sources`, not
+        # folded into it: the two answer different questions. `deleted_sources`
+        # is this run's delta, which the caller already knows; this one is
+        # garbage that no run would have removed, so a non-zero value is the only
+        # visible sign that the one-directional reconciliation had been leaking.
         stats = {"deleted_sources": len(dirty), "upserted_nodes": len(changed_ids),
-                 "upserted_edges": len(new_edges)}
+                 "upserted_edges": len(new_edges),
+                 "pruned_stale_sources": len(stale_sources),
+                 "pruned_stale_nodes": len(stale_ids)}
+        if prune_blocked:
+            stats["prune_blocked"] = prune_blocked
         # sync_graph's contract is that the DB ends up equal to G, so G is the
         # yardstick here exactly as graph.json is for a full load.
         stats.update(self._reconcile(
