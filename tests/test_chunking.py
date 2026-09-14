@@ -432,6 +432,52 @@ def test_omitted_documents_are_reconciled_and_warned(tmp_path, capsys):
     assert "produced no nodes" in err and "doc1.md" in err
 
 
+def test_uncovered_reconciliation_resolves_paths_linearly(tmp_path):
+    """The #1890 reconciliation rebuilt the resolved `covered` set once per
+    dispatched file — O(dispatched x covered) `Path.resolve()` calls, each a
+    filesystem round-trip on Windows. On a 13k-file 1C corpus that ran for
+    hours after every chunk had finished. Doubling the corpus must roughly
+    double the resolve calls, not quadruple them."""
+    import pathlib
+    from graphify.llm import extract_corpus_parallel
+
+    def echo(chunk, **kwargs):
+        nodes = [{"id": f"n_{getattr(u, 'path', u).stem}",
+                  "source_file": getattr(u, "path", u).name, "file_type": "document"}
+                 for u in chunk]
+        return {"nodes": nodes, "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    def resolve_calls(n: int) -> int:
+        root = tmp_path / f"corpus{n}"
+        root.mkdir()
+        docs = []
+        for i in range(n):
+            f = root / f"doc{i}.md"
+            f.write_text(f"# Doc {i}\n", encoding="utf-8")
+            docs.append(f)
+        calls = 0
+        real_resolve = pathlib.Path.resolve
+
+        def counting(self, *a, **kw):
+            nonlocal calls
+            calls += 1
+            return real_resolve(self, *a, **kw)
+
+        with patch("graphify.llm.extract_files_direct", side_effect=echo), \
+             patch.object(pathlib.Path, "resolve", counting):
+            result = extract_corpus_parallel(
+                docs, backend="kimi", root=root,
+                token_budget=None, chunk_size=20, max_concurrency=1,
+            )
+        assert result["uncovered_files"] == []
+        return calls
+
+    small, large = resolve_calls(40), resolve_calls(80)
+    assert large <= small * 2.5, (
+        f"resolve() calls grow quadratically with corpus size: {small} -> {large}"
+    )
+
+
 def test_out_of_scope_nodes_are_dropped_from_merged_result(tmp_path, capsys):
     """#1895: the #1757 cache guard skips the CACHE write for a node attributed
     to a real corpus file that was not dispatched, but the node itself still

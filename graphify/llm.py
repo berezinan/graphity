@@ -3068,10 +3068,10 @@ def extract_corpus_parallel(
         if sf:
             p = Path(sf)
             covered.add(p if p.is_absolute() else (root / p))
-    uncovered = sorted(
-        p for p in dispatched
-        if p.resolve() not in {c.resolve() for c in covered}
-    )
+    # Resolve `covered` once: rebuilding it per dispatched file made this
+    # O(dispatched x covered) filesystem round-trips — hours on a 13k-file corpus.
+    covered_resolved = {c.resolve() for c in covered}
+    uncovered = sorted(p for p in dispatched if p.resolve() not in covered_resolved)
     merged["uncovered_files"] = [str(p) for p in uncovered]
     if uncovered:
         # Two causes, two actions. "The model omitted them" sends the reader to
