@@ -723,6 +723,34 @@ def _reconcile_markdown_links(
     return preserved_edges
 
 
+class GitignorePruneRefused(Exception):
+    """A full rebuild would prune more than half of the existing graph on
+    .gitignore evidence alone.
+
+    #2495 treats a live ignore rule as intent, but .gitignore is edited for VCS
+    reasons that have nothing to do with the graph (ignoring vendored clones or
+    nested repos), and the prune line is printed only after graph.json and the
+    database are already rewritten. A .graphifyignore/--exclude match is
+    graph-level intent and is never gated. Deliberately NOT a ValueError: the
+    reconcile call site maps ValueError to "existing graph unreadable" (#2251).
+    """
+
+    def __init__(self, nodes: int, files: int, total: int, sample_dirs: list[str]):
+        self.nodes = nodes
+        self.files = files
+        self.total = total
+        self.sample_dirs = sample_dirs
+        pct = round(100 * nodes / total) if total else 0
+        sample = ", ".join(sample_dirs) if sample_dirs else "?"
+        super().__init__(
+            f"[graphify watch] refusing full rebuild: .gitignore rules alone would "
+            f"prune {nodes} of {total} node(s) ({pct}%) from {files} alive file(s) "
+            f"(e.g. {sample}). Nothing was written. If intentional, re-run with "
+            f"--force, or move the rule(s) to .graphifyignore to make the exclusion "
+            f"graph-level intent."
+        )
+
+
 def _reconcile_existing_graph(
     existing_graph: Path,
     result: dict,
@@ -737,6 +765,7 @@ def _reconcile_existing_graph(
     deleted_source_identities: set[str],
     is_ignored_always: Callable[[Path], bool] | None = None,
     is_ignored_full: Callable[[Path], bool] | None = None,
+    force: bool = False,
 ) -> tuple[dict, dict]:
     """Merge fresh extraction with preserved graph entries and evict stale sources.
 
@@ -823,28 +852,54 @@ def _reconcile_existing_graph(
         excluded_alive_nodes = 0
         newly_ignored_files: set[str] = set()
         newly_ignored_nodes = 0
+        # .gitignore-only matches, counted separately for the mass-prune gate
+        # (GitignorePruneRefused): top-level dir -> node count for the message.
+        gitignore_only_files: set[str] = set()
+        gitignore_only_nodes = 0
+        gitignore_only_dirs: dict[str, int] = {}
         _alive_cache: dict[str, bool] = {}
-        _ignored_cache: dict[str, bool] = {}
+        _ignored_cache: dict[str, str | None] = {}
+        try:
+            _watch_root_resolved = watch_root.resolve()
+        except (OSError, RuntimeError):
+            _watch_root_resolved = watch_root
 
-        def _ignored_now(identity: str) -> bool:
-            """True when a live ignore rule matches this alive, corpus-absent source.
+        def _ignored_tier(identity: str) -> str | None:
+            """Which live ignore tier matches this alive, corpus-absent source.
 
-            .graphifyignore/--exclude matches evict on every rebuild;
-            .gitignore-driven matches only on a full rebuild (see docstring).
+            "always": .graphifyignore/--exclude/global — evicts on every rebuild;
+            "gitignore": .gitignore-driven — only on a full rebuild (see
+            docstring); None: no live rule matches.
             """
-            ignored = _ignored_cache.get(identity)
-            if ignored is None:
-                target = Path(identity)
-                ignored = bool(
-                    (is_ignored_always is not None and is_ignored_always(target))
-                    or (
-                        full_rebuild
-                        and is_ignored_full is not None
-                        and is_ignored_full(target)
-                    )
-                )
-                _ignored_cache[identity] = ignored
-            return ignored
+            if identity in _ignored_cache:
+                return _ignored_cache[identity]
+            target = Path(identity)
+            tier: str | None = None
+            if is_ignored_always is not None and is_ignored_always(target):
+                tier = "always"
+            elif (
+                full_rebuild
+                and is_ignored_full is not None
+                and is_ignored_full(target)
+            ):
+                tier = "gitignore"
+            _ignored_cache[identity] = tier
+            return tier
+
+        def _note_newly_ignored(identity: str, tier: str) -> None:
+            nonlocal newly_ignored_nodes, gitignore_only_nodes
+            newly_ignored_files.add(identity)
+            newly_ignored_nodes += 1
+            if tier != "gitignore":
+                return
+            gitignore_only_files.add(identity)
+            gitignore_only_nodes += 1
+            try:
+                parts = Path(identity).relative_to(_watch_root_resolved).parts
+                top = parts[0] + "/" if len(parts) > 1 else parts[0]
+            except (ValueError, IndexError):
+                top = Path(identity).name
+            gitignore_only_dirs[top] = gitignore_only_dirs.get(top, 0) + 1
         for node in existing.get("nodes", []):
             source_file = node.get("source_file")
             if not source_file or _is_remote_source(source_file):
@@ -867,10 +922,10 @@ def _reconcile_existing_graph(
                     if alive is None:
                         alive = Path(identity).exists()
                         _alive_cache[identity] = alive
-                    ignored = alive and _ignored_now(identity)
+                    tier = _ignored_tier(identity) if alive else None
+                    ignored = tier is not None
                     if ignored:
-                        newly_ignored_files.add(identity)
-                        newly_ignored_nodes += 1
+                        _note_newly_ignored(identity, tier)
                     if not alive or ignored:
                         normalized = source_paths.normalize(source_file)
                         if normalized:
@@ -886,12 +941,12 @@ def _reconcile_existing_graph(
                         alive = Path(identity).exists()
                         _alive_cache[identity] = alive
                     if alive:
-                        if _ignored_now(identity):
+                        tier = _ignored_tier(identity)
+                        if tier is not None:
                             # Intentionally excluded by a live ignore rule:
                             # deliberate graph-level intent, so treat it exactly
                             # like a deletion (#2495) — fall through to evict.
-                            newly_ignored_files.add(identity)
-                            newly_ignored_nodes += 1
+                            _note_newly_ignored(identity, tier)
                         else:
                             excluded_alive_files.add(identity)
                             excluded_alive_nodes += 1
@@ -903,6 +958,17 @@ def _reconcile_existing_graph(
                     node_evicted_source_identities.add(identity)
                     edge_evicted_source_identities.add(identity)
                     hyperedge_evicted_source_identities.add(identity)
+        # Mass-prune gate: .gitignore evidence alone taking more than half of the
+        # existing graph needs confirmation (--force) or a .graphifyignore rule.
+        # Raised before anything is written; the caller reports and returns False.
+        _existing_total = len(existing.get("nodes", []))
+        if not force and gitignore_only_nodes * 2 > _existing_total:
+            sample = sorted(
+                gitignore_only_dirs, key=lambda k: (-gitignore_only_dirs[k], k)
+            )[:3]
+            raise GitignorePruneRefused(
+                gitignore_only_nodes, len(gitignore_only_files), _existing_total, sample
+            )
         if newly_ignored_files:
             print(
                 f"[graphify watch] pruned {newly_ignored_nodes} node(s) from "
@@ -999,6 +1065,11 @@ def _reconcile_existing_graph(
             "input_tokens": 0,
             "output_tokens": 0,
         }, existing_graph_data
+    except GitignorePruneRefused:
+        # Deliberate refusal, not a reconcile failure: the fallback below would
+        # write the fresh (post-prune) extraction — exactly the outcome the
+        # gate exists to prevent. Let the caller report it and return False.
+        raise
     except Exception as exc:
         # Post-load reconciliation failure: fall back to the fresh extraction
         # while keeping the loaded baseline, so _check_shrink still guards the
@@ -1761,7 +1832,13 @@ def _rebuild_code(
                 deleted_source_identities=deleted_source_identities,
                 is_ignored_always=_ignored_always,
                 is_ignored_full=_ignored_full,
+                force=force,
             )
+        except GitignorePruneRefused as exc:
+            # Mass .gitignore-only prune on a full rebuild: nothing was written
+            # (raised inside reconcile, before graph.json/backup/db sync).
+            print(str(exc), file=sys.stderr)
+            return False
         except (RuntimeError, ValueError) as exc:
             # Existing graph present but unreadable — over the size cap
             # (ValueError) or unparseable JSON (RuntimeError, both via

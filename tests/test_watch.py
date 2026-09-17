@@ -2368,6 +2368,162 @@ def test_gitignore_eviction_gated_on_full_rebuild(tmp_path, capsys):
     assert "newly-ignored file(s)" in capsys.readouterr().out
 
 
+def _mass_gitignore_corpus(tmp_path):
+    """a.py + vendor/{b,c,d}.py: vendor/ owns 6 of 8 nodes (75%), so a
+    .gitignore rule matching it crosses the more-than-half gate."""
+    corpus = tmp_path / "corpus"
+    vendor = corpus / "vendor"
+    vendor.mkdir(parents=True)
+    (corpus / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    for name in ("b", "c", "d"):
+        (vendor / f"{name}.py").write_text(
+            f"def {name}():\n    return 2\n", encoding="utf-8"
+        )
+    return corpus
+
+
+def _items_for(payload, prefix):
+    return sorted(
+        json.dumps(item, sort_keys=True)
+        for bucket in ("nodes", "links", "hyperedges")
+        for item in payload.get(bucket, [])
+        if str(item.get("source_file") or "").startswith(prefix)
+    )
+
+
+def test_full_rebuild_refuses_mass_gitignore_prune(tmp_path, monkeypatch, capsys):
+    """A full rebuild whose .gitignore-only evidence would prune more than half
+    of the existing graph must refuse BEFORE writing anything: graph.json stays
+    byte-identical, no dated backup appears, the refusal names the numbers, a
+    sample directory and both remedies, and the #2495 prune line is not printed.
+    (Workspace root 2026-09-13/18: /arcadedb/ + /openspg/ added to .gitignore
+    for VCS reasons pruned 67 292 of 78 123 nodes on the next `graphify update`.)"""
+    import datetime
+    from graphify.watch import _rebuild_code
+
+    monkeypatch.delenv("GRAPHIFY_FORCE", raising=False)
+    corpus = _mass_gitignore_corpus(tmp_path)
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    before = graph_path.read_bytes()
+    data = json.loads(before)
+    vendor_nodes = sum(
+        1 for n in data["nodes"] if str(n.get("source_file") or "").startswith("vendor/")
+    )
+    assert vendor_nodes * 2 > len(data["nodes"]), "fixture must cross the gate"
+
+    (corpus / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is False
+
+    assert graph_path.read_bytes() == before, "refusal must not touch graph.json"
+    today = datetime.date.today().isoformat()
+    assert not (corpus / "graphify-out" / today).exists()
+    captured = capsys.readouterr()
+    assert "refusing full rebuild" in captured.err
+    assert f"{vendor_nodes} of {len(data['nodes'])} node(s)" in captured.err
+    assert "%" in captured.err
+    assert "3 alive file(s)" in captured.err
+    assert "vendor/" in captured.err
+    assert "--force" in captured.err
+    assert ".graphifyignore" in captured.err
+    assert "newly-ignored file(s)" not in captured.out
+
+
+def test_full_rebuild_mass_gitignore_prune_with_force(tmp_path, capsys):
+    """--force confirms the mass .gitignore prune: the write proceeds exactly as
+    #2495 does today, with the prune line."""
+    from graphify.watch import _rebuild_code
+
+    corpus = _mass_gitignore_corpus(tmp_path)
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    (corpus / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _rebuild_code(corpus, force=True, no_cluster=True, acquire_lock=False) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _items_for(after, "vendor/") == []
+    assert any(n.get("source_file") == "a.py" for n in after["nodes"])
+    captured = capsys.readouterr()
+    assert "newly-ignored file(s)" in captured.out
+    assert "refusing full rebuild" not in captured.err
+
+
+def test_full_rebuild_mass_graphifyignore_prune_not_gated(tmp_path, monkeypatch, capsys):
+    """The same rule in .graphifyignore is graph-level intent (#2495): no gate,
+    the prune proceeds without --force."""
+    from graphify.watch import _rebuild_code
+
+    monkeypatch.delenv("GRAPHIFY_FORCE", raising=False)
+    corpus = _mass_gitignore_corpus(tmp_path)
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    (corpus / ".graphifyignore").write_text("vendor/\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _items_for(after, "vendor/") == []
+    captured = capsys.readouterr()
+    assert "newly-ignored file(s)" in captured.out
+    assert "refusing full rebuild" not in captured.err
+
+
+def test_full_rebuild_small_gitignore_prune_passes(tmp_path, monkeypatch, capsys):
+    """Below the gate (vendor/b.py owns 2 of 6 nodes) a .gitignore-driven prune
+    behaves exactly as before: the newly-ignored file is purged and untouched
+    files survive byte-identical."""
+    from graphify.watch import _rebuild_code
+
+    monkeypatch.delenv("GRAPHIFY_FORCE", raising=False)
+    corpus = tmp_path / "corpus"
+    (corpus / "vendor").mkdir(parents=True)
+    (corpus / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    (corpus / "c.py").write_text("def gamma():\n    return 3\n", encoding="utf-8")
+    (corpus / "vendor" / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    a_before = _items_for(data, "a.py")
+    assert a_before
+
+    (corpus / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _items_for(after, "vendor/") == []
+    assert _items_for(after, "a.py") == a_before
+    captured = capsys.readouterr()
+    assert "newly-ignored file(s)" in captured.out
+    assert "refusing full rebuild" not in captured.err
+
+
+def test_full_rebuild_mass_deletion_not_gated(tmp_path, monkeypatch, capsys):
+    """Files gone from disk are deletion evidence, not .gitignore evidence: a
+    mass deletion is never gated even when .gitignore is untouched."""
+    import shutil
+    from graphify.watch import _rebuild_code
+
+    monkeypatch.delenv("GRAPHIFY_FORCE", raising=False)
+    corpus = _mass_gitignore_corpus(tmp_path)
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    shutil.rmtree(corpus / "vendor")
+    capsys.readouterr()
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert _items_for(after, "vendor/") == []
+    assert "refusing full rebuild" not in capsys.readouterr().err
+
+
 def test_graphifyignore_eviction_applies_to_incremental_rebuilds(tmp_path, capsys):
     """#2495 policy split, other half: a .graphifyignore match is unambiguous
     graph-level intent and evicts on the incremental (hook) path too."""
