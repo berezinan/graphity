@@ -2075,6 +2075,8 @@ def dispatch_command(cmd: str) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        from graphify.query_backend import require_service as _require_service
+        _require_service(str(graph_json.resolve()))
         from networkx.readwrite import json_graph as _jg
         from graphify.build import build_from_json
         from graphify.cluster import cluster, score_all, remap_communities_to_previous
@@ -2314,8 +2316,18 @@ def dispatch_command(cmd: str) -> None:
         # The #479 guard can refuse this write, so it goes before the sidecars —
         # a report and labels describing a clustering graph.json does not contain
         # are worse than no run at all (#2436).
-        if not to_json(G, communities, str(out / "graph.json"),
-                       community_labels=labels, built_at_commit=_commit):
+        # Fork hook (graphify/recluster.py): a re-clustering that reproduced the
+        # stored partition has nothing to write; one that moved nodes patches the
+        # graph database instead of needing a full `arcade reload`.
+        from graphify.recluster import community_changes as _community_changes
+        from graphify.recluster import sync_community_changes as _sync_community_changes
+        _changed = _community_changes(_raw, G, communities, labels, _commit)
+        if _changed == {}:
+            print("[graphify] partition unchanged - graph.json left as is.")
+            if not stale_marker_preexisted:
+                _clear_html_stale_marker()
+        elif not to_json(G, communities, str(out / "graph.json"),
+                         community_labels=labels, built_at_commit=_commit):
             if not stale_marker_preexisted:
                 _clear_html_stale_marker()
             print(
@@ -2325,6 +2337,8 @@ def dispatch_command(cmd: str) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        else:
+            _sync_community_changes(str(out / "graph.json"), _raw, _changed, communities)
         tokens = label_token_usage
         from graphify.report import load_learning_for_report as _llfr
         report = generate(G, communities, cohesion, labels, gods, surprises,

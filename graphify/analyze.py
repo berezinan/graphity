@@ -440,6 +440,19 @@ def _cross_community_surprises(
     return deduped[:top_n]
 
 
+_BETWEENNESS_BUDGET = 50_000_000
+
+
+def _betweenness_pivots(n_nodes: int, n_edges: int) -> "int | None":
+    """Pivot count for sampled betweenness. Each pivot is a pure-Python traversal
+    of the whole graph, so 100 pivots cost 42 minutes on a 2M-node graph. Scale
+    the count from a work budget: graphs up to 500k nodes+edges keep 100 pivots,
+    larger ones go down to a floor of 10. None = exact (small graphs)."""
+    if n_nodes <= 1000:
+        return None
+    return max(10, min(100, _BETWEENNESS_BUDGET // (n_nodes + n_edges)))
+
+
 def suggest_questions(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -471,7 +484,7 @@ def suggest_questions(
 
     # 2. Bridge nodes (high betweenness) → cross-cutting concern questions
     if G.number_of_edges() > 0:
-        k = min(100, G.number_of_nodes()) if G.number_of_nodes() > 1000 else None
+        k = _betweenness_pivots(G.number_of_nodes(), G.number_of_edges())
         betweenness = nx.betweenness_centrality(G, k=k, seed=42)
         # Top bridge nodes that are NOT file-level hubs
         bridges = sorted(

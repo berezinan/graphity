@@ -1155,6 +1155,46 @@ class ArcadeDBBackend(GraphBackend):
         self.record_reconciliation(stats)
         return stats
 
+    def update_communities(self, node_community: "dict[str, int | None]",
+                           expected_sizes: "dict[int, int]", *, batch=2000) -> dict:
+        """Move nodes to their new community in place, instead of a full reload.
+
+        ``node_community`` holds only the nodes whose community changed;
+        ``expected_sizes`` is the whole partition (community -> member count) the
+        database must show afterwards. A re-clustering touches nothing else this
+        backend stores - god_nodes are degree-ranked, so they stand. Nodes are
+        addressed by ``id_key``, never by ``id`` (see `_id_key`).
+        """
+        by_cid: "dict[int | None, list[str]]" = {}
+        for nid, cid in node_community.items():
+            by_cid.setdefault(cid, []).append(_id_key(nid))
+        stmts, pending = [], 0
+
+        def _flush():
+            nonlocal stmts, pending
+            if stmts:
+                self._run(";".join(stmts), language="sqlscript")
+            stmts, pending = [], 0
+
+        for cid, keys in by_cid.items():
+            value = "null" if cid is None else str(int(cid))
+            for i in range(0, len(keys), batch):
+                chunk = keys[i:i + batch]
+                stmts.append(f"UPDATE Node SET community = {value} WHERE id_key IN "
+                             f"[{','.join(_sql_str(k) for k in chunk)}]")
+                pending += len(chunk)
+                if pending >= batch:
+                    _flush()
+        _flush()
+
+        got = {int(r["community"]): int(r["c"]) for r in self._run(
+            "SELECT community, count(*) AS c FROM Node WHERE community IS NOT NULL "
+            "GROUP BY community")}
+        stats = {"updated_nodes": len(node_community),
+                 "reconciled": got == {int(k): int(v) for k, v in expected_sizes.items()}}
+        self.record_reconciliation(stats)
+        return stats
+
     def _absent_ids(self, ids, *, batch=2000) -> list[str]:
         """Which of ``ids`` the database does not hold, asked by index key.
 

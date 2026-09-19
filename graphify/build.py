@@ -379,6 +379,33 @@ def _shortest_unique_suffix(sf: str, all_sfs: "set[str]") -> str:
     return "/".join(parts)
 
 
+def _shortest_unique_suffixes(sfs: "set[str]") -> "dict[str, str]":
+    """`_shortest_unique_suffix` for every member of *sfs* at once, in
+    O(len(sfs) * path depth) instead of pairwise. A 1C:EDT export puts tens of
+    thousands of files under one basename (`Module.bsl`), where the pairwise
+    form took hours. A suffix that is unique at length k stays unique at k+1, so
+    resolved members can never collide with the ones still pending."""
+    from collections import Counter
+    parts = {sf: [p for p in sf.replace("\\", "/").split("/") if p] for sf in sfs}
+    out: dict[str, str] = {}
+    pending = list(sfs)
+    k = 1
+    while pending:
+        counts = Counter(tuple(parts[sf][-k:]) for sf in pending if len(parts[sf]) >= k)
+        still = []
+        for sf in pending:
+            p = parts[sf]
+            if len(p) < k:
+                out[sf] = "/".join(p)
+            elif counts[tuple(p[-k:])] == 1:
+                out[sf] = "/".join(p[-k:])
+            else:
+                still.append(sf)
+        pending = still
+        k += 1
+    return out
+
+
 def _file_label_reassignments(items: "list[tuple]") -> dict:
     """Given (key, label, source_file) triples, return {key: new_label} for file
     nodes whose basename collides with another's — the shortest unique
@@ -395,8 +422,9 @@ def _file_label_reassignments(items: "list[tuple]") -> dict:
         distinct = {sf for _, sf in members}
         if len(distinct) < 2:
             continue  # no collision — leave the bare basename label
+        suffixes = _shortest_unique_suffixes(distinct)
         for key, sf in members:
-            out[key] = _shortest_unique_suffix(sf, distinct)
+            out[key] = suffixes[sf]
     return out
 
 
@@ -1092,6 +1120,14 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # alone (0 = no known file, 2+ = genuinely ambiguous — same "no safe
     # canonical winner" rule Pass 2's _loc_collisions already applies).
     if _ast_file_nodes:
+        # _is_file_node_label can only hold when label and source_file end in the
+        # same path segment, so bucket the AST file nodes by it: testing every
+        # non-AST node against every AST file node is O(n*m), tens of minutes on
+        # a 2M-node graph.
+        _ast_files_by_tail: dict[str, list[tuple[str, str]]] = {}
+        for _ast_id, _ast_sf in _ast_file_nodes:
+            _tail = str(_ast_sf).replace("\\", "/").rsplit("/", 1)[-1]
+            _ast_files_by_tail.setdefault(_tail, []).append((_ast_id, _ast_sf))
         for nid in sorted(node_set):
             if nid in _ghost_remap:
                 continue  # already resolved by the exact (sf, label) key
@@ -1102,7 +1138,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             if not label:
                 continue
             matches = {
-                ast_id for ast_id, ast_sf in _ast_file_nodes
+                ast_id for ast_id, ast_sf in _ast_files_by_tail.get(label.rsplit("/", 1)[-1], ())
                 if _is_file_node_label(label, ast_sf)
             }
             if len(matches) == 1:

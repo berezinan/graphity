@@ -645,3 +645,56 @@ def test_shortfall_warning_names_the_right_cause():
                                     "unresolved_endpoint_edges": 1})
     assert "index does not find" in index_miss
     assert "node count matches" in index_miss
+
+
+def _communities_in_db(arc) -> dict:
+    return {r["id"]: r.get("community") for r in arc._run("SELECT id, community FROM Node")}
+
+
+def test_update_communities_moves_only_named_nodes(tmp_path_factory):
+    """A re-clustering patches `community` in place - no drop + full reload - and
+    reaches non-ASCII ids, which a lookup by raw `id` would miss (see `_id_key`)."""
+    host, port = _parse_host_port(_URL)
+    arc = ArcadeDBBackend("graphify_recluster_test", host=host, port=port, password=_PW)
+    if not arc.ready():
+        pytest.skip(f"ArcadeDB not reachable at {_URL}")
+    g = _make_digraph()
+    g.add_node("справочник_товары", label="Товары", source_file="extract.py",
+               source_location="L7", community=0)
+    g.add_edge("справочник_товары", "n1", relation="calls", confidence="EXTRACTED")
+    p = tmp_path_factory.mktemp("recluster") / "g.json"
+    p.write_text(json.dumps(json_graph.node_link_data(g, edges="links")), encoding="utf-8")
+    arc.ensure_database(drop=True)
+    arc.load_from_graph_json(str(p))
+    try:
+        before = _communities_in_db(arc)
+        sizes: dict = {}
+        for nid, cid in before.items():
+            if cid is not None:
+                sizes[cid] = sizes.get(cid, 0) + 1
+
+        # Nothing moved: the partition still reconciles, nothing is rewritten.
+        assert arc.update_communities({}, sizes) == {"updated_nodes": 0, "reconciled": True}
+        assert _communities_in_db(arc) == before
+
+        moved = {"справочник_товары": 41, "n1": 41}
+        expected = dict(before, **moved)
+        new_sizes: dict = {}
+        for cid in expected.values():
+            if cid is not None:
+                new_sizes[cid] = new_sizes.get(cid, 0) + 1
+        stats = arc.update_communities(moved, new_sizes)
+        assert stats == {"updated_nodes": 2, "reconciled": True}
+        assert _communities_in_db(arc) == expected
+        assert not arc.has_recorded_shortfall()
+        assert len(arc.get_community(41).members) == len(moved)
+
+        # A partition the database does not end up showing is recorded as a
+        # shortfall, so the next sync reloads instead of patching again.
+        assert arc.update_communities({}, {**new_sizes, 99: 5})["reconciled"] is False
+        assert arc.has_recorded_shortfall()
+    finally:
+        try:
+            arc._server("drop database graphify_recluster_test")
+        except Exception:
+            pass
