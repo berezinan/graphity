@@ -2320,9 +2320,10 @@ def dispatch_command(cmd: str) -> None:
         # stored partition has nothing to write; one that moved nodes patches the
         # graph database instead of needing a full `arcade reload`.
         from graphify.recluster import community_changes as _community_changes
+        from graphify.recluster import needs_write as _needs_write
         from graphify.recluster import sync_community_changes as _sync_community_changes
-        _changed = _community_changes(_raw, G, communities, labels, _commit)
-        if _changed == {}:
+        _changed = _community_changes(_raw, G, communities, labels)
+        if not _needs_write(_raw, _changed, _commit):
             print("[graphify] partition unchanged - graph.json left as is.")
             if not stale_marker_preexisted:
                 _clear_html_stale_marker()

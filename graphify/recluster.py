@@ -13,7 +13,6 @@ def community_changes(
     G,
     communities: "dict[int, list[str]]",
     labels: "dict[int, str] | None",
-    built_at_commit: "str | None" = None,
 ) -> "dict[str, tuple[int | None, str | None]] | None":
     """``{node_id: (community, community_name)}`` for every node whose community
     or community name differs from what *raw* (the loaded graph.json) records.
@@ -21,13 +20,10 @@ def community_changes(
     Empty dict = the re-clustering reproduced the stored partition, so rewriting
     graph.json would reproduce the stored file. ``None`` = can't vouch for that:
     the rebuilt graph differs from the file in shape (nodes merged or dropped,
-    edges or hyperedges lost at build) or the commit stamp would change, so the
-    caller must write as before.
+    edges or hyperedges lost at build), so the caller must write as before.
     """
     nodes = raw.get("nodes", [])
     links = raw.get("links", raw.get("edges", []))
-    if built_at_commit and raw.get("built_at_commit") != built_at_commit:
-        return None  # to_json would (re)stamp the file
     if (G.number_of_nodes() != len(nodes)
             or G.number_of_edges() != len(links)
             or len(G.graph.get("hyperedges", [])) != len(raw.get("hyperedges", []))):
@@ -48,6 +44,12 @@ def community_changes(
         if node.get("community") != cid or node.get("community_name") != name:
             changed[nid] = (cid, name)
     return changed
+
+
+def needs_write(raw: dict, changed: "dict | None", built_at_commit: "str | None") -> bool:
+    """Whether to_json would produce a file different from the stored one: some
+    node changed (or the diff can't be vouched for), or the commit stamp would."""
+    return changed != {} or bool(built_at_commit and raw.get("built_at_commit") != built_at_commit)
 
 
 def sync_community_changes(graph_json_path: str, raw: dict, changed: "dict | None",

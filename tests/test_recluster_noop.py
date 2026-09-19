@@ -75,3 +75,17 @@ def test_shape_mismatch_is_not_vouched_for(tmp_path):
     raw, G = _reload(_stored_graph(tmp_path))
     G.remove_node("a_fn")
     assert community_changes(raw, G, {0: ["a_mod"], 1: COMMUNITIES[1]}, LABELS) is None
+
+
+def test_missing_commit_stamp_forces_a_write_but_not_a_database_reload(tmp_path):
+    # A stamp to_json would add is a reason to write the file, not a reason to
+    # distrust the community diff: the database still has nothing to update.
+    from graphify.recluster import needs_write
+    raw, G = _reload(_stored_graph(tmp_path))
+    changed = community_changes(raw, G, COMMUNITIES, LABELS)
+    assert changed == {}
+    assert not needs_write(raw, changed, "c0ffee")
+    assert not needs_write(raw, changed, None)
+    assert needs_write(raw, changed, "deadbeef")
+    assert needs_write(raw, {"a_fn": (1, "Бета")}, "c0ffee")
+    assert needs_write(raw, None, "c0ffee")
