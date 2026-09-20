@@ -84,6 +84,23 @@ def _isolate_backend_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _scrub_graphify_env(monkeypatch):
+    """Clear every ``GRAPHIFY_*`` variable the developer happens to have exported.
+
+    The suite patches module-level defaults (e.g. ``security._MAX_GRAPH_FILE_BYTES``)
+    while the production code resolves the same setting from an env var first, so an
+    exported ``GRAPHIFY_MAX_GRAPH_BYTES=32GB`` silently wins and ten size-cap tests
+    fail with "DID NOT RAISE". The code reads ~40 such variables, so scrub the whole
+    prefix rather than the one that happened to bite; a test that wants a variable
+    sets it with monkeypatch, which runs after this fixture.
+    """
+    import os
+
+    for key in [k for k in os.environ if k.startswith("GRAPHIFY_")]:
+        monkeypatch.delenv(key, raising=False)
+
+
 _ANALYZE_WARNING_FILTERS = (
     "ignore:Tensorflow not installed; ParametricUMAP will be unavailable:ImportWarning:umap",
     "ignore:Please import `random` from the `scipy\\.sparse` namespace.*:"
@@ -93,7 +110,9 @@ _ANALYZE_WARNING_FILTERS = (
 
 
 @pytest.fixture(autouse=True)
-def _pin_json_backend(request: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def _pin_json_backend(
+    request: Any, monkeypatch: pytest.MonkeyPatch, _scrub_graphify_env: None
+) -> None:
     """Pin ``GRAPHIFY_BACKEND=json`` for every test not about ArcadeDB.
 
     The default backend is ArcadeDB and an unreachable server is a fatal error,

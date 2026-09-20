@@ -483,7 +483,10 @@ def test_collect_files_parity_with_legacy_synthetic(tmp_path):
     (tmp_path / "vendored").mkdir()
     (tmp_path / "vendored" / "drop.py").write_text("x")
     (tmp_path / "vendored" / "keep.py").write_text("x")
-    (tmp_path / ".gitignore").write_text("gen/\nvendored/*.py\n!vendored/keep.py\n")
+    # .graphifyignore, not .gitignore: the subject here is directory-level
+    # pruning vs a negation, and collect_files follows detect()'s default, where
+    # `.gitignore` is not an ignore source.
+    (tmp_path / ".graphifyignore").write_text("gen/\nvendored/*.py\n!vendored/keep.py\n")
 
     result = collect_files(tmp_path)
     assert result == _legacy_collect_files(tmp_path)

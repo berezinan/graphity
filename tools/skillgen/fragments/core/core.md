@@ -69,8 +69,9 @@ Only when the path is one or more `https://github.com/...` URLs, or several loca
 $(cat graphify-out/.graphify_python) -c "
 import json
 from graphify.detect import detect
+from graphify.watch import _read_build_gitignore
 from pathlib import Path
-result = detect(Path('INPUT_PATH'))
+result = detect(Path('INPUT_PATH'), gitignore=_read_build_gitignore(Path('graphify-out')))
 # Write the sidecar from Python, not a shell redirect, so the same block renders
 # on PowerShell hosts without console-encoding drift (#2528).
 Path('graphify-out/.graphify_detect.json').write_text(json.dumps(result, ensure_ascii=False), encoding=\"utf-8\")

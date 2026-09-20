@@ -108,6 +108,7 @@ def generate(
     built_at_commit: str | None = None,
     learning: dict | None = None,
     obsidian: bool = False,
+    corpus_scope: dict | None = None,
 ) -> str:
     today = date.today().isoformat()
 
@@ -152,6 +153,16 @@ def generate(
                 f"- Unclassified: {len(unclassified)} file(s) not represented in "
                 f"the graph (top: {top})"
             )
+
+    # Which rules shaped this corpus, and where that decision came from. Without
+    # it a graph gives no way to tell a deliberately narrow scope from one that
+    # a stray .gitignore line silently narrowed.
+    if corpus_scope:
+        honored = "honored" if corpus_scope.get("gitignore") else "not honored"
+        origin = corpus_scope.get("source") or "default"
+        excludes = corpus_scope.get("excludes") or []
+        excl = f" · --exclude: {', '.join(excludes)}" if excludes else ""
+        lines.append(f"- Corpus scope: .gitignore {honored} ({origin}){excl}")
 
     from .analyze import _is_file_node as _ifn
 

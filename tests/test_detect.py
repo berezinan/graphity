@@ -311,7 +311,7 @@ def test_git_info_exclude_utf8_bom(tmp_path):
     (secrets / "x.py").write_text("token = 'x'")
     (tmp_path / "real.py").write_text("def real(): pass")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     all_files = [f for files in result["files"].values() for f in files]
     assert not any("secrets" in f for f in all_files), "BOM'd info/exclude pattern was dropped"
     assert any("real.py" in f for f in all_files)
@@ -428,7 +428,7 @@ def test_gitignore_nested_below_root_excludes_file(tmp_path):
     (sub / "keep.py").write_text("y = 2")
     (sub / "secret.txt").write_text("shh")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code_files = result["files"]["code"]
     assert any("root.py" in f for f in code_files)
     assert any("keep.py" in f for f in code_files)
@@ -452,7 +452,7 @@ def test_gitignore_keeps_tracked_file_but_drops_untracked_sibling(tmp_path):
     untracked = storage / "scratch.js"
     untracked.write_text("export function scratch(){ return 3; }", encoding="utf-8")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code = {Path(path).name for path in result["files"]["code"]}
 
     assert code == {"app.js", "fileWatcher.js"}
@@ -533,7 +533,7 @@ def test_git_tracking_probe_failure_preserves_ignore_behavior(
 
     monkeypatch.setattr(detect_mod.subprocess, "run", _git_unavailable)
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
 
     assert str(ignored_file) not in result["files"]["code"]
     assert str(ignored_file) in result["ignored"]
@@ -558,13 +558,13 @@ def test_git_lsfiles_skipped_when_no_gitignore_contributes(tmp_path, monkeypatch
     monkeypatch.setattr(detect_mod.subprocess, "run", _spy)
 
     # No .gitignore anywhere -> gitignore contributes nothing -> no probe.
-    detect(tmp_path)
+    detect(tmp_path, gitignore=True)
     assert calls["ls_files"] == 0, "git ls-files ran despite no .gitignore in play"
 
     # Add a .gitignore -> gitignore now contributes -> probe happens (once).
     (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
     calls["ls_files"] = 0
-    detect(tmp_path)
+    detect(tmp_path, gitignore=True)
     assert calls["ls_files"] >= 1, "git ls-files skipped even though .gitignore is present"
 
 
@@ -596,7 +596,7 @@ def test_gitignore_nested_negation_overrides_broader_root_rule(tmp_path):
     (sub / "important.py").write_text("b = 1")
     (sub / "other.py").write_text("c = 1")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code = as_posix_list(result["files"]["code"])
     # nested `!important.py` re-includes it despite the root `*.py` exclude...
     assert any(f.endswith("vendor/sub/important.py") for f in code)
@@ -618,7 +618,7 @@ def test_nested_ignore_overrides_git_info_exclude_and_root(tmp_path):
     (sub / "keep.py").write_text("x = 1")
     (tmp_path / "drop.py").write_text("y = 1")                  # only info/exclude -> excluded
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code = as_posix_list(result["files"]["code"])
     assert any(f.endswith("a/b/keep.py") for f in code), "nested ! must beat root + info/exclude"
     assert not any(f.endswith("drop.py") for f in code)
@@ -1148,7 +1148,7 @@ def test_detect_honors_git_info_exclude(tmp_path):
     wt.mkdir(parents=True)
     (wt / "dupe.py").write_text("def dupe(): pass")
     (tmp_path / "real.py").write_text("def real(): pass")
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     all_files = [f for files in result["files"].values() for f in files]
     assert not any("dupe.py" in f for f in all_files), "worktree dir was not excluded"
     assert any("real.py" in f for f in all_files), "real source was dropped"
@@ -1163,7 +1163,7 @@ def test_git_info_exclude_ranks_below_gitignore_negation(tmp_path):
     (tmp_path / ".gitignore").write_text("!secret-ok.txt\n")
     (tmp_path / "secret-bad.txt").write_text("x")
     (tmp_path / "secret-ok.txt").write_text("x")
-    patterns = _load_graphifyignore(tmp_path)
+    patterns = _load_graphifyignore(tmp_path, gitignore=True)
     assert _is_ignored(tmp_path / "secret-bad.txt", tmp_path, patterns)
     assert not _is_ignored(tmp_path / "secret-ok.txt", tmp_path, patterns)
 
@@ -2054,7 +2054,7 @@ def test_gitignore_fallback_when_no_graphifyignore(tmp_path):
     (tmp_path / "main.py").write_text("print('hi')")
     (tmp_path / "schema.generated.py").write_text("x = 1")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code = result["files"]["code"]
     assert any("main.py" in f for f in code)
     assert not any("vendor" in f for f in code)
@@ -2073,7 +2073,7 @@ def test_graphifyignore_and_gitignore_are_merged(tmp_path):
     (tmp_path / "other.py").write_text("x = 2")
     (tmp_path / "keep.py").write_text("x = 3")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code = result["files"]["code"]
     assert not any("main.py" in f for f in code)   # gitignore STILL applied (merged)
     assert not any("other.py" in f for f in code)  # graphifyignore applied
@@ -2089,7 +2089,7 @@ def test_graphifyignore_negation_overrides_gitignore(tmp_path):
     (tmp_path / "main.py").write_text("x = 1")
     (tmp_path / "keep.py").write_text("x = 2")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
     code = result["files"]["code"]
     assert any("keep.py" in f for f in code)      # rescued by graphifyignore negation
     assert not any("main.py" in f for f in code)  # still excluded
@@ -3152,7 +3152,7 @@ def test_nested_gitignore_star_does_not_ignore_outside_its_dir(tmp_path):
     """A nested .gitignore containing a bare `*` (auto-written by e.g. the
     hypothesis library into .hypothesis/) must ignore ONLY that directory's
     contents — matching it against root-relative paths ignored the entire
-    corpus (detect() returned 0 files on a real repo). Regression for #1873."""
+    corpus (detect(, gitignore=True) returned 0 files on a real repo). Regression for #1873."""
     (tmp_path / "README.md").write_text("# hello")
     (tmp_path / "main.py").write_text("x = 1")
     hyp = tmp_path / ".hypothesis"
@@ -3160,7 +3160,7 @@ def test_nested_gitignore_star_does_not_ignore_outside_its_dir(tmp_path):
     (hyp / ".gitignore").write_text("*\n")
     (hyp / "cached.py").write_text("y = 2")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
 
     assert result["total_files"] == 2  # README.md + main.py survive; .hypothesis/* ignored
 
@@ -3193,7 +3193,7 @@ def test_nested_gitignore_does_not_govern_sibling_project(tmp_path):
     (pb / ".gitignore").write_text("data/\n")
     (pb / "data" / "dump.csv").write_text("a,b\n1,2\n")
 
-    result = detect(tmp_path)
+    result = detect(tmp_path, gitignore=True)
 
     all_paths = [f for v in result["files"].values() for f in v]
     assert any(
@@ -3204,7 +3204,7 @@ def test_nested_gitignore_does_not_govern_sibling_project(tmp_path):
     assert any(
         e.rstrip(os.sep).endswith(os.path.join("project_b", "data"))
         for e in result["ignored"]
-    ), f"ignored subtree should be recorded in detect()['ignored']: {result['ignored']}"
+    ), f"ignored subtree should be recorded in detect(, gitignore=True)['ignored']: {result['ignored']}"
 
 
 # ---------------------------------------------------------------------------
@@ -3587,3 +3587,124 @@ def test_globstar_matcher_leaves_no_reference_cycle():
     finally:
         gc.enable()
     assert collected == 0, f"globstar matcher leaked {collected} cyclic objects per run"
+
+
+# ---------------------------------------------------------------------------
+# Default corpus mode: .gitignore is NOT honored unless asked for (fork delta)
+
+def test_nested_repo_ignored_by_parent_gitignore_is_indexed_by_default(tmp_path):
+    """A parent `.gitignore` line naming a nested repo must not hide its code.
+
+    `/nested/` in the workspace root means "separate repository, do not commit
+    it here" — the standard way to keep a clone out of the parent's index. Read
+    as a corpus rule it silently dropped every nested repository's code from the
+    graph, which is what flipped this default.
+    """
+    _git(tmp_path, "init", "-q")
+    (tmp_path / ".gitignore").write_text("/nested/\n", encoding="utf-8")
+    pkg = tmp_path / "nested" / "pkg"
+    pkg.mkdir(parents=True)
+    _git(pkg, "init", "-q")
+    (pkg / "mod.py").write_text("def f(): pass\n", encoding="utf-8")
+    (tmp_path / "root.py").write_text("x = 1\n", encoding="utf-8")
+
+    code = as_posix_list(detect(tmp_path)["files"]["code"])
+    assert any(path.endswith("nested/pkg/mod.py") for path in code)
+    assert any(path.endswith("root.py") for path in code)
+
+    honored = as_posix_list(detect(tmp_path, gitignore=True)["files"]["code"])
+    assert not any(path.endswith("nested/pkg/mod.py") for path in honored)
+    assert any(path.endswith("root.py") for path in honored)
+
+
+def test_graphifyignore_still_excludes_under_default_mode(tmp_path):
+    """Junk is declared in .graphifyignore, and that keeps working by default."""
+    (tmp_path / ".graphifyignore").write_text("artifacts/\n", encoding="utf-8")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "generated.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("y = 2\n", encoding="utf-8")
+
+    code = as_posix_list(detect(tmp_path)["files"]["code"])
+    assert any(path.endswith("app.py") for path in code)
+    assert not any("artifacts/" in path for path in code)
+
+
+def test_nested_graphifyignore_still_scoped_to_its_subtree_by_default(tmp_path):
+    """A nested .graphifyignore governs its own subtree only, default mode too."""
+    nested = tmp_path / "nested"
+    (nested / "spikes").mkdir(parents=True)
+    (nested / ".graphifyignore").write_text("spikes/*.json\n", encoding="utf-8")
+    (nested / "spikes" / "synth.json").write_text("{}\n", encoding="utf-8")
+    other = tmp_path / "other" / "spikes"
+    other.mkdir(parents=True)
+    (other / "synth.json").write_text("{}\n", encoding="utf-8")
+
+    files = as_posix_list(
+        f for group in detect(tmp_path)["files"].values() for f in group
+    )
+    assert not any(path.endswith("nested/spikes/synth.json") for path in files)
+    assert any(path.endswith("other/spikes/synth.json") for path in files)
+
+
+def test_no_gitignore_flag_matches_the_default(tmp_path):
+    """--no-gitignore is now a restatement of the default, not a change to it."""
+    _git(tmp_path, "init", "-q")
+    (tmp_path / ".gitignore").write_text("vendor/\n*.log\n", encoding="utf-8")
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    (vendor / "lib.py").write_text("def g(): pass\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "run.log").write_text("noise\n", encoding="utf-8")
+
+    default = detect(tmp_path)["files"]
+    explicit = detect(tmp_path, gitignore=False)["files"]
+    assert {k: sorted(v) for k, v in default.items()} == {
+        k: sorted(v) for k, v in explicit.items()
+    }
+
+
+def test_global_ignore_excludes_git_tracked_file(tmp_path, monkeypatch):
+    """The tracked-file exemption (#2759) spares .gitignore rules only.
+
+    The global layer is graph-level intent, so it stays authoritative for
+    tracked paths — otherwise a global pattern is a no-op in every git repo,
+    which is where it matters most.
+    """
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _git(proj, "init", "-q")
+    specs = proj / "openspec"
+    specs.mkdir()
+    (specs / "spec.md").write_text("# spec\n", encoding="utf-8")
+    (proj / "main.py").write_text("x = 1\n", encoding="utf-8")
+    _git(proj, "add", "openspec/spec.md", "main.py")
+    _set_global_ignore(monkeypatch, tmp_path / "home", "openspec/\n")
+
+    files = as_posix_list(
+        f
+        for group in detect(proj, gitignore=True)["files"].values()
+        for f in group
+    )
+    assert not any("openspec/" in path for path in files)
+    assert any(path.endswith("main.py") for path in files)
+
+
+def test_ignored_predicate_applies_the_global_layer(tmp_path, monkeypatch):
+    """The predicate must make the same decisions detect()'s walk made.
+
+    It never loaded the global layer, so #2495 reconciliation saw a
+    globally-excluded file as dropped by .gitignore instead.
+    """
+    from graphify.detect import ignored_predicate
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _set_global_ignore(monkeypatch, tmp_path / "home", "*.min.js\n")
+    bundle = proj / "app.min.js"
+    bundle.write_text("var x=1", encoding="utf-8")
+    (proj / "main.py").write_text("x = 1\n", encoding="utf-8")
+
+    is_ignored = ignored_predicate(proj)
+    assert is_ignored(bundle)
+    assert not is_ignored(proj / "main.py")

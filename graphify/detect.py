@@ -1238,7 +1238,7 @@ def _read_ignore_text(path: Path) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-def _load_dir_own_ignore(d: Path, *, gitignore: bool = True) -> list[tuple[Path, str]]:
+def _load_dir_own_ignore(d: Path, *, gitignore: bool = False) -> list[tuple[Path, str]]:
     """Read .gitignore/.graphifyignore directly inside *d* (not its ancestors).
 
     Merges .gitignore and .graphifyignore for this one directory (#1363):
@@ -1265,7 +1265,7 @@ def _load_dir_own_ignore(d: Path, *, gitignore: bool = True) -> list[tuple[Path,
     return patterns
 
 
-def _load_graphifyignore(root: Path, *, gitignore: bool = True) -> list[tuple[Path, str]]:
+def _load_graphifyignore(root: Path, *, gitignore: bool = False) -> list[tuple[Path, str]]:
     """Read .graphifyignore files and return (anchor_dir, pattern) pairs.
 
     Patterns are returned outer-first so that inner (closer) rules are
@@ -1639,7 +1639,7 @@ def ignored_predicate(
     root: Path,
     *,
     extra_excludes: list[str] | None = None,
-    gitignore: bool = True,
+    gitignore: bool = False,
 ) -> Callable[[Path], bool]:
     """Build a per-path predicate answering "would detect() exclude this path?".
 
@@ -1662,6 +1662,14 @@ def ignored_predicate(
     root = root.resolve()
     patterns = _load_graphifyignore(root, gitignore=gitignore)
     explicit_patterns = _load_graphifyignore(root, gitignore=False)
+    # Same global layer detect() applies, in both lists for the same reason: it
+    # is the weakest matcher (prepended, so any local rule wins) but an explicit
+    # one, so the tracked-file exemption must not spare paths it matches. The
+    # predicate omitted it entirely, which made it disagree with detect() on
+    # globally-ignored files — #2495 then attributed them to `.gitignore`.
+    global_patterns = _load_global_graphifyignore(root)
+    patterns[:0] = global_patterns
+    explicit_patterns[:0] = global_patterns
     # Only shell out to git when .gitignore actually contributes patterns beyond
     # the explicit (.graphifyignore/--exclude) set: with no .gitignore in play,
     # nothing is dropped by gitignore and the tracked-file exemption is moot, so a
@@ -1747,7 +1755,12 @@ def _resolves_under_root(path: Path, root: Path) -> bool:
     return True
 
 
-def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, cache_root: Path | None = None, gitignore: bool = True) -> dict:
+def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, cache_root: Path | None = None, gitignore: bool = False) -> dict:
+    # gitignore defaults to False (fork delta): a parent `.gitignore` line like
+    # `/graphify/` means "separate repo, don't commit it here", not "junk" —
+    # honoring it silently dropped the code of every nested repository from the
+    # graph. Junk is declared in .graphifyignore / ~/.graphify/ignore instead;
+    # `--gitignore` restores the upstream behavior.
     root = root.resolve()
     configured_out_dir = root / GRAPHIFY_OUT
     configured_out_names = {configured_out_dir.name}
@@ -1822,8 +1835,13 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
     # during the walk) or CLI --exclude wins via last-match-wins. Kept out of
     # the graphifyignore_patterns count below, which reports local + --exclude
     # patterns only.
+    # The global layer is graph-level intent, not a VCS rule, so it also goes
+    # into the explicit set: the tracked-file exemption (#2759) must only spare
+    # paths from `.gitignore` rules. Without this a global pattern silently did
+    # nothing in any git repository, since every tracked file escaped it.
     global_ignore = _load_global_graphifyignore(root)
     ignore_patterns[:0] = global_ignore
+    explicit_ignore_patterns[:0] = global_ignore
 
     def _ignored_for_scan(path: Path) -> bool:
         return _is_scan_ignored(
@@ -2475,7 +2493,7 @@ def detect_incremental(
     google_workspace: bool | None = None,
     kind: str = "semantic",
     extra_excludes: list[str] | None = None,
-    gitignore: bool = True,
+    gitignore: bool = False,
 ) -> dict:
     """Like detect(), but returns only new or modified files since the last run.
 

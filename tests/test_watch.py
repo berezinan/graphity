@@ -578,10 +578,11 @@ def test_update_rebuilds_with_nested_star_gitignore(tmp_path):
     bug: a nested bare `*` zeroed the re-scan, update built 0 nodes, and the
     shrink-guard refused. With scoping fixed the rebuild sees the real files."""
     import json
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _rebuild_code, _write_build_config
 
     corpus = tmp_path / "corpus"
     (corpus / "src").mkdir(parents=True)
+    _write_build_config(corpus / "graphify-out", excludes=None, gitignore=True)
     (corpus / "src" / "a.py").write_text(
         "from src.b import Base\nclass App(Base):\n    def run(self): return 1\n", encoding="utf-8"
     )
@@ -609,10 +610,13 @@ def test_update_discovers_newly_added_files_and_dirs(tmp_path):
     this pins the build -> add -> update -> discovered sequence the earlier test
     (single build) did not cover, with a nested `*` scratch dir as a guard."""
     import json
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _rebuild_code, _write_build_config
 
     corpus = tmp_path / "corpus"
     (corpus / "src").mkdir(parents=True)
+    # The scratch-dir guard below is a nested .gitignore, so this graph asks for
+    # the honoring mode explicitly.
+    _write_build_config(corpus / "graphify-out", excludes=None, gitignore=True)
     (corpus / "src" / "a.py").write_text("def alpha(): return 1\n", encoding="utf-8")
     assert _rebuild_code(corpus, acquire_lock=False) is True
 
@@ -2120,10 +2124,11 @@ def test_rebuild_code_preserves_nodes_from_excluded_but_alive_file(tmp_path, cap
     (#2495): only .graphifyignore/--exclude matches evict on the hook path.
     """
     import json
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _rebuild_code, _write_build_config
 
     corpus = tmp_path / "corpus"
     (corpus / "notes").mkdir(parents=True)
+    _write_build_config(corpus / "graphify-out", excludes=None, gitignore=True)
     (corpus / "auth.py").write_text("def login(): pass\n", encoding="utf-8")
     (corpus / "notes" / "brainstorm.md").write_text(
         "# Brainstorm\n\nA local-only design note.\n", encoding="utf-8"
@@ -2333,11 +2338,14 @@ def test_gitignore_eviction_gated_on_full_rebuild(tmp_path, capsys):
     incremental rebuild (#1795's motivating case — a deliberately-graphed
     .gitignore'd tree survives the hook path), but an explicit full
     `graphify update` honors it and purges the file."""
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _rebuild_code, _write_build_config
 
     corpus = tmp_path / "corpus"
     generated = corpus / "generated"
     generated.mkdir(parents=True)
+    # The #2495 policy split applies to graphs that honor .gitignore, which is
+    # no longer the default mode.
+    _write_build_config(corpus / "graphify-out", excludes=None, gitignore=True)
     (corpus / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
     (generated / "gen.py").write_text("def generated():\n    return 2\n", encoding="utf-8")
 
@@ -2370,10 +2378,16 @@ def test_gitignore_eviction_gated_on_full_rebuild(tmp_path, capsys):
 
 def _mass_gitignore_corpus(tmp_path):
     """a.py + vendor/{b,c,d}.py: vendor/ owns 6 of 8 nodes (75%), so a
-    .gitignore rule matching it crosses the more-than-half gate."""
+    .gitignore rule matching it crosses the more-than-half gate.
+
+    The graph records `gitignore: true`: the gate exists for graphs that honor
+    `.gitignore`, which is no longer the default mode."""
+    from graphify.watch import _write_build_config
+
     corpus = tmp_path / "corpus"
     vendor = corpus / "vendor"
     vendor.mkdir(parents=True)
+    _write_build_config(corpus / "graphify-out", excludes=None, gitignore=True)
     (corpus / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
     for name in ("b", "c", "d"):
         (vendor / f"{name}.py").write_text(
@@ -2477,11 +2491,12 @@ def test_full_rebuild_small_gitignore_prune_passes(tmp_path, monkeypatch, capsys
     """Below the gate (vendor/b.py owns 2 of 6 nodes) a .gitignore-driven prune
     behaves exactly as before: the newly-ignored file is purged and untouched
     files survive byte-identical."""
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _rebuild_code, _write_build_config
 
     monkeypatch.delenv("GRAPHIFY_FORCE", raising=False)
     corpus = tmp_path / "corpus"
     (corpus / "vendor").mkdir(parents=True)
+    _write_build_config(corpus / "graphify-out", excludes=None, gitignore=True)
     (corpus / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
     (corpus / "c.py").write_text("def gamma():\n    return 3\n", encoding="utf-8")
     (corpus / "vendor" / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")

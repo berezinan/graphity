@@ -1984,10 +1984,26 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
 
     elif cmd == "watch":
-        watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
+        gitignore_mode: bool | None = None
+        watch_args: list[str] = []
+        for a in sys.argv[2:]:
+            if a == "--gitignore":
+                gitignore_mode = True
+            elif a == "--no-gitignore":
+                gitignore_mode = False
+            else:
+                watch_args.append(a)
+        watch_path = Path(watch_args[0]) if watch_args else Path(".")
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
+        # Same contract as update: the flag records the graph's mode, which every
+        # rebuild of this watch loop then reads back from the build config.
+        if gitignore_mode is not None:
+            from graphify.watch import _write_build_config as _write_build_cfg
+            _write_build_cfg(
+                watch_path / _GRAPHIFY_OUT, excludes=None, gitignore=gitignore_mode
+            )
         # A watch loop whose database is unreachable cannot complete a single
         # rebuild, so refuse at startup instead of idling until the first edit.
         from graphify.query_backend import require_service as _require_service
@@ -2426,6 +2442,7 @@ def dispatch_command(cmd: str) -> None:
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
+        gitignore_mode: bool | None = None
         args = sys.argv[2:]
         watch_arg: str | None = None
         for a in args:
@@ -2434,6 +2451,12 @@ def dispatch_command(cmd: str) -> None:
                 continue
             if a == "--no-cluster":
                 no_cluster = True
+                continue
+            if a == "--gitignore":
+                gitignore_mode = True
+                continue
+            if a == "--no-gitignore":
+                gitignore_mode = False
                 continue
             if a.startswith("-"):
                 print(f"error: unknown update option: {a}", file=sys.stderr)
@@ -2459,6 +2482,14 @@ def dispatch_command(cmd: str) -> None:
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
+        # A mode given here is the graph's new mode: _rebuild_code reads it back
+        # from the build config, and so does every later hook rebuild. Recorded
+        # before the service check, as in extract.
+        if gitignore_mode is not None:
+            from graphify.watch import _write_build_config as _write_build_cfg
+            _write_build_cfg(
+                watch_path / _GRAPHIFY_OUT, excludes=None, gitignore=gitignore_mode
+            )
         # As in extract: the sync closing this rebuild is not optional, so an
         # unreachable database costs milliseconds rather than a whole rebuild.
         from graphify.query_backend import require_service as _require_service
@@ -3209,7 +3240,7 @@ def dispatch_command(cmd: str) -> None:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
-                "[--no-gitignore] [--code-only] [--no-dedup] "
+                "[--gitignore|--no-gitignore] [--code-only] [--no-dedup] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] [--timing]",
                 file=sys.stderr,
@@ -3245,7 +3276,8 @@ def dispatch_command(cmd: str) -> None:
         google_workspace = False
         global_merge = False
         code_only = False
-        no_gitignore = False
+        # None = no flag on this run: keep whatever mode the graph recorded.
+        gitignore_mode: bool | None = None
         global_repo_tag: str | None = None
         # Performance/tuning knobs (issue #792). None means "use library default".
         cli_max_workers: int | None = None
@@ -3317,7 +3349,9 @@ def dispatch_command(cmd: str) -> None:
             elif a == "--google-workspace":
                 google_workspace = True; i += 1
             elif a == "--no-gitignore":
-                no_gitignore = True; i += 1
+                gitignore_mode = False; i += 1
+            elif a == "--gitignore":
+                gitignore_mode = True; i += 1
             elif a == "--global":
                 global_merge = True; i += 1
             elif a == "--as" and i + 1 < len(args):
@@ -3405,11 +3439,6 @@ def dispatch_command(cmd: str) -> None:
         out_root = (out_dir.resolve() if out_dir else target)
         graphify_out = out_root / _GRAPHIFY_OUT
         graphify_out.mkdir(parents=True, exist_ok=True)
-        # Before anything expensive: the sync at the end of this pipeline is not
-        # optional, so an unreachable database must cost milliseconds, not an
-        # entire paid extraction.
-        from graphify.query_backend import require_service as _require_service
-        _require_service(str(graphify_out / "graph.json"))
         # Persist corpus-shaping options so later update/watch/hook rebuilds
         # use the same file set as the initial extraction (#1886).
         from graphify.watch import (
@@ -3417,21 +3446,31 @@ def dispatch_command(cmd: str) -> None:
             _read_build_excludes as _read_build_ex,
             _read_build_gitignore as _read_build_gi,
         )
-        # #1971 persistence: an explicit --no-gitignore persists False; a later
-        # flag-less `graphify extract` must NOT clobber it back to True, which
-        # would make the git-ignored code silently disappear again (the exact
-        # complaint #1971 is about). Honor the persisted value for THIS run when
-        # the flag is absent (read before the write below), and write False only
-        # when the flag is set — None leaves the setting as-is, mirroring how
-        # #1886 persists --exclude.
-        _effective_gitignore = False if no_gitignore else _read_build_gi(graphify_out)
+        # #1971 persistence: an explicit --gitignore/--no-gitignore persists that
+        # mode; a later flag-less `graphify extract` must NOT clobber it, which
+        # would make the code of a deliberately-scoped corpus silently disappear
+        # (the exact complaint #1971 is about). Honor the persisted value for THIS
+        # run when no flag was given (read before the write below), and write only
+        # what the flag stated — None leaves the setting as-is, mirroring how #1886
+        # persists --exclude.
+        _effective_gitignore = (
+            gitignore_mode if gitignore_mode is not None else _read_build_gi(graphify_out)
+        )
         # An explicit list replaces the persisted one; omission reuses it.
         _effective_excludes = cli_excludes or _read_build_ex(graphify_out)
+        # Written BEFORE the service check below: a run that dies on an
+        # unreachable database used to leave no trace of the mode the user asked
+        # for, so the next rebuild silently fell back to the default.
         _write_build_cfg(
             graphify_out,
             excludes=cli_excludes or None,
-            gitignore=False if no_gitignore else None,
+            gitignore=gitignore_mode,
         )
+        # Before anything expensive: the sync at the end of this pipeline is not
+        # optional, so an unreachable database must cost milliseconds, not an
+        # entire paid extraction.
+        from graphify.query_backend import require_service as _require_service
+        _require_service(str(graphify_out / "graph.json"))
 
         stages = _StageTimer(cli_timing)
 
@@ -3572,6 +3611,10 @@ def dispatch_command(cmd: str) -> None:
                 cache_root=out_root,
                 gitignore=_effective_gitignore,
             )
+            # Full scan: compare against the previous build before the semantic
+            # pass turns a widened corpus into API spend.
+            from graphify.watch import warn_on_corpus_growth as _warn_growth
+            _warn_growth(manifest_path, detection, target)
             files_by_type = detection.get("files", {})
             code_files = [Path(p) for p in files_by_type.get("code", [])]
             doc_files = [Path(p) for p in files_by_type.get("document", [])]

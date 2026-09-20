@@ -1101,6 +1101,22 @@ def _is_uv_from_interpreter_fix_line(line: str) -> bool:
     return "uv tool run" in line and "graphifyy python" in line
 
 
+def _is_corpus_mode_fix_line(line: str) -> bool:
+    """Whether a line makes the skill's detect() honor the graph's recorded mode.
+
+    The pipeline called ``detect(Path('INPUT_PATH'))`` and so always used the
+    function default, while the CLI read the mode recorded in
+    ``.graphify_build.json``. The two then disagreed about the file set on the
+    same project. Both the import of the reader (added) and the old and new
+    detect calls are sanctioned here.
+    """
+    stripped = line.strip()
+    return (
+        stripped == "from graphify.watch import _read_build_gitignore"
+        or stripped.startswith("result = detect(Path('INPUT_PATH')")
+    )
+
+
 def _is_semantic_cache_scope_fix_line(line: str) -> bool:
     """Whether a line scopes semantic cache writes to dispatched files (#1757).
 
@@ -1161,6 +1177,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_shebang_allowlist_fix_line,
     _is_obsidian_usage_comment_line,
     _is_uv_from_interpreter_fix_line,
+    _is_corpus_mode_fix_line,
     _is_semantic_cache_scope_fix_line,
     _is_community_label_export_fix_line,
 )

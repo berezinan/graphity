@@ -125,7 +125,12 @@ def _read_build_excludes(out_dir: Path) -> list[str]:
 
 
 def _read_build_gitignore(out_dir: Path) -> bool:
-    """Return whether rebuilds should honor VCS ignore files (default True)."""
+    """Return whether rebuilds should honor VCS ignore files (default False).
+
+    Mirrors detect()'s default: with no recorded mode, `.gitignore` is not
+    honored. A graph built with an explicit `--gitignore` records True here and
+    keeps it across rebuilds.
+    """
     try:
         path = out_dir / _BUILD_CONFIG_FILENAME
         if path.is_file():
@@ -134,7 +139,64 @@ def _read_build_gitignore(out_dir: Path) -> bool:
                 return cfg["gitignore"]
     except (OSError, json.JSONDecodeError):
         pass
-    return True
+    return False
+
+
+_CORPUS_GROWTH_FACTOR = 2
+
+
+def warn_on_corpus_growth(manifest_path: Path, detected: dict, root: Path) -> None:
+    """Warn when this scan picked up more than twice the previous file count.
+
+    The mirror image of the mass-prune gate: that one catches a corpus
+    collapsing (nodes vanish), this one catches it exploding — a widened scope,
+    a deleted .graphifyignore, or a first run after the `.gitignore` default
+    flipped, each of which quietly turns into LLM spend on the semantic pass.
+    Growth cannot corrupt an existing graph, so this only warns: refusing the
+    first rebuild after an upgrade would be hostile.
+
+    Best effort: an unreadable or missing manifest means there is nothing to
+    compare against (a first build), and the scan proceeds silently.
+    """
+    try:
+        if not manifest_path.is_file():
+            return
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(manifest, dict) or not manifest:
+        return
+    previous = len(manifest)
+    current_paths = [f for group in detected.get("files", {}).values() for f in group]
+    if len(current_paths) <= previous * _CORPUS_GROWTH_FACTOR:
+        return
+
+    try:
+        root_resolved = root.resolve()
+    except (OSError, RuntimeError):
+        root_resolved = root
+    known = {key.replace("\\", "/") for key in manifest}
+    new_by_dir: dict[str, int] = {}
+    for path in current_paths:
+        try:
+            rel = Path(path).resolve().relative_to(root_resolved).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if rel in known:
+            continue
+        top = rel.split("/", 1)[0] if "/" in rel else "(root)"
+        new_by_dir[top] = new_by_dir.get(top, 0) + 1
+    sample = ", ".join(
+        f"{name}/ ({count})"
+        for name, count in sorted(new_by_dir.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    )
+    largest = f" Largest new directories: {sample}." if sample else ""
+    print(
+        f"[graphify watch] corpus grew from {previous} to {len(current_paths)} file(s) "
+        f"(x{len(current_paths) / previous:.1f})."
+        f"{largest}"
+        " Declare anything unwanted in .graphifyignore or ~/.graphify/ignore."
+    )
 
 
 def _merge_changed_paths(*sources: "list[Path] | None") -> list[Path]:
@@ -1497,6 +1559,9 @@ def _rebuild_code(
             extra_excludes=_persisted_excludes or None,
             gitignore=_gitignore_enabled,
         )
+        # Read against the manifest of the previous build, before the save
+        # sites below overwrite it.
+        warn_on_corpus_growth(out / "manifest.json", detected, watch_path)
         code_files = [Path(f) for f in detected['files']['code']]
 
         # #3511: `graphify extract` has surfaced files it saw but could not
@@ -2079,7 +2144,16 @@ def _rebuild_code(
         from graphify.report import load_learning_for_report as _llfr
         report = generate(G, communities, cohesion, labels, gods, surprises, detection,
                           {"input": 0, "output": 0}, report_root, suggested_questions=questions,
-                          built_at_commit=commit, learning=_llfr(out / "graph.json"))
+                          built_at_commit=commit, learning=_llfr(out / "graph.json"),
+                          corpus_scope={
+                              "gitignore": _gitignore_enabled,
+                              "excludes": _persisted_excludes,
+                              "source": (
+                                  "recorded in .graphify_build.json"
+                                  if (out / _BUILD_CONFIG_FILENAME).is_file()
+                                  else "default"
+                              ),
+                          })
         report_path = out / "GRAPH_REPORT.md"
         labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
         graph_tmp = out / ".graph.tmp.json"
