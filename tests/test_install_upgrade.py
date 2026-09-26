@@ -139,7 +139,7 @@ def test_claude_install_upgrades_stale_hook_payload(tmp_path, monkeypatch):
     settings.write_text(json.dumps(stale_settings), encoding="utf-8")
     monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
 
-    mainmod.claude_install(tmp_path)
+    mainmod.claude_install(tmp_path, project=True)
 
     new_settings_text = settings.read_text(encoding="utf-8")
     assert _OLD_HOOK_PAYLOAD_SNIPPET not in new_settings_text, (

@@ -523,7 +523,7 @@ def test_claude_hook_is_shell_agnostic(tmp_path):
     # POSIX bash (which fails on Windows cmd.exe/PowerShell).
     import json as _json
     from graphify.__main__ import _install_claude_hook
-    _install_claude_hook(tmp_path)
+    _install_claude_hook(tmp_path, project=True)
     hooks = _json.loads((tmp_path / ".claude" / "settings.json").read_text())["hooks"]["PreToolUse"]
     matchers = {h["matcher"] for h in hooks}
     assert {"Bash|Grep", "Read|Glob"} <= matchers  # Grep in the search matcher: #1986
@@ -544,8 +544,8 @@ def test_claude_hook_install_idempotent_and_replaces_old_bash_hook(tmp_path):
         {"matcher": "Bash", "hooks": [{"type": "command",
          "command": "[ -f graphify-out/graph.json ] && echo '{...}' || true"}]},
     ]}}), encoding="utf-8")
-    _install_claude_hook(tmp_path)
-    _install_claude_hook(tmp_path)  # second install must not duplicate
+    _install_claude_hook(tmp_path, project=True)
+    _install_claude_hook(tmp_path, project=True)  # second install must not duplicate
     hooks = _json.loads(settings_path.read_text())["hooks"]["PreToolUse"]
     graphify_hooks = [h for h in hooks if "graphify" in str(h)]
     assert len(graphify_hooks) == 2, "exactly the Bash + Read|Glob guards, no dupes"
@@ -1412,7 +1412,9 @@ def test_user_profile_install_still_resolves_absolute_path(tmp_path, monkeypatch
         with patch("sys.argv", ["graphify", platform, "install"]):
             main()
 
-    commands = _hook_commands((project / _PROJECT_HOOK_FILES[platform]).read_text(encoding="utf-8"))
+    # Claude's user-profile hooks live in the user-level settings, not the project.
+    hook_file = home / ".claude" / "settings.json" if platform == "claude" else project / _PROJECT_HOOK_FILES[platform]
+    commands = _hook_commands(hook_file.read_text(encoding="utf-8"))
     assert commands, f"{platform} install registered no hook command"
     for command in commands:
         assert command.startswith("C:/Users/installer/graphify.EXE "), command

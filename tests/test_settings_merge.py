@@ -15,6 +15,7 @@ user's mcpServers/enabledPlugins/theme/hooks. The fix:
 from __future__ import annotations
 
 import json
+import functools
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,8 @@ from graphify.install import (
 
 # installer key -> (function, settings file relative to project dir, hooks section)
 _INSTALLERS = {
-    "claude": (_install_claude_hook, Path(".claude") / "settings.json", "PreToolUse"),
+    # project scope: without it the Claude hooks go to the user-level settings
+    "claude": (functools.partial(_install_claude_hook, project=True), Path(".claude") / "settings.json", "PreToolUse"),
     "codebuddy": (_install_codebuddy_hook, Path(".codebuddy") / "settings.json", "PreToolUse"),
     "codex": (_install_codex_hook, Path(".codex") / "hooks.json", "PreToolUse"),
     "gemini": (_install_gemini_hook, Path(".gemini") / "settings.json", "BeforeTool"),

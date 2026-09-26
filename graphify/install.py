@@ -705,6 +705,9 @@ def install(platform: str = "claude", *, project: bool = False, project_dir: Pat
         _register_always_on_block(
             claude_md, "  CLAUDE.md        ->  ", _skill_registration(skill_ref)
         )
+        if not project:
+            # Hooks share the skill's scope; a project install adds its own via claude_install.
+            _install_claude_hook(project_dir)
 
     if platform == "codebuddy":
         # Register in ~/.codebuddy/CODEBUDDY.md (CodeBuddy only)
@@ -728,12 +731,23 @@ def install(platform: str = "claude", *, project: bool = False, project_dir: Pat
     print("Prefer a hosted version? Early access to the graphify platform is")
     print("open free before the public v1 launch: https://app.graphify.com")
     print()
+def _refuse_strict_without_project() -> NoReturn:
+    """--strict blocks the first raw read of every session; at user level that
+    would hit every project on the machine, including ones with no graph."""
+    print(
+        "error: --strict requires --project: strict mode blocks the first raw file read "
+        "per session, and a user-level hook would do that in every project on this "
+        "machine, including ones without a graph. Run `graphify install --project --strict`.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 def _print_install_usage() -> None:
     platforms = ", ".join([*_PLATFORM_CONFIG, "gemini", "cursor"])
     print("Usage: graphify install [--project] [--strict] [--platform P|P]")
     print(f"Platforms: {platforms}")
     print("  --strict  block the first raw file read per session until one "
-          "`graphify query` runs (Claude Code project hook only; needs --project)")
+          "`graphify query` runs (Claude Code project hook only; requires --project, "
+          "refused without it)")
 _CLAUDE_MD_MARKER = "## graphify"
 _CODEBUDDY_MD_MARKER = "## graphify"
 _AGENTS_MD_MARKER = "## graphify"
@@ -1803,13 +1817,22 @@ def claude_install(project_dir: Path | None = None, strict: bool = False, projec
     if strict:
         print("Strict mode: the first raw file read per session is blocked until")
         print("one `graphify query` runs (toggle with GRAPHIFY_HOOK_STRICT=0).")
+def _claude_user_dir() -> Path:
+    """User-level Claude Code config dir, honoring CLAUDE_CONFIG_DIR like the skill (#527, #2694)."""
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return Path(os.environ["CLAUDE_CONFIG_DIR"])
+    return Path.home() / ".claude"
 def _install_claude_hook(project_dir: Path, strict: bool = False, project: bool = False) -> None:
-    """Add graphify PreToolUse hook to .claude/settings.json.
+    """Add graphify PreToolUse hook to settings.json of the install scope.
 
-    A project-scoped install emits the bare command, since .claude/settings.json
-    is then committed and an installing machine's path is wrong there (#3129).
+    A project-scoped install writes <project>/.claude/settings.json with the bare
+    command, since that file is then committed and an installing machine's path
+    is wrong there (#3129). Otherwise the hooks go to the user-level settings with
+    the absolute exe path: Claude Code merges user and project hooks, so writing
+    them into every project a user-level install ran in doubled every hint.
     """
-    settings_path = project_dir / ".claude" / "settings.json"
+    settings_dir = project_dir / ".claude" if project else _claude_user_dir()
+    settings_path = settings_dir / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
 
     settings = _read_settings_for_merge(settings_path)
@@ -1825,14 +1848,61 @@ def _install_claude_hook(project_dir: Path, strict: bool = False, project: bool 
     hooks["PreToolUse"].extend(_claude_pretooluse_hooks(strict=strict, project=project))
     _write_settings_with_backup(settings_path, settings)
     _mode = " (strict)" if strict else ""
-    print(f"  .claude/settings.json  ->  PreToolUse hooks registered (Bash|Grep search + Read/Glob){_mode}")
-def _uninstall_claude_hook(project_dir: Path) -> None:
-    """Remove the graphify PreToolUse hook from .claude/settings.json and its
-    local-only sibling .claude/settings.local.json.
+    print(f"  {settings_path}  ->  PreToolUse hooks registered (Bash|Grep search + Read/Glob){_mode}")
+    if not project:
+        _warn_claude_project_duplicates(project_dir)
+def _count_graphify_hooks(settings_path: Path) -> int:
+    """Number of graphify PreToolUse hooks in one Claude settings file (0 if unreadable)."""
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+        pre_tool = settings.get("hooks", {}).get("PreToolUse", [])
+        return sum(1 for h in pre_tool if isinstance(h, dict) and "graphify" in str(h))
+    except (OSError, ValueError, AttributeError):
+        return 0
+def _warn_claude_project_duplicates(project_dir: Path) -> None:
+    """After a user-level install, name project-scope leftovers in project_dir.
 
-    A user may relocate the hook into settings.local.json so it is not committed
-    to a shared repo, so uninstall has to clean whichever file holds it (#1731).
+    Project hooks add to the user-level ones (every hint prints twice); a project
+    skill shadows the user-level one (the agent reads a stale copy). Warn only:
+    the files may be committed and wanted by others.
     """
+    claude_dir = (project_dir / ".claude").absolute()
+    try:
+        if claude_dir.resolve() == _claude_user_dir().resolve():
+            return  # installing from home: these ARE the user-level files
+    except OSError:
+        return
+    fix = "remove with `graphify claude uninstall --project`, then re-run this install"
+    for name in ("settings.json", "settings.local.json"):
+        count = _count_graphify_hooks(claude_dir / name)
+        if count:
+            print(
+                f"warning: {claude_dir / name} still has {count} graphify PreToolUse hook(s); "
+                f"Claude Code merges them with the user-level ones, so every hint prints twice - {fix}",
+                file=sys.stderr,
+            )
+    skill_dir = claude_dir / "skills" / "graphify"
+    if skill_dir.is_dir():
+        try:
+            version = (skill_dir / ".graphify_version").read_text(encoding="utf-8").strip()
+        except OSError:
+            version = "unknown"
+        print(
+            f"warning: project skill copy {skill_dir} (version {version}) shadows the "
+            f"user-level skill - {fix}",
+            file=sys.stderr,
+        )
+def _uninstall_claude_hook(project_dir: Path, project: bool = True) -> None:
+    """Remove the graphify PreToolUse hook from the settings of one scope.
+
+    Project scope cleans .claude/settings.json and its local-only sibling
+    .claude/settings.local.json: a user may relocate the hook there so it is not
+    committed to a shared repo (#1731). User scope cleans the user-level
+    settings.json, where a user-level install puts the hooks.
+    """
+    if not project:
+        _strip_graphify_hook(_claude_user_dir() / "settings.json")
+        return
     claude_dir = project_dir / ".claude"
     for name in ("settings.json", "settings.local.json"):
         _strip_graphify_hook(claude_dir / name)
@@ -1850,7 +1920,7 @@ def _strip_graphify_hook(settings_path: Path) -> None:
         return
     settings["hooks"]["PreToolUse"] = filtered
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  .claude/{settings_path.name}  ->  PreToolUse hook removed")
+    print(f"  {settings_path}  ->  PreToolUse hook removed")
 def uninstall_all(project_dir: Path | None = None, purge: bool = False) -> None:
     """Remove graphify from every platform detected in the current project."""
     pd = project_dir or Path(".")
@@ -1939,7 +2009,8 @@ def claude_uninstall(project_dir: Path | None = None, *, project: bool = False, 
     elif not removed_any:
         print("graphify section not found in CLAUDE.md - nothing to do")
 
-    _uninstall_claude_hook(project_dir)
+    # Hooks follow the skill's scope: a user-level uninstall removes user-level hooks.
+    _uninstall_claude_hook(project_dir, project=project or not remove_user_skill)
 def _strip_graphify_md_section(target: Path) -> bool:
     """Strip the ## graphify section from one CLAUDE.md-style file.
 
@@ -2143,15 +2214,11 @@ def dispatch_install_cli(cmd: str) -> bool:
                 selected_platform = arg
                 i += 1
         chosen_platform = selected_platform or default_platform
+        if strict and not project_scope:
+            _refuse_strict_without_project()
         if project_scope:
             _project_install(chosen_platform, Path("."), strict=strict)
         else:
-            if strict:
-                print(
-                    "note: --strict applies to the project PreToolUse hook; run "
-                    "`graphify install --project --strict` or `graphify claude install --strict`.",
-                    file=sys.stderr,
-                )
             install(platform=chosen_platform)
     elif cmd == "uninstall":
         args = sys.argv[2:]
@@ -2189,6 +2256,8 @@ def dispatch_install_cli(cmd: str) -> bool:
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
         if subcmd == "install":
             _strict = "--strict" in sys.argv[3:]
+            if _strict and "--project" not in sys.argv[3:]:
+                _refuse_strict_without_project()
             if "--project" in sys.argv[3:]:
                 _project_install("claude", Path("."), strict=_strict)
             else:
