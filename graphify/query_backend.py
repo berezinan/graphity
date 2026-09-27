@@ -17,7 +17,9 @@ Design contract that makes a DB backend possible:
 """
 from __future__ import annotations
 
+import functools
 import math
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -33,6 +35,7 @@ from graphify.serve import (
     _dfs_core,
     _filter_graph_by_context,
     _find_node,
+    _find_node_tiers,
     find_node_ambiguity,
     _hub_threshold,
     _idf_value,
@@ -820,6 +823,138 @@ def shortfall_warning(stats: dict) -> str | None:
     return msg
 
 
+@functools.cache
+def _diacritic_variants() -> dict[str, str]:
+    """Символ → все символы, которые `_strip_diacritics(...).lower()` сводит к нему.
+
+    `source_file` и `id` хранятся сырыми, а токены эталона сняты с диакритики
+    (`й` → `и`, `é` → `e`). Шаблон для сырого поля ставит на место символа
+    класс его вариантов: так он совпадает ровно с тем, что эталон сочтёт тем же
+    символом, и остаётся избирательным. Одиночный символ-джокер на месте всех
+    не-ASCII символов делал шаблон кириллического токена бессодержательным, и
+    выборка тянула весь граф.
+    """
+    out: dict[str, set[str]] = {}
+    for i in range(0x10000):
+        if 0xD800 <= i < 0xE000:
+            continue
+        ch = chr(i).lower()
+        x = _strip_diacritics(ch).lower()
+        if len(ch) == 1 and len(x) == 1 and x != ch:
+            out.setdefault(x, {x}).add(ch)
+    return {x: "".join(sorted(v)) for x, v in out.items()}
+
+
+def _fold_rx(s: str) -> str:
+    """Регулярка для сырого поля, совпадающая со всем, что эталон сведёт к `s`.
+
+    Работает под флагом `(?iu)`: регистр сравнивает сама регулярка, а не
+    `toLowerCase()` на каждой строке.
+
+    Точек в результате нет ни одной. `MATCHES` в ArcadeDB (#5258, фикс #5354
+    только в `main`) кэширует скомпилированный шаблон под ключом
+    `"MATCHES_" + regex`, а ключ разбирается как путь `$var.field`: две точки в
+    регулярке дают «Nested property access is not supported», одна — компиляцию
+    шаблона на каждой строке. Поэтому небуквенно-цифровые символы пишутся как
+    `\\x{HH}`, а вместо `.*` вызывающие ставят `_ANY`.
+    """
+    def lit(ch: str) -> str:
+        return ch if ch.isalnum() else f"\\x{{{ord(ch):X}}}"
+
+    variants = _diacritic_variants()
+    out = []
+    for c in s:
+        v = variants.get(c)
+        # Каждый член класса через `lit`: у `^`, `]`, `\`, `-`, `&` есть
+        # полноширинные варианты, и без этого `[^＾]` читался бы как отрицание.
+        out.append("[" + "".join(lit(ch) for ch in v) + "]" if v else lit(c))
+    return "".join(out)
+
+
+# Любая строка без единой точки — см. `_fold_rx`.
+_ANY = r"[\s\S]*"
+
+
+# Разделитель токенов `_search_tokens` (`[^\W_]+`) в синтаксисе Java-регулярок
+# ArcadeDB: всё, что не буква и не цифра. Тест полноты переводит его обратно.
+_SEP = r"[^\p{L}\p{N}]"
+
+_Cond = tuple[str, str, str]          # (поле, LIKE | MATCHES, шаблон)
+
+
+def _like_text(s: str) -> str:
+    """Свободный текст для шаблона LIKE: `\\` → `?`.
+
+    ArcadeDB раскрывает обратный слэш в параметре как escape (`a\\b` стал
+    backspace), а одиночный символ `?` совпадает с ним при любом раскрытии.
+    """
+    return s.replace("\\", "?")
+
+
+def _dedupe(groups: list[list[_Cond]]) -> list[list[_Cond]]:
+    # Каждая лишняя группа — ещё один полный проход по Node.
+    unique: list[list[_Cond]] = []
+    for g in groups:
+        if g not in unique:
+            unique.append(g)
+    return unique
+
+
+def _label_substring_tier_filter(label: str) -> list[list[_Cond]]:
+    """Условие выборки узлов тира substring — второй этап `_resolve_one`.
+
+    Возвращает OR из AND-групп. Правила сопоставления здесь не повторяются:
+    база отдаёт надмножество, тиры считает эталонный код на мини-графе. Своя
+    копия правил уже разошлась с эталоном, когда `_search_tokens` начал резать
+    по `_`: `dbo_Price` искался как `LIKE '%dbo price%'` и не находился нигде.
+
+    Второй этап идёт, только когда первый (`_label_upper_tier_filter`) доказал,
+    что верхние тиры пусты, поэтому покрыть нужно один substring. Его условие у
+    эталона — `term` в norm_label или в label_tokens, либо `norm_query` в
+    norm_label; id и путь в нём не участвуют. Всё это влечёт одно: каждый
+    токен запроса есть в norm_label (токен без пробелов лежит внутри одного
+    токена метки). Запрос без токенов эталон не резолвит вовсе.
+    """
+    tokens = _search_tokens(label)
+    return [[("norm_label", "LIKE", f"%{t}%") for t in tokens]] if tokens else []
+
+
+def _label_upper_tier_filter(label: str) -> list[list[_Cond]]:
+    """Условие выборки узлов тиров source_exact, exact и prefix — без substring.
+
+    Тир узла от других узлов не зависит, поэтому если эта выборка дала непустой
+    верхний тир, он совпадает с тиром на полном графе, и тянуть совпадения по
+    подстроке не нужно. На ERP2 они и были ценой: `Module` есть почти в каждом
+    пути 1С:EDT, и полная выборка несла в Python ~2 млн кандидатов (719 с).
+
+    Покрыты условия эталона: `term`/`norm_query` равен началу norm_label (с ним
+    и `bare_label`, его префикс); `label_tokens` начинается с `term` —
+    регулярка по norm_label; `nid` начинается с `term`/`norm_query`;
+    `source_tokens` равны `term` — регулярка по пути. Для `path::symbol` то же
+    по части symbol: её отбор (#3485) требует точного совпадения символа.
+    """
+    def sides(q: str) -> list[list[_Cond]]:
+        norm_q = _strip_diacritics(str(q)).lower().strip()
+        tokens = _search_tokens(q)
+        term = " ".join(tokens)
+        out: list[list[_Cond]] = []
+        for prefix in filter(None, dict.fromkeys((term, norm_q))):
+            out.append([("norm_label", "LIKE", f"{_like_text(prefix)}%")])
+            out.append([("id", "MATCHES", f"(?iu){_fold_rx(prefix)}{_ANY}")])
+        if tokens:
+            out.append([("norm_label", "MATCHES", f"{_SEP}*" + f"{_SEP}+".join(tokens) + _ANY)])
+            body = f"{_SEP}+".join(_fold_rx(t) for t in tokens)
+            out.append([("source_file", "MATCHES", f"(?iu){_SEP}*{body}{_SEP}*")])
+        return out
+
+    groups = sides(label)
+    if "::" in label:
+        symbol = label.partition("::")[2].strip()
+        if symbol:
+            groups += sides(symbol)
+    return _dedupe(groups)
+
+
 def _by_id(row: dict) -> str:
     """Sort key standing in for a dropped ``ORDER BY id``.
 
@@ -898,10 +1033,15 @@ class ArcadeDBBackend(GraphBackend):
         r.raise_for_status()
         return r.json() if r.text else {}
 
-    def _run(self, command: str, *, kind="command", language="sql", params=None) -> list[dict]:
+    def _run(self, command: str, *, kind="command", language="sql", params=None,
+             limit: int | None = None) -> list[dict]:
         body = {"language": language, "command": command}
         if params:
             body["params"] = params
+        if limit is not None:
+            # Без явного limit HTTP-эндпоинт сам дописывает `limit 20000` и
+            # молча обрезает выборку; -1 снимает ограничение.
+            body["limit"] = limit
         r = self._s.post(f"{self.base}/api/v1/{kind}/{self.db}", json=body, timeout=300)
         if r.status_code >= 400:
             raise RuntimeError(f"ArcadeDB {r.status_code}: {r.text[:300]}\n  {command[:160]}")
@@ -1778,34 +1918,56 @@ class ArcadeDBBackend(GraphBackend):
                                   degree=int(r.get("degree") or 0))
         return None
 
-    def _resolve_one(self, label: str) -> dict | None:
-        """Mirror _find_node's first match (exact > prefix > substring)."""
-        term = " ".join(_search_tokens(label))
-        if not term:
-            return None
-        rows = self._run("SELECT id, label, norm_label FROM Node WHERE norm_label LIKE :p OR id LIKE :p",
-                         params={"p": f"%{term}%"})
+    def _label_candidates(self, groups: list[list[_Cond]]) -> nx.DiGraph:
+        """Мини-граф узлов, удовлетворяющих OR из AND-групп условий."""
+        H = nx.DiGraph()
+        if not groups:
+            return H
+        params: dict[str, str] = {}
+        ors = []
+        for group in groups:
+            ands = []
+            for field_expr, op, pattern in group:
+                key = f"p{len(params)}"
+                params[key] = pattern
+                ands.append(f"{field_expr} {op} :{key}")
+            ors.append("(" + " AND ".join(ands) + ")")
+        rows = self._run(
+            "SELECT id, label, norm_label, source_file, source_location FROM Node WHERE "
+            + " OR ".join(ors), params=params, limit=-1)
         rows.sort(key=_by_id)
-        tiers: list[list[dict]] = [[], [], []]
         for r in rows:
-            nl = (r.get("norm_label") or _strip_diacritics(str(r.get("label", "")))).lower()
-            bare, nidl = nl.rstrip("()"), r["id"].lower()
-            if term in (nl, bare, nidl):
-                tiers[0].append(r)
-            elif nl.startswith(term) or bare.startswith(term) or nidl.startswith(term):
-                tiers[1].append(r)
-            elif term in nl:
-                tiers[2].append(r)
-        for t in tiers:
-            if t:
-                return t[0]
+            H.add_node(r["id"], **{k: r[k] for k in ("label", "norm_label", "source_file", "source_location")
+                                   if r.get(k) is not None})
+        return H
+
+    def _resolve_one(self, label: str) -> tuple[str, nx.DiGraph] | None:
+        """First match of `_find_node` over the candidate superset, plus the winning tier.
+
+        The tier comes back as its own graph: a node's tier does not depend on
+        the other nodes, so `find_node_ambiguity` over it answers as over the
+        whole superset without recomputing tiers for every candidate. Built
+        fresh rather than via `H.subgraph`, which would share `H.graph` and with
+        it the trigram index cached there for H's nodes.
+        """
+        H = self._label_candidates(_label_upper_tier_filter(label))
+        tiers = _find_node_tiers(H, label)
+        if not any(tiers[:3]):
+            # Верхние тиры пусты и полны — ответ может быть только в substring.
+            H = self._label_candidates(_label_substring_tier_filter(label))
+            tiers = _find_node_tiers(H, label)
+        for tier in tiers:
+            if tier:
+                T = nx.DiGraph()
+                T.add_nodes_from((nid, H.nodes[nid]) for nid in tier)
+                return tier[0], T
         return None
 
     def get_neighbors(self, label, relation_filter="") -> Neighbors | None:
-        node = self._resolve_one(label.lower())
-        if node is None:
+        hit = self._resolve_one(label.lower())
+        if hit is None:
             return None
-        nid = node["id"]
+        nid, H = hit
         rf = relation_filter.lower()
         out = self._run(
             "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
@@ -1824,7 +1986,7 @@ class ArcadeDBBackend(GraphBackend):
             if rf and rf not in (r.get("relation") or "").lower():
                 continue
             recs.append(NeighborRecord(False, r.get("lbl", r["nb"]), str(r.get("relation", "")), str(r.get("confidence", ""))))
-        return Neighbors(label=node.get("label", nid), neighbors=recs)
+        return Neighbors(label=H.nodes[nid].get("label", nid), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:
         rows = self._run("SELECT id, label, source_file, community_name FROM Node WHERE community = :c",
@@ -1918,10 +2080,10 @@ class ArcadeDBBackend(GraphBackend):
         return rows[0]["label"] if rows and rows[0].get("label") else nid
 
     def explain(self, label) -> ExplainResult | None:
-        node = self._resolve_one(label)
-        if node is None:
+        hit = self._resolve_one(label)
+        if hit is None:
             return None
-        nid = node["id"]
+        nid, H = hit
         rows = self._run("SELECT id, label, source_file, source_location, file_type, community, degree, "
                         "definition_file, definition_location "
                         "FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})
@@ -1956,14 +2118,9 @@ class ArcadeDBBackend(GraphBackend):
         # Неоднозначность решается по узлам базы тем же правилом, что в
         # JsonBackend: несколько кандидатов ОДНОГО тира в РАЗНЫХ файлах.
         # Несколько совпадений внутри одного файла — обычное старшинство.
-        rows_amb = self._run(
-            "SELECT id, source_file FROM Node WHERE norm_label = :l",
-            params={"l": _strip_diacritics(str(label)).lower()})
-        by_file: dict[str, str] = {}
-        for row in rows_amb:
-            sf = str(row.get("source_file") or "")
-            by_file.setdefault(sf, row["id"])
-        ambiguous = sorted(by_file.items()) if len(by_file) > 1 else []
+        # H — узлы победившего тира, поэтому `find_node_ambiguity` видит тех
+        # же конкурентов, что на полном графе.
+        ambiguous = [(str(H.nodes[r].get("source_file") or r), r) for r in find_node_ambiguity(H, label)]
         return ExplainResult(detail=detail, connections=conns, ambiguous=ambiguous)
 
     def pr_impact(self, files) -> tuple[list[int], int]:

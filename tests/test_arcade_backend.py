@@ -45,6 +45,19 @@ def _make_digraph() -> nx.DiGraph:
     G.add_edge("n1", "n2", relation="calls", confidence="INFERRED", context="call")
     G.add_edge("n2", "n3", relation="imports", confidence="EXTRACTED", context="import")
     G.add_edge("n3", "n4", relation="uses", confidence="EXTRACTED")
+    # Метки с пунктуацией: `_search_tokens` режет по `_` и `.`, а хранимый
+    # norm_label их сохраняет. Однословные метки выше это расхождение не ловят.
+    G.add_node("p1", label="dbo_Price", source_file="import/price_import.py", source_location="L3", community=3)
+    G.add_node("p2", label="dbo.Price", source_file="sql/views/v_sales.sql", source_location="L7", community=3)
+    G.add_node("p3", label="Price.sql", source_file="sql/tables/Price.sql", source_location="L1", community=3)
+    G.add_node("p4", label="ExternalDataSource.X.Table.dbo_Price", source_file="src/X.mdo",
+               source_location="L1", community=3)
+    G.add_node("p5", label="load_prices", source_file="import/price_import.py", source_location="L20", community=3)
+    G.add_node("p6", label="load_prices", source_file="legacy/loader.py", source_location="L4", community=3)
+    G.add_node("p7", label="Процедура", source_file="src/Настройки/Ёлка.bsl", source_location="L2", community=3)
+    G.add_edge("p5", "p1", relation="uses", confidence="EXTRACTED")
+    G.add_edge("p2", "p3", relation="references", confidence="EXTRACTED")
+    G.add_edge("p4", "p3", relation="maps", confidence="INFERRED")
     return G
 
 
@@ -161,6 +174,36 @@ def test_explain_parity(backends, label):
     # render parity too (degree-ranked, but ties -> compare as the renderer emits)
     assert render_explain(jb.explain(label), label).splitlines()[:6] == \
            render_explain(arc.explain(label), label).splitlines()[:6]
+
+
+_PUNCTUATED = ["dbo_Price", "dbo.Price", "dbo Price", "Price.sql",
+               "ExternalDataSource.X.Table.dbo_Price", "load_prices",
+               "import/price_import.py::load_prices",
+               # Путь без диакритики: проверяет семантику LIKE самой базы
+               # (одиночный символ там `?`, а `_` — литерал).
+               "src/Настроики/Елка.bsl"]
+
+
+@pytest.mark.parametrize("label", _PUNCTUATED)
+def test_explain_parity_punctuated(backends, label):
+    jb, arc = backends
+    j, a = jb.explain(label), arc.explain(label)
+    assert j is not None and a is not None
+    # Порядок кандидатов в тире на JSON задаёт обход графа, поэтому
+    # неоднозначность сравнивается множеством, а узел — только без неё.
+    assert set(j.ambiguous) == set(a.ambiguous)
+    if not j.ambiguous:
+        assert (j.detail.label, j.detail.id, j.detail.source_file) == \
+               (a.detail.label, a.detail.id, a.detail.source_file)
+
+
+@pytest.mark.parametrize("label", ["dbo_Price", "dbo.Price", "Price.sql", "import/price_import.py::load_prices"])
+def test_get_neighbors_parity_punctuated(backends, label):
+    jb, arc = backends
+    def norm(n):
+        return None if n is None else (n.label, sorted((x.outgoing, x.label, x.relation, x.confidence) for x in n.neighbors))
+    assert norm(arc.get_neighbors(label)) is not None
+    assert norm(jb.get_neighbors(label)) == norm(arc.get_neighbors(label))
 
 
 def test_god_nodes_parity(backends):
@@ -361,7 +404,7 @@ def test_load_reports_shortfall(tmp_path_factory):
         assert st["unresolved_endpoint_edges"] == 1, \
             "the loss must be attributed to the unresolvable endpoint"
         warn = shortfall_warning(st)
-        assert warn is not None and "1 of 4 edges" in warn and "endpoint" in warn
+        assert warn is not None and f"1 of {len(raw['links'])} edges" in warn and "endpoint" in warn
     finally:
         try:
             arc._server("drop database graphify_shortfall_test")
