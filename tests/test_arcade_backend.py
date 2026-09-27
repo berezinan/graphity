@@ -37,14 +37,23 @@ _DB = "graphify_parity_test"
 
 def _make_digraph() -> nx.DiGraph:
     G = nx.DiGraph()
-    G.add_node("n1", label="extract", source_file="extract.py", source_location="L10", community=0)
-    G.add_node("n2", label="cluster", source_file="cluster.py", source_location="L5", community=0)
-    G.add_node("n3", label="build", source_file="build.py", source_location="L1", community=1)
-    G.add_node("n4", label="report", source_file="report.py", source_location="L1", community=1)
+    G.add_node("n1", label="extract", source_file="extract.py", source_location="L10", community=0,
+               community_name="Extraction")
+    G.add_node("n2", label="cluster", source_file="cluster.py", source_location="L5", community=0,
+               community_name="Extraction")
+    G.add_node("n3", label="build", source_file="build.py", source_location="L1", community=1,
+               community_name="Сборка", definition_file="build_impl.py", definition_location="L99")
+    G.add_node("n4", label="report", source_file="report.py", source_location="L1", community=1,
+               community_name="Сборка")
     G.add_node("n5", label="isolated", source_file="other.py", source_location="L1", community=2)
-    G.add_edge("n1", "n2", relation="calls", confidence="INFERRED", context="call")
-    G.add_edge("n2", "n3", relation="imports", confidence="EXTRACTED", context="import")
-    G.add_edge("n3", "n4", relation="uses", confidence="EXTRACTED")
+    # Место ребра — точка вызова. Три случая хранения: совпадает с файлом
+    # источника (в базе не повторяется), с файлом цели, третий файл.
+    G.add_edge("n1", "n2", relation="calls", confidence="INFERRED", context="call",
+               source_file="extract.py", source_location="L12")
+    G.add_edge("n2", "n3", relation="imports", confidence="EXTRACTED", context="import",
+               source_file="build.py", source_location="L2")
+    G.add_edge("n3", "n4", relation="uses", confidence="EXTRACTED",
+               source_file="glue/wiring.py", source_location="L40")
     # Метки с пунктуацией: `_search_tokens` режет по `_` и `.`, а хранимый
     # norm_label их сохраняет. Однословные метки выше это расхождение не ловят.
     G.add_node("p1", label="dbo_Price", source_file="import/price_import.py", source_location="L3", community=3)
@@ -55,8 +64,10 @@ def _make_digraph() -> nx.DiGraph:
     G.add_node("p5", label="load_prices", source_file="import/price_import.py", source_location="L20", community=3)
     G.add_node("p6", label="load_prices", source_file="legacy/loader.py", source_location="L4", community=3)
     G.add_node("p7", label="Процедура", source_file="src/Настройки/Ёлка.bsl", source_location="L2", community=3)
+    # Ребро без файла: восстановление по источнику не должно выдумать место.
     G.add_edge("p5", "p1", relation="uses", confidence="EXTRACTED")
-    G.add_edge("p2", "p3", relation="references", confidence="EXTRACTED")
+    G.add_edge("p2", "p3", relation="references", confidence="EXTRACTED",
+               source_file="sql/views/v_sales.sql", source_location="L9")
     G.add_edge("p4", "p3", relation="maps", confidence="INFERRED")
     return G
 
@@ -131,9 +142,10 @@ def test_get_neighbors_parity(backends):
 
 def test_get_community_parity(backends):
     jb, arc = backends
-    for cid in (0, 1, 2):
+    for cid in (0, 1, 2, 3):
         jc, ac = jb.get_community(cid), arc.get_community(cid)
         assert {m.label for m in jc.members} == {m.label for m in ac.members}
+        assert jc.name == ac.name, cid
 
 
 def test_graph_stats_parity(backends):
@@ -161,19 +173,45 @@ def test_shortest_path_no_path_parity(backends):
     assert "No directed path found" in a
 
 
-@pytest.mark.parametrize("label", ["build", "cluster", "extract"])
+@pytest.mark.parametrize("label", ["build", "cluster", "extract", "report", "load_prices", "p1", "p2"])
 def test_explain_parity(backends, label):
     jb, arc = backends
     def norm(r):
         d = r.detail
         return (
-            (d.label, d.id, d.source_file, d.file_type, d.community, d.degree),
-            sorted((c.outgoing, c.label, c.relation, c.confidence, c.degree) for c in r.connections),
+            (d.label, d.id, d.source_file, d.file_type, d.community, d.degree,
+             d.definition_file, d.definition_location),
+            sorted((c.outgoing, c.label, c.relation, c.confidence, c.degree,
+                    c.source_file, c.source_location) for c in r.connections),
         )
-    assert norm(jb.explain(label)) == norm(arc.explain(label))
-    # render parity too (degree-ranked, but ties -> compare as the renderer emits)
-    assert render_explain(jb.explain(label), label).splitlines()[:6] == \
-           render_explain(arc.explain(label), label).splitlines()[:6]
+    j, a = jb.explain(label), arc.explain(label)
+    if j.ambiguous:
+        # Узел неоднозначной метки выбирается порядком обхода; его сверяет
+        # test_explain_parity_punctuated, здесь нужны только места связей.
+        assert set(j.ambiguous) == set(a.ambiguous)
+        return
+    assert norm(j) == norm(a)
+    # Полный вывод: место связи и «Defined in:» видит пользователь.
+    assert render_explain(j, label) == render_explain(a, label)
+
+
+def test_explain_edge_location_cases(backends):
+    """Каждый случай хранения места ребра даёт то же, что эталон, а не просто
+    совпадает с ним пустотой с обеих сторон."""
+    jb, arc = backends
+    def at(backend, label, other):
+        return next((c.source_file, c.source_location)
+                    for c in backend.explain(label).connections if c.label == other)
+    assert at(arc, "extract", "cluster") == ("extract.py", "L12")        # = источник
+    assert at(arc, "cluster", "build") == ("build.py", "L2")             # = цель
+    assert at(arc, "build", "report") == ("glue/wiring.py", "L40")       # третий файл
+    assert at(arc, "build", "cluster") == ("build.py", "L2")             # входящее
+    assert at(arc, "p2", "Price.sql") == ("sql/views/v_sales.sql", "L9")
+    # У ребра p5 -> p1 файла нет, у источника p5 он есть: место не выдумывается.
+    assert at(arc, "p1", "load_prices") == ("", "")
+    for label, other in (("extract", "cluster"), ("build", "report"), ("p2", "Price.sql"),
+                         ("p1", "load_prices")):
+        assert at(jb, label, other) == at(arc, label, other)
 
 
 _PUNCTUATED = ["dbo_Price", "dbo.Price", "dbo Price", "Price.sql",

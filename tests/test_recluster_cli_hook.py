@@ -62,7 +62,7 @@ def test_changed_partition_is_still_written(tmp_path):
 class _FakeDb:
     def __init__(self, populated=True, shortfall=False, reconciled=True):
         self.populated, self.shortfall, self.reconciled = populated, shortfall, reconciled
-        self.calls = []
+        self.calls, self.names = [], []
 
     def is_populated(self):
         return self.populated
@@ -72,6 +72,7 @@ class _FakeDb:
 
     def update_communities(self, node_community, expected_sizes, **kw):
         self.calls.append((node_community, expected_sizes))
+        self.names.append(kw.get("names"))
         return {"updated_nodes": len(node_community), "reconciled": self.reconciled}
 
 
@@ -97,6 +98,18 @@ def test_name_only_change_sends_nothing(monkeypatch):
     _patch(monkeypatch, db)
     sync_community_changes("g.json", RAW, {"a": (0, "Renamed")}, {0: ["a", "узел_б"]})
     assert db.calls == []
+
+
+def test_name_only_change_with_labels_reaches_the_database(monkeypatch):
+    """A relabel that moved no node used to stop here, so the database kept the
+    old names for good. With the labels to_json got, the full map goes down."""
+    db = _FakeDb()
+    _patch(monkeypatch, db)
+    sync_community_changes("g.json", RAW, {"a": (0, "Renamed")}, {0: ["a", "узел_б"], 1: []},
+                           {"0": "Renamed"})
+    assert db.calls == [({}, {0: 2, 1: 0})]
+    # Mirrors to_json: a community without a label is written as "Community N".
+    assert db.names == [{0: "Renamed", 1: "Community 1"}]
 
 
 def test_json_backend_is_a_noop(monkeypatch):

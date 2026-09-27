@@ -53,9 +53,15 @@ def needs_write(raw: dict, changed: "dict | None", built_at_commit: "str | None"
 
 
 def sync_community_changes(graph_json_path: str, raw: dict, changed: "dict | None",
-                           communities: "dict[int, list[str]]") -> None:
+                           communities: "dict[int, list[str]]",
+                           labels: "dict[int, str] | None" = None) -> None:
     """After graph.json is written: bring the ArcadeDB copy of the partition up to
     date by updating only the nodes that moved. No-op for the JSON backend.
+
+    With *labels* (the map handed to to_json) the stored community names are
+    replaced too, built by the rule to_json writes them - so a relabel that moved
+    no node still reaches the database. Without them the stored names stand, as
+    they do in graph.json.
 
     Not guarded, like the sync in `extract`/`update`: the graph database is
     required, so a failed or short update raises and fails the command.
@@ -74,10 +80,15 @@ def sync_community_changes(graph_json_path: str, raw: dict, changed: "dict | Non
         return
     stored = {n.get("id"): n.get("community") for n in raw.get("nodes", [])}
     moved = {nid: cid for nid, (cid, _name) in changed.items() if stored.get(nid) != cid}
-    if not moved:
-        return  # only community names changed; this backend does not store them
-    stats = db.update_communities(moved, {cid: len(m) for cid, m in communities.items()})
-    print(f"[graphify db] updated ArcadeDB '{cfg['database']}' ({stats['updated_nodes']} nodes moved).")
+    names = None
+    if labels:
+        by_cid = {int(k): v for k, v in labels.items()}
+        names = {int(cid): by_cid.get(int(cid), f"Community {cid}") for cid in communities}
+    if not moved and names is None:
+        return
+    stats = db.update_communities(moved, {cid: len(m) for cid, m in communities.items()}, names=names)
+    print(f"[graphify db] updated ArcadeDB '{cfg['database']}' ({stats['updated_nodes']} nodes moved"
+          f"{', community names refreshed' if names is not None else ''}).")
     if not stats["reconciled"]:
         raise RuntimeError("ArcadeDB community update did not reconcile: per-community node "
                            f"counts differ from graph.json.\n{reload_hint}")

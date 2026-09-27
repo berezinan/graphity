@@ -1003,6 +1003,49 @@ def _id_key(node_id: str) -> str:
     return blake2b(str(node_id).encode("utf-8"), digest_size=16).hexdigest()
 
 
+# Fields both the full load and the incremental sync write - exactly what the
+# ArcadeDB readers select. One definition on purpose: two copies of these lists
+# once lacked the edge's file in both places at once, and every `explain` on this
+# backend lost its call sites. The community name lives in `Community`, one row
+# per community; the edge's file follows `_edge_doc`.
+_NODE_FIELDS = ("id", "label", "source_file", "source_location", "file_type", "community",
+                "definition_file", "definition_location")
+_EDGE_FIELDS = ("relation", "confidence", "weight", "context", "source_location")
+
+
+def _scalars(data: dict, fields: tuple) -> dict:
+    return {k: data[k] for k in fields if k in data and isinstance(data[k], (str, int, float, bool))}
+
+
+def _node_doc(nid: str, data: dict, degree: int) -> dict:
+    doc = _scalars(data, _NODE_FIELDS)
+    doc["id"] = nid
+    doc["norm_label"] = (data.get("norm_label") or _strip_diacritics(str(data.get("label", "")))).lower()
+    doc["degree"] = int(degree)
+    doc["id_key"] = _id_key(nid)
+    return doc
+
+
+def _edge_doc(data: dict, source_file, source_written: bool) -> dict:
+    """Edge record; its file is stored only where the reader cannot recover it.
+
+    An edge is created FROM its source, so a reader restores a missing file from
+    the out-vertex (`coalesce` in `explain`). That is safe only when the vertex
+    was written with that very file in the same operation: a shared node can sit
+    in the database under a file that has since drifted in the graph, so an edge
+    from a vertex this operation does not write keeps its own file. An edge with
+    no file stores "" so that the restore cannot invent one. On ERP2 99.96 % of
+    4.9M edges repeat their source's file - storing it on each was +56 % of the
+    database.
+    """
+    doc = _scalars(data, _EDGE_FIELDS)
+    sf = data.get("source_file")
+    sf = sf if isinstance(sf, str) else ""
+    if not (source_written and sf and sf == source_file):
+        doc["source_file"] = sf
+    return doc
+
+
 class ArcadeDBBackend(GraphBackend):
     """Reads from a per-project ArcadeDB database over HTTP.
 
@@ -1266,22 +1309,19 @@ class ArcadeDBBackend(GraphBackend):
             _ddl(cmd)
         self.claim_project()
 
-        keep_n = ("id", "label", "source_file", "source_location", "file_type", "community")
         for i in range(0, len(nodes), batch):
             stmts = []
             for n in nodes[i:i + batch]:
-                doc = {k: n[k] for k in keep_n if k in n and isinstance(n[k], (str, int, float, bool))}
-                doc["norm_label"] = (n.get("norm_label") or _strip_diacritics(str(n.get("label", "")))).lower()
-                doc["degree"] = int(degree.get(n["id"], 0))
-                doc["id_key"] = _id_key(n["id"])
+                doc = _node_doc(n["id"], n, degree.get(n["id"], 0))
                 stmts.append("INSERT INTO Node CONTENT " + json.dumps(doc, ensure_ascii=False))
             self._run(";".join(stmts), language="sqlscript")
 
-        keep_e = ("relation", "confidence", "weight", "context")
+        # A full load writes every vertex, so each edge's source is written too.
+        node_file = {n["id"]: n.get("source_file") for n in nodes}
         for i in range(0, len(edges), batch):
             stmts = []
             for e in edges[i:i + batch]:
-                doc = {k: e[k] for k in keep_e if k in e and isinstance(e[k], (str, int, float, bool))}
+                doc = _edge_doc(e, node_file.get(e["source"]), True)
                 stmts.append(
                     f"CREATE EDGE Rel FROM (SELECT FROM Node WHERE id_key={_sql_str(_id_key(e['source']))}) "
                     f"TO (SELECT FROM Node WHERE id_key={_sql_str(_id_key(e['target']))}) CONTENT {json.dumps(doc, ensure_ascii=False)}"
@@ -1289,21 +1329,52 @@ class ArcadeDBBackend(GraphBackend):
             self._run(";".join(stmts), language="sqlscript")
 
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
+        self._replace_community_names(
+            {n["community"]: n["community_name"] for n in nodes
+             if isinstance(n.get("community"), int) and isinstance(n.get("community_name"), str)},
+            batch=batch)
         stats = self._reconcile(len(nodes), len(edges),
                                 node_ids=[n["id"] for n in nodes],
                                 edges=[(e["source"], e["target"]) for e in edges])
         self.record_reconciliation(stats)
         return stats
 
+    def _replace_community_names(self, names: "dict[int, str]", *, batch=2000) -> None:
+        """Replace the stored community names with ``names`` (community -> name).
+
+        One row per community rather than a copy on each node: ERP2 carries
+        46 836 distinct names over 2M nodes, 166 MB repeated vs 3.9 MB once. The
+        type is created here, not only at load, so a database loaded before it
+        existed gains it on its first re-clustering.
+        """
+        import json
+
+        for cmd in ("CREATE DOCUMENT TYPE Community", "CREATE PROPERTY Community.cid INTEGER",
+                    "CREATE INDEX ON Community (cid) UNIQUE"):
+            try:
+                self._run(cmd)
+            except RuntimeError as exc:
+                if "already exist" not in str(exc).lower():
+                    raise
+        self._run("DELETE FROM Community")
+        rows = sorted(names.items())
+        for i in range(0, len(rows), batch):
+            self._run(";".join(
+                "INSERT INTO Community CONTENT " + json.dumps({"cid": int(cid), "name": name}, ensure_ascii=False)
+                for cid, name in rows[i:i + batch]), language="sqlscript")
+
     def update_communities(self, node_community: "dict[str, int | None]",
-                           expected_sizes: "dict[int, int]", *, batch=2000) -> dict:
+                           expected_sizes: "dict[int, int]", *,
+                           names: "dict[int, str] | None" = None, batch=2000) -> dict:
         """Move nodes to their new community in place, instead of a full reload.
 
         ``node_community`` holds only the nodes whose community changed;
         ``expected_sizes`` is the whole partition (community -> member count) the
-        database must show afterwards. A re-clustering touches nothing else this
-        backend stores - god_nodes are degree-ranked, so they stand. Nodes are
-        addressed by ``id_key``, never by ``id`` (see `_id_key`).
+        database must show afterwards. ``names``, when given, is the complete
+        community -> name map graph.json now records; it replaces the stored one
+        even if no node moved (a relabel alone). A re-clustering touches nothing
+        else this backend stores - god_nodes are degree-ranked, so they stand.
+        Nodes are addressed by ``id_key``, never by ``id`` (see `_id_key`).
         """
         by_cid: "dict[int | None, list[str]]" = {}
         for nid, cid in node_community.items():
@@ -1326,6 +1397,8 @@ class ArcadeDBBackend(GraphBackend):
                 if pending >= batch:
                     _flush()
         _flush()
+        if names is not None:
+            self._replace_community_names(names, batch=batch)
 
         got = {int(r["community"]): int(r["c"]) for r in self._run(
             "SELECT community, count(*) AS c FROM Node WHERE community IS NOT NULL "
@@ -1637,21 +1710,14 @@ class ArcadeDBBackend(GraphBackend):
         for i in range(0, len(changed_ids), batch):
             self._run("DELETE VERTEX FROM Node WHERE id_key IN :ids",
                       params={"ids": [_id_key(n) for n in changed_ids[i:i + batch]]})
-        keep_n = ("id", "label", "source_file", "source_location", "file_type", "community")
         for i in range(0, len(changed_ids), batch):
             stmts = []
             for nid in changed_ids[i:i + batch]:
-                data = G.nodes[nid]
-                doc = {k: data[k] for k in keep_n if k in data and isinstance(data[k], (str, int, float, bool))}
-                doc["id"] = nid
-                doc["norm_label"] = (data.get("norm_label") or _strip_diacritics(str(data.get("label", "")))).lower()
-                doc["degree"] = int(degree.get(nid, 0))
-                doc["id_key"] = _id_key(nid)
+                doc = _node_doc(nid, G.nodes[nid], degree.get(nid, 0))
                 stmts.append("INSERT INTO Node CONTENT " + json.dumps(doc, ensure_ascii=False))
             if stmts:
                 self._run(";".join(stmts), language="sqlscript")
 
-        keep_e = ("relation", "confidence", "weight", "context")
         new_edges, neighbors = [], set()
         for u, v, d in G.edges(data=True):
             if u in changed_set or v in changed_set:
@@ -1661,7 +1727,8 @@ class ArcadeDBBackend(GraphBackend):
         for i in range(0, len(new_edges), batch):
             stmts = []
             for src, tgt, d in new_edges[i:i + batch]:
-                doc = {k: d[k] for k in keep_e if k in d and isinstance(d[k], (str, int, float, bool))}
+                # Only a changed source is rewritten here; see _edge_doc.
+                doc = _edge_doc(d, G.nodes[src].get("source_file"), src in changed_set)
                 stmts.append(
                     f"CREATE EDGE Rel FROM (SELECT FROM Node WHERE id_key={_sql_str(_id_key(src))}) "
                     f"TO (SELECT FROM Node WHERE id_key={_sql_str(_id_key(tgt))}) CONTENT {json.dumps(doc, ensure_ascii=False)}"
@@ -1989,15 +2056,20 @@ class ArcadeDBBackend(GraphBackend):
         return Neighbors(label=H.nodes[nid].get("label", nid), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:
-        rows = self._run("SELECT id, label, source_file, community_name FROM Node WHERE community = :c",
+        rows = self._run("SELECT id, label, source_file FROM Node WHERE community = :c",
                         params={"c": int(community_id)})
         if not rows:
             return None
         rows.sort(key=_by_id)
+        try:
+            named = self._run("SELECT name FROM Community WHERE cid = :c LIMIT 1",
+                              params={"c": int(community_id)})
+        except RuntimeError:
+            named = []  # loaded before `Community` existed: no names until a reload
         return CommunityRecord(cid=int(community_id),
                                members=[NodeRecord(label=r.get("label", r["id"]),
                                                    source_file=str(r.get("source_file", "") or "")) for r in rows],
-                               name=rows[0].get("community_name"))
+                               name=named[0].get("name") if named else None)
 
     def god_nodes(self, top_n=10) -> list[GodNode]:
         rows = self._run("SELECT value FROM Meta WHERE key = 'god_nodes' LIMIT 1")
@@ -2099,15 +2171,17 @@ class ArcadeDBBackend(GraphBackend):
             definition_file=str(r.get("definition_file", "") or ""),
             definition_location=str(r.get("definition_location", "") or ""),
         )
+        # The edge's file is stored only where the out-vertex `a` does not
+        # already name it (_edge_doc); "" means "no file" and is kept as is.
         out = self._run(
             "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
             "RETURN b.label AS lbl, b.degree AS deg, r.relation AS relation, r.confidence AS confidence, "
-            "r.source_file AS sfile, r.source_location AS sloc",
+            "coalesce(r.source_file, a.source_file) AS sfile, r.source_location AS sloc",
             kind="query", language="cypher", params={"id": _id_key(nid)})
         inc = self._run(
             "MATCH (a:Node)-[r:Rel]->(b:Node {id_key:$id}) "
             "RETURN a.label AS lbl, a.degree AS deg, r.relation AS relation, r.confidence AS confidence, "
-            "r.source_file AS sfile, r.source_location AS sloc",
+            "coalesce(r.source_file, a.source_file) AS sfile, r.source_location AS sloc",
             kind="query", language="cypher", params={"id": _id_key(nid)})
         def _conn(x, outgoing):
             return Connection(outgoing, x.get("lbl", ""), str(x.get("relation", "")),

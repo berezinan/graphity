@@ -72,6 +72,8 @@ _HOOK_SOURCE_EXTS = (
     '.py', '.js', '.cjs', '.ts', '.tsx', '.jsx', '.astro', '.vue', '.svelte', '.go',
     '.rs', '.java', '.rb', '.c', '.h', '.cpp', '.hpp', '.cc', '.cs', '.kt',
     '.swift', '.php', '.scala', '.lua', '.sh', '.md', '.rst', '.txt', '.mdx',
+    # Fork delta: the 1C files detect/extract know (BSL/OneScript, 1C:EDT).
+    '.bsl', '.os', '.osl', '.mdo', '.form', '.rights', '.dcs', '.oform', '.cmi',
 )
 _GEMINI_NUDGE_TEXT = (
     'graphify: knowledge graph at graphify-out/. For focused questions, run '
@@ -2355,7 +2357,7 @@ def dispatch_command(cmd: str) -> None:
             )
             sys.exit(1)
         else:
-            _sync_community_changes(str(out / "graph.json"), _raw, _changed, communities)
+            _sync_community_changes(str(out / "graph.json"), _raw, _changed, communities, labels)
         tokens = label_token_usage
         from graphify.report import load_learning_for_report as _llfr
         report = generate(G, communities, cohesion, labels, gods, surprises,
