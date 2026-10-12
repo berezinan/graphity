@@ -10,9 +10,10 @@ Use when you've added or modified files since the last run. Only re-extracts cha
 $(cat graphify-out/.graphify_python) -c "
 import sys, json
 from graphify.detect import detect_incremental, save_manifest
+from graphify.watch import _read_build_external_roots
 from pathlib import Path
 
-result = detect_incremental(Path('INPUT_PATH'))
+result = detect_incremental(Path('INPUT_PATH'), external_roots=_read_build_external_roots(Path('graphify-out')) or None)
 new_total = result.get('new_total', 0)
 print(json.dumps(result, indent=2, ensure_ascii=False))
 Path('graphify-out/.graphify_incremental.json').write_text(json.dumps(result, ensure_ascii=False), encoding=\"utf-8\")

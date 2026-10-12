@@ -83,6 +83,47 @@ _GEMINI_NUDGE_TEXT = (
 )
 
 
+def _split_external_root_flags(args: list[str]) -> "tuple[list[str], list[str] | None]":
+    """Pull ``--external-root``/``--no-external-roots`` out of ``args``.
+
+    Returns the remaining args and the requested roots: None when neither flag
+    was given (keep the recorded list), [] for ``--no-external-roots``.
+    """
+    rest: list[str] = []
+    roots: list[str] | None = None
+    clear = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--external-root" and i + 1 < len(args):
+            roots = (roots or []) + [args[i + 1]]
+            i += 2
+        elif a.startswith("--external-root="):
+            roots = (roots or []) + [a.split("=", 1)[1]]
+            i += 1
+        elif a == "--no-external-roots":
+            clear = True
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    if clear and roots:
+        print(
+            "error: --external-root and --no-external-roots are mutually exclusive",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return rest, ([] if clear else roots)
+
+
+def _external_roots_for_storage(roots: list[str], scan_root: Path) -> list[str]:
+    """Normalize ``--external-root`` values (warning on dropped ones) for the
+    build config: absolute, forward slashes."""
+    from graphify.detect import _normalize_external_roots
+
+    return [p.as_posix() for p in _normalize_external_roots(roots, scan_root)]
+
+
 def _default_graph_path() -> str:
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
 
@@ -323,8 +364,14 @@ def _stale_graph_sources(
                 excluded_exact.add(e)
         for entry in detection.get("skipped_sensitive", []):
             excluded_exact.add(nfc(str(entry).split(" [", 1)[0]))
+    # A link the walk gate cut (outside the scan root and the allowed external
+    # roots, a cycle, a duplicate) is recorded once and covers its subtree.
+    from graphify.detect import link_cut_predicate
+    _link_cut = link_cut_predicate(detection or {})
 
     def _provably_excluded(c: Path) -> bool:
+        if _link_cut(c):
+            return True
         spellings = [nfc(str(c))]
         try:
             spellings.append(nfc(str(c.resolve())))
@@ -1988,7 +2035,8 @@ def dispatch_command(cmd: str) -> None:
     elif cmd == "watch":
         gitignore_mode: bool | None = None
         watch_args: list[str] = []
-        for a in sys.argv[2:]:
+        _watch_argv, external_roots_arg = _split_external_root_flags(sys.argv[2:])
+        for a in _watch_argv:
             if a == "--gitignore":
                 gitignore_mode = True
             elif a == "--no-gitignore":
@@ -2001,10 +2049,14 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
         # Same contract as update: the flag records the graph's mode, which every
         # rebuild of this watch loop then reads back from the build config.
-        if gitignore_mode is not None:
+        if gitignore_mode is not None or external_roots_arg is not None:
             from graphify.watch import _write_build_config as _write_build_cfg
             _write_build_cfg(
-                watch_path / _GRAPHIFY_OUT, excludes=None, gitignore=gitignore_mode
+                watch_path / _GRAPHIFY_OUT, excludes=None, gitignore=gitignore_mode,
+                external_roots=(
+                    _external_roots_for_storage(external_roots_arg, watch_path)
+                    if external_roots_arg is not None else None
+                ),
             )
         # A watch loop whose database is unreachable cannot complete a single
         # rebuild, so refuse at startup instead of idling until the first edit.
@@ -2445,7 +2497,7 @@ def dispatch_command(cmd: str) -> None:
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
         gitignore_mode: bool | None = None
-        args = sys.argv[2:]
+        args, external_roots_arg = _split_external_root_flags(sys.argv[2:])
         watch_arg: str | None = None
         for a in args:
             if a == "--force":
@@ -2487,10 +2539,14 @@ def dispatch_command(cmd: str) -> None:
         # A mode given here is the graph's new mode: _rebuild_code reads it back
         # from the build config, and so does every later hook rebuild. Recorded
         # before the service check, as in extract.
-        if gitignore_mode is not None:
+        if gitignore_mode is not None or external_roots_arg is not None:
             from graphify.watch import _write_build_config as _write_build_cfg
             _write_build_cfg(
-                watch_path / _GRAPHIFY_OUT, excludes=None, gitignore=gitignore_mode
+                watch_path / _GRAPHIFY_OUT, excludes=None, gitignore=gitignore_mode,
+                external_roots=(
+                    _external_roots_for_storage(external_roots_arg, watch_path)
+                    if external_roots_arg is not None else None
+                ),
             )
         # As in extract: the sync closing this rebuild is not optional, so an
         # unreachable database costs milliseconds rather than a whole rebuild.
@@ -3242,7 +3298,8 @@ def dispatch_command(cmd: str) -> None:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
-                "[--gitignore|--no-gitignore] [--code-only] [--no-dedup] "
+                "[--gitignore|--no-gitignore] [--external-root DIR ...|--no-external-roots] "
+                "[--code-only] [--no-dedup] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] [--timing]",
                 file=sys.stderr,
@@ -3317,7 +3374,9 @@ def dispatch_command(cmd: str) -> None:
                 sys.exit(2)
             return v
 
-        args = sys.argv[3:] if has_path else sys.argv[2:]
+        args, cli_external_roots = _split_external_root_flags(
+            sys.argv[3:] if has_path else sys.argv[2:]
+        )
         i = 0
         while i < len(args):
             a = args[i]
@@ -3447,6 +3506,7 @@ def dispatch_command(cmd: str) -> None:
             _write_build_config as _write_build_cfg,
             _read_build_excludes as _read_build_ex,
             _read_build_gitignore as _read_build_gi,
+            _read_build_external_roots as _read_build_er,
         )
         # #1971 persistence: an explicit --gitignore/--no-gitignore persists that
         # mode; a later flag-less `graphify extract` must NOT clobber it, which
@@ -3460,6 +3520,15 @@ def dispatch_command(cmd: str) -> None:
         )
         # An explicit list replaces the persisted one; omission reuses it.
         _effective_excludes = cli_excludes or _read_build_ex(graphify_out)
+        # Same for --external-root: an explicit list (or --no-external-roots)
+        # replaces the persisted one, omission reuses it.
+        _cli_external = (
+            _external_roots_for_storage(cli_external_roots, target)
+            if cli_external_roots is not None else None
+        )
+        _effective_external_roots = (
+            _cli_external if _cli_external is not None else _read_build_er(graphify_out)
+        )
         # Written BEFORE the service check below: a run that dies on an
         # unreachable database used to leave no trace of the mode the user asked
         # for, so the next rebuild silently fell back to the default.
@@ -3467,6 +3536,7 @@ def dispatch_command(cmd: str) -> None:
             graphify_out,
             excludes=cli_excludes or None,
             gitignore=gitignore_mode,
+            external_roots=_cli_external,
         )
         # Before anything expensive: the sync at the end of this pipeline is not
         # optional, so an unreachable database must cost milliseconds, not an
@@ -3538,6 +3608,7 @@ def dispatch_command(cmd: str) -> None:
                 google_workspace=google_workspace or None,
                 extra_excludes=_effective_excludes or None,
                 gitignore=_effective_gitignore,
+                external_roots=_effective_external_roots or None,
             )
             files_by_type = detection.get("files", {})
             new_by_type = detection.get("new_files", {})
@@ -3612,6 +3683,7 @@ def dispatch_command(cmd: str) -> None:
                 extra_excludes=_effective_excludes or None,
                 cache_root=out_root,
                 gitignore=_effective_gitignore,
+                external_roots=_effective_external_roots or None,
             )
             # Full scan: compare against the previous build before the semantic
             # pass turns a widened corpus into API spend.
@@ -3980,6 +4052,21 @@ def dispatch_command(cmd: str) -> None:
             sem_result["hyperedges"].extend(cached_hyperedges)
             if sem_cache_hits:
                 print(f"[graphify extract] semantic cache: {sem_cache_hits} hit / {sem_cache_misses} miss")
+            # Cache sharing with an external root's own project only works with
+            # mirrored mount paths and the same prompt/mode; the hit rate is the
+            # one place a silent mismatch shows.
+            if _effective_external_roots:
+                from graphify.detect import _key_under, _real_key
+                _uncached_set = set(uncached_paths)
+                for _ext in _effective_external_roots:
+                    _ext_key = _real_key(_ext)
+                    _ext_files = [s for s in sem_paths_str if _key_under(_real_key(s), _ext_key)]
+                    if _ext_files:
+                        _ext_miss = sum(1 for s in _ext_files if s in _uncached_set)
+                        print(
+                            f"[graphify extract] semantic cache via external root {_ext}: "
+                            f"{len(_ext_files) - _ext_miss} hit / {_ext_miss} miss"
+                        )
 
             if uncached_paths:
                 print(f"[graphify extract] semantic extraction on {len(uncached_paths)} files via {backend}...")

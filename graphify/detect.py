@@ -758,8 +758,13 @@ def convert_office_file(path: Path, out_dir: Path, root: "Path | None" = None) -
     except (ValueError, OSError):
         # Not under the scan root (custom GRAPHIFY_OUT layouts, --include
         # sources, direct API callers): keep the previous absolute form rather
-        # than guessing, so behavior is unchanged for those cases.
-        key = str(path.resolve())
+        # than guessing, so behavior is unchanged for those cases. A file reached
+        # through a directory link into an external corpus root keeps its walked
+        # path, so the sidecar name matches the source project's.
+        from graphify.cache import _walked_rel_through_dir_link
+
+        walked = _walked_rel_through_dir_link(path, Path(root).resolve())
+        key = walked.as_posix() if walked is not None else str(path.resolve())
     normalized_path = unicodedata.normalize("NFC", key)
     name_hash = hashlib.sha256(normalized_path.encode()).hexdigest()[:8]
     out_path = out_dir / f"{path.stem}_{name_hash}.md"
@@ -1755,7 +1760,219 @@ def _resolves_under_root(path: Path, root: Path) -> bool:
     return True
 
 
-def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, cache_root: Path | None = None, gitignore: bool = False) -> dict:
+# Fork delta (allow-external-corpus-roots): a Windows junction is a directory
+# link that is_symlink()/os.path.islink() do not report, and os.walk enters it
+# whatever `followlinks` says. Path.is_junction() only exists from 3.12, so the
+# reparse tag is read directly.
+_IO_REPARSE_TAG_MOUNT_POINT = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+
+def _is_junction(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
+
+def _is_dir_link(path: Path) -> bool:
+    """True for a symlink or a Windows junction (one lstat: called per dir)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or (
+        getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+    )
+
+
+def _real_key(path: "Path | str") -> str:
+    """Comparable resolved form of ``path`` (case-folded where the OS is)."""
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(os.path.abspath(path))
+    return os.path.normcase(str(resolved))
+
+
+def _key_under(key: str, base: str) -> bool:
+    """True when real-path key ``key`` equals ``base`` or lies beneath it."""
+    return key == base or key.startswith(base if base.endswith(os.sep) else base + os.sep)
+
+
+_LINK_CUT_MARKERS = ("[symlink target outside scan root]", "[link cycle]", "[link duplicate]")
+
+
+def link_cut_predicate(detected: dict) -> "Callable[[Path], bool]":
+    """True for a path at or under a link the walk gate cut in ``detected``.
+
+    Such a path is out of the corpus by a live decision (containment, cycle,
+    duplicate), so a rebuild may evict its still-present files the way it
+    evicts files matching an ignore rule.
+    """
+    cut = [
+        os.path.normcase(entry[: -len(marker)].rstrip())
+        for entry in detected.get("skipped_sensitive", []) or []
+        for marker in _LINK_CUT_MARKERS
+        if entry.endswith(marker)
+    ]
+
+    def _is_cut(path: Path) -> bool:
+        key = os.path.normcase(os.path.abspath(path))
+        return any(_key_under(key, c) for c in cut)
+
+    return _is_cut
+
+
+def _normalize_external_roots(roots, scan_root: Path, *, warn: bool = True) -> list[Path]:
+    """Resolve ``--external-root`` values against the scan root.
+
+    A root inside the scan root adds nothing and is dropped; a missing root is
+    kept (its link may appear later). Both are reported on stderr.
+    """
+    import sys as _sys
+
+    scan_key = _real_key(scan_root)
+    out: list[Path] = []
+    seen: set[str] = set()
+    for raw in roots or ():
+        resolved = Path(os.path.abspath(Path(raw).expanduser())).resolve()
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        if _key_under(key, scan_key):
+            if warn:
+                print(
+                    f"[graphify] WARNING: external root {raw} lies inside the scan root; ignored.",
+                    file=_sys.stderr,
+                )
+            continue
+        if warn and not resolved.is_dir():
+            print(
+                f"[graphify] WARNING: external root {raw} does not exist (yet).",
+                file=_sys.stderr,
+            )
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+class _WalkGate:
+    """Decide which directory links a corpus walk enters and which files it admits.
+
+    * A link whose target is the current directory or one of its ancestors is
+      cut as ``[link cycle]`` — always, for symlinks and junctions alike.
+    * A link into the scan root keeps the historical behavior: a symlink is
+      entered only with ``follow_symlinks``, a junction always (aliases are
+      indexed as separate copies on purpose).
+    * A link into an allowed external root is entered regardless of
+      ``follow_symlinks``; a second path to an already walked external
+      directory is cut as ``[link duplicate]`` (first in sorted order wins).
+    * Any other link is cut as ``[symlink target outside scan root]``.
+
+    Directory identity is the resolved path, computed lexically below each
+    link, so the walk costs one ``resolve()`` per link rather than per dir.
+    """
+
+    def __init__(self, root: Path, *, follow_symlinks: bool, external_roots=()) -> None:
+        self.root = Path(root).resolve()
+        self._root_key = os.path.normcase(str(self.root))
+        self._external = [(os.path.normcase(str(e)), e) for e in external_roots]
+        self.follow_symlinks = follow_symlinks
+        self.skipped: list[str] = []
+        self.mirror_mismatches: list[str] = []
+        self.admitted: dict[str, int] = {e.as_posix(): 0 for e in external_roots}
+        self._real: dict[str, str] = {}
+        self._external_targets: list[str] = []
+
+    @property
+    def followlinks(self) -> bool:
+        return self.follow_symlinks or bool(self._external)
+
+    def _external_root_for(self, key: str) -> "Path | None":
+        for ext_key, ext in self._external:
+            if _key_under(key, ext_key):
+                return ext
+        return None
+
+    def prune(self, dirpath: str, dirnames: list[str]) -> None:
+        dirnames.sort()
+        dp_real = self._real.get(dirpath)
+        if dp_real is None:
+            dp_real = self._real[dirpath] = _real_key(dirpath)
+        kept: list[str] = []
+        for d in dirnames:
+            child = os.path.join(dirpath, d)
+            if not _is_dir_link(Path(child)):
+                real = os.path.join(dp_real, os.path.normcase(d))
+                if real in self._external_targets:
+                    self.skipped.append(child + " [link duplicate]")
+                    continue
+                self._real[child] = real
+                kept.append(d)
+                continue
+            try:
+                target = Path(child).resolve()
+            except (OSError, RuntimeError):
+                self.skipped.append(child + " [symlink target outside scan root]")
+                continue
+            real = os.path.normcase(str(target))
+            if _key_under(dp_real, real):
+                self.skipped.append(child + " [link cycle]")
+                continue
+            if _key_under(real, self._root_key):
+                if self.follow_symlinks or _is_junction(Path(child)):
+                    self._real[child] = real
+                    kept.append(d)
+                continue
+            ext = self._external_root_for(real)
+            if ext is None:
+                self.skipped.append(child + " [symlink target outside scan root]")
+                continue
+            if any(_key_under(real, t) for t in self._external_targets):
+                self.skipped.append(child + " [link duplicate]")
+                continue
+            self._external_targets.append(real)
+            self._check_mirror(child, target, ext)
+            self._real[child] = real
+            kept.append(d)
+        dirnames[:] = kept
+
+    def _check_mirror(self, link: str, target: Path, ext: Path) -> None:
+        import sys as _sys
+
+        try:
+            link_rel = Path(os.path.relpath(os.path.abspath(link), self.root)).as_posix()
+            target_rel = target.relative_to(ext).as_posix()
+        except ValueError:
+            return
+        if os.path.normcase(link_rel) != os.path.normcase(target_rel):
+            self.mirror_mismatches.append(f"{link_rel} -> {ext.as_posix()}/{target_rel}")
+            print(
+                f"[graphify] WARNING: link {link_rel} mounts {target_rel} of external root "
+                f"{ext.as_posix()} under a different path; its files are indexed, but "
+                f"cache entries shared with that project will not match.",
+                file=_sys.stderr,
+            )
+
+    def admit(self, path: Path) -> "str | bool":
+        """False to reject; True for an in-root file; the external root (posix)
+        a file was admitted through otherwise. Only directory links reach an
+        external root: a file that is itself a link stays out."""
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except (OSError, RuntimeError):
+            return False
+        if _key_under(key, self._root_key):
+            return True
+        ext = self._external_root_for(key)
+        if ext is None or _is_dir_link(path):
+            return False
+        return ext.as_posix()
+
+
+def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, cache_root: Path | None = None, gitignore: bool = False, external_roots: "list[Path | str] | None" = None) -> dict:
     # gitignore defaults to False (fork delta): a parent `.gitignore` line like
     # `/graphify/` means "separate repo, don't commit it here", not "junk" —
     # honoring it silently dropped the code of every nested repository from the
@@ -1882,18 +2099,17 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             file=_sys.stderr,
         )
 
+    gate = _WalkGate(
+        root,
+        follow_symlinks=follow_symlinks,
+        external_roots=_normalize_external_roots(external_roots, root),
+    )
     for scan_root in scan_paths:
         in_memory_tree = memory_dir.exists() and str(scan_root).startswith(str(memory_dir))
         for dirpath, dirnames, filenames in os.walk(
-            scan_root, followlinks=follow_symlinks, onerror=_on_walk_error
+            scan_root, followlinks=gate.followlinks, onerror=_on_walk_error
         ):
             dp = Path(dirpath)
-            if follow_symlinks and os.path.islink(dirpath):
-                real = os.path.realpath(dirpath)
-                parent_real = os.path.realpath(os.path.dirname(dirpath))
-                if parent_real == real or parent_real.startswith(real + os.sep):
-                    dirnames.clear()
-                    continue
             if not in_memory_tree:
                 # dp == root was already loaded by _load_graphifyignore (root is
                 # the last entry in its ancestor chain); every other directory
@@ -1944,15 +2160,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                         continue
                     kept_dirs.append(d)
                 dirnames[:] = kept_dirs
-                if follow_symlinks:
-                    safe_dirs: list[str] = []
-                    for d in dirnames:
-                        child = dp / d
-                        if child.is_symlink() and not _resolves_under_root(child, root):
-                            skipped_sensitive.append(str(child) + " [symlink target outside scan root]")
-                            continue
-                        safe_dirs.append(d)
-                    dirnames[:] = safe_dirs
+            gate.prune(dirpath, dirnames)
             for fname in filenames:
                 if fname in _SKIP_FILES:
                     continue
@@ -1961,6 +2169,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                     seen.add(p)
                     all_files.append(p)
 
+    skipped_sensitive.extend(gate.skipped)
     all_files.sort(key=lambda p: str(p))
 
     out_base = Path(cache_root).resolve() if cache_root is not None else root
@@ -1976,7 +2185,8 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         if not in_memory and _ignored_for_scan(p):
             ignored.append(str(p))
             continue
-        if not _resolves_under_root(p, root):
+        admitted_via = gate.admit(p)
+        if admitted_via is False:
             skipped_sensitive.append(str(p) + " [symlink target outside scan root]")
             continue
         if not _is_regular_file(p):
@@ -2002,6 +2212,8 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             # counted, not listed — so a user couldn't tell they were seen (#1692).
             unclassified.append(str(p))
             continue
+        if isinstance(admitted_via, str):
+            gate.admitted[admitted_via] += 1
         if ftype:
             if p.suffix.lower() in GOOGLE_WORKSPACE_EXTENSIONS:
                 if not google_workspace:
@@ -2084,6 +2296,8 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         "pruned_noise_dirs": sorted(pruned_noise),
         "graphifyignore_patterns": len(ignore_patterns) - len(global_ignore),
         "scan_root": str(root.resolve()),
+        "external_roots": dict(gate.admitted),
+        "external_mirror_mismatches": list(gate.mirror_mismatches),
     }
 
 
@@ -2494,6 +2708,7 @@ def detect_incremental(
     kind: str = "semantic",
     extra_excludes: list[str] | None = None,
     gitignore: bool = False,
+    external_roots: "list[Path | str] | None" = None,
 ) -> dict:
     """Like detect(), but returns only new or modified files since the last run.
 
@@ -2523,6 +2738,7 @@ def detect_incremental(
         google_workspace=google_workspace,
         extra_excludes=extra_excludes,
         gitignore=gitignore,
+        external_roots=external_roots,
     )
     # Pass ``root`` so a manifest written with relative keys (post-#777) is
     # re-anchored to the absolute form the rest of this function compares

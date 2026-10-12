@@ -7800,11 +7800,16 @@ def extract(
     }
 
 
-def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:
+def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None, external_roots: "list[Path | str] | None" = None) -> list[Path]:
     containment_root = root if root is not None else target
-    from graphify.detect import _resolves_under_root
+    from graphify.detect import _WalkGate, _normalize_external_roots
+    gate = _WalkGate(
+        containment_root,
+        follow_symlinks=follow_symlinks,
+        external_roots=_normalize_external_roots(external_roots, containment_root, warn=False),
+    )
     if target.is_file():
-        return [target] if _resolves_under_root(target, containment_root) else []
+        return [target] if gate.admit(target) is not False else []
     _EXTENSIONS = set(_DISPATCH.keys())
     from graphify.detect import _is_ignored, _is_noise_dir, _load_graphifyignore
     ignore_root = root if root is not None else target
@@ -7826,38 +7831,33 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         # conservatism as detect's scan walk).
         has_negation = any(pat.startswith("!") for _, pat in patterns)
         results: list[Path] = []
-        for dirpath, dirnames, filenames in os.walk(target):
+        for dirpath, dirnames, filenames in os.walk(target, followlinks=gate.followlinks):
             dp = Path(dirpath)
             dirnames[:] = [
                 d for d in dirnames
                 if not _is_noise_dir(d, dp)  # pass parent so "env"/"*_env" is marker-gated (#2058)
                 and (has_negation or not _ignored(dp / d))
             ]
+            gate.prune(dirpath, dirnames)
             for fname in filenames:
                 p = dp / fname
                 suffix = p.suffix
-                if (suffix in _EXTENSIONS or suffix.lower() in _EXTENSIONS) and not _ignored(p) and _resolves_under_root(p, containment_root):
+                if (suffix in _EXTENSIONS or suffix.lower() in _EXTENSIONS) and not _ignored(p) and gate.admit(p) is not False:
                     results.append(p)
         return sorted(results)
-    # Walk with symlink following + cycle detection
+    # Walk with symlink following; the gate cuts cycles and out-of-root links.
     results = []
     for dirpath, dirnames, filenames in os.walk(target, followlinks=True):
-        if os.path.islink(dirpath):
-            real = os.path.realpath(dirpath)
-            parent_real = os.path.realpath(os.path.dirname(dirpath))
-            if parent_real == real or parent_real.startswith(real + os.sep):
-                dirnames.clear()
-                continue
         dp = Path(dirpath)
         dirnames[:] = [
             d for d in dirnames
             if not _is_noise_dir(d, dp)  # pass parent so "env"/"*_env" is marker-gated (#2058)
-            and (not (dp / d).is_symlink() or _resolves_under_root(dp / d, containment_root))
         ]
+        gate.prune(dirpath, dirnames)
         for fname in filenames:
             p = dp / fname
             suffix = p.suffix
-            if (suffix in _EXTENSIONS or suffix.lower() in _EXTENSIONS) and not _ignored(p) and _resolves_under_root(p, containment_root):
+            if (suffix in _EXTENSIONS or suffix.lower() in _EXTENSIONS) and not _ignored(p) and gate.admit(p) is not False:
                 results.append(p)
     return sorted(results)
 

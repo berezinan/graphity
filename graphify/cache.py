@@ -426,6 +426,21 @@ def _normalize_path(path: Path) -> Path:
     return Path(os.path.normcase(s))
 
 
+def _walked_rel_through_dir_link(path: Path, root: Path) -> "Path | None":
+    """``path`` relative to ``root`` as walked, when a directory link on the
+    way leads outside the root: the walked path lies lexically under the root
+    and the file itself is not a link. None otherwise."""
+    from graphify.detect import _is_dir_link
+
+    try:
+        rel = Path(os.path.abspath(path)).relative_to(Path(os.path.abspath(root)))
+    except ValueError:
+        return None
+    if _is_dir_link(Path(path)):
+        return None
+    return rel
+
+
 def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = None) -> str:
     """SHA256 of file contents + path relative to root.
 
@@ -470,7 +485,12 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
         # Preserve the existing fallback for a target outside the corpus. An
         # in-root symlink to such a target is excluded by collect_files(), but
         # direct cache callers still rely on the resolved external identity.
-        salt = resolved.as_posix().lower()
+        # A file reached through a DIRECTORY link into an external corpus root
+        # keeps its walked identity instead, so a consumer mounting a shared
+        # tree at the mirrored path shares the source project's keys (fork
+        # delta, allow-external-corpus-roots).
+        walked_rel = _walked_rel_through_dir_link(p, root)
+        salt = (walked_rel if walked_rel is not None else resolved).as_posix().lower()
     else:
         walked = Path(os.path.abspath(p))
         walked_root = Path(os.path.abspath(root))
@@ -760,6 +780,13 @@ def _portability_anchors(path: "str | Path", root: "str | Path") -> tuple[list[s
         rel = os.path.relpath(path_resolved, root_resolved)
     except (ValueError, OSError):
         rel = ""
+    if not rel or rel == ".." or rel.startswith(".." + os.sep):
+        # Reached through a directory link into an external corpus root: the
+        # walked path is the identity (see file_hash), so anchor on it rather
+        # than on the common ancestor of the two trees.
+        walked_rel = _walked_rel_through_dir_link(Path(path), root_resolved)
+        if walked_rel is not None:
+            rel = str(walked_rel)
 
     # Ordered by preference for the restore form: the spelling the extractor was
     # actually handed first, then its resolved form, then the scan root.

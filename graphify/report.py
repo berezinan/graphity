@@ -163,6 +163,16 @@ def generate(
         excludes = corpus_scope.get("excludes") or []
         excl = f" · --exclude: {', '.join(excludes)}" if excludes else ""
         lines.append(f"- Corpus scope: .gitignore {honored} ({origin}){excl}")
+    # Allowed external roots (--external-root): how many files each admitted
+    # through a directory link, and links mounted at a non-mirrored path, whose
+    # files cannot share cache entries with the root's own project.
+    external = detection_result.get("external_roots") or {}
+    if external:
+        origin = (corpus_scope or {}).get("source") or "default"
+        roots = ", ".join(f"{r} ({n} file(s))" for r, n in sorted(external.items()))
+        lines.append(f"- External roots ({origin}): {roots}")
+        for mismatch in detection_result.get("external_mirror_mismatches") or []:
+            lines.append(f"- External link not mirrored (no shared cache): {mismatch}")
 
     from .analyze import _is_file_node as _ifn
 

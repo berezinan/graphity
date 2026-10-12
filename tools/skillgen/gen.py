@@ -1108,12 +1108,19 @@ def _is_corpus_mode_fix_line(line: str) -> bool:
     function default, while the CLI read the mode recorded in
     ``.graphify_build.json``. The two then disagreed about the file set on the
     same project. Both the import of the reader (added) and the old and new
-    detect calls are sanctioned here.
+    detect calls are sanctioned here. The recorded ``--external-root`` list
+    (allow-external-corpus-roots) is read the same way, by both ``detect`` and
+    ``detect_incremental``, so its imports and calls are sanctioned too.
     """
     stripped = line.strip()
     return (
-        stripped == "from graphify.watch import _read_build_gitignore"
+        stripped in (
+            "from graphify.watch import _read_build_gitignore",
+            "from graphify.watch import _read_build_gitignore, _read_build_external_roots",
+            "from graphify.watch import _read_build_external_roots",
+        )
         or stripped.startswith("result = detect(Path('INPUT_PATH')")
+        or stripped.startswith("result = detect_incremental(Path('INPUT_PATH')")
     )
 
 

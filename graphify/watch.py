@@ -85,12 +85,14 @@ def _write_build_config(
     *,
     excludes: "list[str] | None",
     gitignore: bool | None = None,
+    external_roots: "list[str] | None" = None,
 ) -> None:
     """Persist corpus-shaping options under ``out_dir``.
 
     Best effort and non clobbering: omitted options retain their existing values.
+    ``external_roots`` replaces the stored list as a whole; ``[]`` clears it.
     """
-    if not excludes and gitignore is None:
+    if not excludes and gitignore is None and external_roots is None:
         return
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +107,8 @@ def _write_build_config(
             config["excludes"] = list(excludes)
         if gitignore is not None:
             config["gitignore"] = gitignore
+        if external_roots is not None:
+            config["external_roots"] = list(external_roots)
         path.write_text(json.dumps(config), encoding="utf-8")
     except OSError:
         pass
@@ -119,6 +123,20 @@ def _read_build_excludes(out_dir: Path) -> list[str]:
             ex = cfg.get("excludes") if isinstance(cfg, dict) else None
             if isinstance(ex, list):
                 return [str(x) for x in ex if isinstance(x, str) and x]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _read_build_external_roots(out_dir: Path) -> list[str]:
+    """Return the persisted ``--external-root`` list for this graph, or []."""
+    try:
+        path = out_dir / _BUILD_CONFIG_FILENAME
+        if path.is_file():
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            roots = cfg.get("external_roots") if isinstance(cfg, dict) else None
+            if isinstance(roots, list):
+                return [str(x) for x in roots if isinstance(x, str) and x]
     except (OSError, json.JSONDecodeError):
         pass
     return []
@@ -179,9 +197,12 @@ def warn_on_corpus_growth(manifest_path: Path, detected: dict, root: Path) -> No
     new_by_dir: dict[str, int] = {}
     for path in current_paths:
         try:
-            rel = Path(path).resolve().relative_to(root_resolved).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            continue
+            rel = Path(path).relative_to(root_resolved).as_posix()
+        except ValueError:
+            try:
+                rel = Path(path).resolve().relative_to(root_resolved).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue
         if rel in known:
             continue
         top = rel.split("/", 1)[0] if "/" in rel else "(root)"
@@ -1558,6 +1579,7 @@ def _rebuild_code(
             watch_path, follow_symlinks=follow_symlinks,
             extra_excludes=_persisted_excludes or None,
             gitignore=_gitignore_enabled,
+            external_roots=_read_build_external_roots(out) or None,
         )
         # Read against the manifest of the previous build, before the save
         # sites below overwrite it.
@@ -1586,13 +1608,27 @@ def _rebuild_code(
         # .gitignore-driven exclusion is honored only on a full rebuild — the
         # incremental/hook path keeps preserving a deliberately-graphed
         # .gitignore'd tree (#1795).
-        from graphify.detect import ignored_predicate
-        _ignored_always = ignored_predicate(
+        from graphify.detect import ignored_predicate, link_cut_predicate
+        _ignored_always_rules = ignored_predicate(
             watch_root, extra_excludes=_persisted_excludes or None, gitignore=False,
         )
-        _ignored_full = ignored_predicate(
-            watch_root, extra_excludes=_persisted_excludes or None, gitignore=True,
-        ) if _gitignore_enabled else _ignored_always
+        # A path under a link the walk cut (outside the scan root and the
+        # allowed external roots, a cycle, a duplicate) is excluded by a live
+        # decision too, so dropping an --external-root evicts its files.
+        _link_cut = link_cut_predicate(detected)
+
+        def _ignored_always(p: Path) -> bool:
+            return _ignored_always_rules(p) or _link_cut(p)
+
+        if _gitignore_enabled:
+            _ignored_full_rules = ignored_predicate(
+                watch_root, extra_excludes=_persisted_excludes or None, gitignore=True,
+            )
+
+            def _ignored_full(p: Path) -> bool:
+                return _ignored_full_rules(p) or _link_cut(p)
+        else:
+            _ignored_full = _ignored_always
 
         # Include document files that have AST extractors (e.g. .md, .mdx, .qmd)
         ast_doc_files: list[Path] = []
