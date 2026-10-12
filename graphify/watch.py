@@ -2069,6 +2069,8 @@ def _rebuild_code(
             "total_files": len(code_files),
             "total_words": detected.get("total_words", 0),
             "unclassified": detected.get("unclassified", []),
+            "external_roots": detected.get("external_roots", {}),
+            "external_mirror_mismatches": detected.get("external_mirror_mismatches", []),
         }
 
         # Inherit the existing graph's directed flag (#2342) so `graphify
