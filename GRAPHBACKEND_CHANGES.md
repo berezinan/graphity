@@ -71,7 +71,7 @@ hint when `requests` is missing.
   picks full-load vs incremental.
 - A guarded hook in `watch._rebuild_code` (the `graphify update` fast path) and in
   the full-build path (`__main__` after `to_json`) syncs the DB when
-  `GRAPHIFY_BACKEND=arcadedb`: first/full builds load fresh, watch-hook
+  `GRAPHIFY_GRAPH_STORE=arcadedb`: first/full builds load fresh, watch-hook
   incremental rebuilds (`changed_paths` set) call `sync_graph`. No-op for the
   JSON default; wrapped in try/except so a DB hiccup never fails a rebuild.
 
@@ -106,7 +106,7 @@ cross-project questions.
 The server is assumed already running (lifecycle management is a later phase).
 
 ```bash
-export GRAPHIFY_BACKEND=arcadedb
+export GRAPHIFY_GRAPH_STORE=arcadedb   # the default; GRAPHIFY_BACKEND is upstream's LLM selector
 export GRAPHIFY_ARCADE_URL=http://127.0.0.1:2480   # default
 export GRAPHIFY_ARCADE_DB=proj_myrepo              # database name (default: graphify)
 export GRAPHIFY_ARCADE_USER=root                   # default
@@ -115,8 +115,7 @@ export GRAPHIFY_ARCADE_PASSWORD=...                # required
 graphify query "build graph"        # routed to ArcadeDB
 ```
 
-Unset `GRAPHIFY_BACKEND` (or leave it `json`) for the in-process default — nothing
-changes for existing users. Loading a `graph.json` into a database is done with
+Set `GRAPHIFY_GRAPH_STORE=json` for the in-process model. Loading a `graph.json` into a database is done with
 `ArcadeDBBackend.load_from_graph_json()` (stores `norm_label`, `degree`, and the
 precomputed `god_nodes`). Verified live end-to-end against a 1M-node database.
 

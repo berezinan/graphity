@@ -141,24 +141,31 @@ def test_god_nodes_renders():
 # --- backend selection factory --------------------------------------------- #
 
 def test_resolve_config_default_backend(monkeypatch):
-    """The default backend with no GRAPHIFY_BACKEND set is the graph database.
+    """The default backend with no GRAPHIFY_GRAPH_STORE set is the graph database.
 
     Guarded on purpose: upstream knows nothing about ArcadeDB, so a merge can
     put ``json`` back as the default as silently as it can drop a call site —
     and the whole point of this change is that graphify never quietly answers
     from graph.json.
     """
-    monkeypatch.delenv("GRAPHIFY_BACKEND", raising=False)
+    monkeypatch.delenv("GRAPHIFY_GRAPH_STORE", raising=False)
+    assert resolve_backend_config("g.json")["kind"] == "arcadedb"
+
+
+def test_resolve_config_ignores_graphify_backend(monkeypatch):
+    """GRAPHIFY_BACKEND is upstream's LLM selector (#4361) and never picks the store."""
+    monkeypatch.delenv("GRAPHIFY_GRAPH_STORE", raising=False)
+    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
     assert resolve_backend_config("g.json")["kind"] == "arcadedb"
 
 
 def test_resolve_config_json_is_the_explicit_opt_out(monkeypatch):
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "json")
     assert resolve_backend_config("g.json") == {"kind": "json", "graph_path": "g.json"}
 
 
 def test_resolve_config_arcadedb_from_env(monkeypatch):
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "arcadedb")
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "arcadedb")
     monkeypatch.setenv("GRAPHIFY_ARCADE_URL", "http://db.host:9999")
     monkeypatch.setenv("GRAPHIFY_ARCADE_DB", "proj_x")
     cfg = resolve_backend_config()
@@ -168,7 +175,7 @@ def test_resolve_config_arcadedb_from_env(monkeypatch):
 
 
 def test_open_backend_json_from_preloaded_graph(monkeypatch):
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "json")
     be = open_backend(graph=_make_digraph())
     assert isinstance(be, JsonBackend)
 
@@ -215,7 +222,7 @@ def test_derive_db_name_separates_same_named_directories(tmp_path):
 
 
 def test_resolve_config_arcadedb_derives_db_when_unset(monkeypatch, tmp_path):
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "arcadedb")
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "arcadedb")
     monkeypatch.delenv("GRAPHIFY_ARCADE_DB", raising=False)
     gj = _graph_json(tmp_path, "CoolProj")
     cfg = resolve_backend_config(str(gj))

@@ -355,7 +355,7 @@ def _run(args: list[str], cwd: Path, **env_overrides: str):
     import subprocess
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHIFY_")}
-    env["GRAPHIFY_BACKEND"] = "json"
+    env["GRAPHIFY_GRAPH_STORE"] = "json"
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (str(_REPO), os.environ.get("PYTHONPATH", "")) if p
     )
@@ -450,7 +450,7 @@ def test_external_root_is_recorded_even_when_the_database_probe_fails(projects):
     result = _run(
         ["extract", ".", "--external-root", str(src), "--code-only", "--no-cluster"],
         cwd=consumer,
-        GRAPHIFY_BACKEND="arcadedb",
+        GRAPHIFY_GRAPH_STORE="arcadedb",
         GRAPHIFY_ARCADE_URL="http://127.0.0.1:1",
     )
     assert result.returncode != 0

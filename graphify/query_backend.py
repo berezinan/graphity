@@ -2276,21 +2276,29 @@ def derive_db_name(graph_path: str | None) -> str:
     return f"proj_{safe}_{key}" if safe else f"proj_{key}"
 
 
+# Values of GRAPHIFY_GRAPH_STORE. Also the values the fork used to put in
+# GRAPHIFY_BACKEND before upstream took that variable for the LLM provider
+# (#4361): llm._graphify_backend_setting() filters them out so a stale setting
+# does not select an LLM backend.
+GRAPH_STORE_VALUES = frozenset({"arcadedb", "arcade", "json"})
+
+
 def resolve_backend_config(graph_path: str | None = None) -> dict:
     """Resolve which backend to use from the environment.
 
     ArcadeDB is the default: the graph database is where graphify reads from,
     and the server is a machine service that is expected to be running (see
-    `require_backend` for what happens when it is not). ``GRAPHIFY_BACKEND=json``
+    `require_backend` for what happens when it is not). ``GRAPHIFY_GRAPH_STORE=json``
     is the explicit opt-out onto the in-process model — kept for tests, CI and
     upstream compatibility, not as a fallback the system chooses on its own.
+    ``GRAPHIFY_BACKEND`` is not read: upstream uses it to pick the LLM provider.
 
     The database name defaults to a per-project name derived from ``graph_path``
     unless ``GRAPHIFY_ARCADE_DB`` is set.
     """
     import os
     from graphify import arcade_server
-    kind = os.environ.get("GRAPHIFY_BACKEND", "arcadedb").strip().lower()
+    kind = os.environ.get("GRAPHIFY_GRAPH_STORE", "arcadedb").strip().lower()
     if kind in ("arcadedb", "arcade"):
         # Precedence: environment, then the machine config the service writes,
         # then the built-in default. Environment on top so a test or a debugging

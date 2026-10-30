@@ -18,7 +18,7 @@ PYTHON = sys.executable
 
 def _run(args: list[str], cwd: Path, **env_overrides: str) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHIFY_")}
-    env["GRAPHIFY_BACKEND"] = "json"
+    env["GRAPHIFY_GRAPH_STORE"] = "json"
     env.update(env_overrides)
     return subprocess.run(
         [PYTHON, "-m", "graphify", *args],
@@ -91,7 +91,7 @@ def test_mode_is_recorded_even_when_the_database_probe_fails(tmp_path):
     result = _run(
         ["extract", ".", "--gitignore", "--code-only", "--no-cluster"],
         cwd=corpus,
-        GRAPHIFY_BACKEND="arcadedb",
+        GRAPHIFY_GRAPH_STORE="arcadedb",
         GRAPHIFY_ARCADE_URL="http://127.0.0.1:1",  # nothing listens here
     )
 

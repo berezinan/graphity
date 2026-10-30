@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 # Test files that are ABOUT the ArcadeDB backend and therefore choose their own
-# GRAPHIFY_BACKEND. Everything else runs against the JSON backend.
+# GRAPHIFY_GRAPH_STORE. Everything else runs against the JSON backend.
 _ARCADE_TEST_FILES = frozenset({
     "test_arcade_backend.py",
     "test_arcade_server.py",
@@ -113,19 +113,23 @@ _ANALYZE_WARNING_FILTERS = (
 def _pin_json_backend(
     request: Any, monkeypatch: pytest.MonkeyPatch, _scrub_graphify_env: None
 ) -> None:
-    """Pin ``GRAPHIFY_BACKEND=json`` for every test not about ArcadeDB.
+    """Pin ``GRAPHIFY_GRAPH_STORE=json`` for every test not about ArcadeDB.
 
     The default backend is ArcadeDB and an unreachable server is a fatal error,
     so without this the whole suite would demand a running service. Setting the
     variable (rather than deleting it) also stops whatever the developer happens
     to have exported from leaking in — the suite is deterministic either way.
+    ``GRAPHIFY_BACKEND`` is dropped for every test: upstream reads it as the LLM
+    provider, and a developer's stale ``GRAPHIFY_BACKEND=arcadedb`` must not
+    steer those tests.
 
     A test that wants the real default still gets it: its own monkeypatch runs
     after this fixture and wins.
     """
+    monkeypatch.delenv("GRAPHIFY_BACKEND", raising=False)
     if request.path.name in _ARCADE_TEST_FILES:
         return
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "json")
 
 
 def pytest_collection_modifyitems(items: list[Any]) -> None:

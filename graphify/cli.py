@@ -1888,7 +1888,7 @@ def dispatch_command(cmd: str) -> None:
                 sys.exit(1)
             cfg = resolve_backend_config(str(gj))
             if cfg.get("kind") != "arcadedb":
-                print("set GRAPHIFY_BACKEND=arcadedb to reload an ArcadeDB database", file=sys.stderr)
+                print("unset GRAPHIFY_GRAPH_STORE (or set it to arcadedb) to reload an ArcadeDB database", file=sys.stderr)
                 sys.exit(2)
             from graphify.query_backend import shortfall_warning
             be = require_backend(config=cfg, require_database=False)

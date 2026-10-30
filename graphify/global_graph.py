@@ -79,7 +79,7 @@ def _file_hash(path: Path) -> str:
 def _sync_global_db() -> None:
     """Reload the global ArcadeDB database from global-graph.json.
 
-    No-op unless ``GRAPHIFY_BACKEND=arcadedb`` (so the default JSON model is
+    No-op under ``GRAPHIFY_GRAPH_STORE=json`` (so the opt-out JSON model is
     untouched). The global graph is a single dedup'd merge that ``global_add``
     rewrites whole, so a full reload matches its semantics; it targets a separate
     database (``GRAPHIFY_ARCADE_GLOBAL_DB``, default ``graphify_global``).

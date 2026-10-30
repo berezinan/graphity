@@ -16,7 +16,7 @@ PYTHON = sys.executable
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPHIFY_")}
-    env["GRAPHIFY_BACKEND"] = "json"
+    env["GRAPHIFY_GRAPH_STORE"] = "json"
     return subprocess.run(
         [PYTHON, "-m", "graphify", *args], cwd=str(cwd),
         capture_output=True, text=True, env=env,

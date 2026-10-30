@@ -150,8 +150,8 @@ def test_missing_database_names_it_and_the_remedy():
 
 
 def test_json_backend_is_never_probed(monkeypatch, tmp_path):
-    """`GRAPHIFY_BACKEND=json` must not touch the service at all."""
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
+    """`GRAPHIFY_GRAPH_STORE=json` must not touch the service at all."""
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "json")
     import networkx as nx
     be = require_backend(graph=nx.DiGraph(), graph_path=str(tmp_path / "graph.json"))
     assert isinstance(be, JsonBackend)

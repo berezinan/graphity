@@ -267,7 +267,7 @@ def test_global_add_syncs_arcadedb(tmp_path, monkeypatch):
     monkeypatch.setattr("graphify.global_graph._GLOBAL_DIR", gdir)
     monkeypatch.setattr("graphify.global_graph._GLOBAL_GRAPH", gpath)
     monkeypatch.setattr("graphify.global_graph._GLOBAL_MANIFEST", gdir / "global-manifest.json")
-    monkeypatch.setenv("GRAPHIFY_BACKEND", "arcadedb")
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "arcadedb")
     monkeypatch.setenv("GRAPHIFY_ARCADE_URL", _URL)
     monkeypatch.setenv("GRAPHIFY_ARCADE_PASSWORD", _PW)
     monkeypatch.setenv("GRAPHIFY_ARCADE_GLOBAL_DB", "graphify_global_test")
