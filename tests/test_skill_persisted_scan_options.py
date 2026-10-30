@@ -60,7 +60,8 @@ def test_skill_scan_honors_persisted_options(tmp_path, monkeypatch, art, source)
 def test_absent_or_malformed_build_options_use_defaults(tmp_path, contents):
     if contents is not None:
         (tmp_path / '.graphify_build.json').write_text(contents, encoding='utf-8')
-    assert _read_build_gitignore(tmp_path) is True
+    # Fork delta: with no recorded mode .gitignore is not honored (gitignore-off-by-default).
+    assert _read_build_gitignore(tmp_path) is False
     assert _read_build_excludes(tmp_path) == []
 
 

@@ -189,14 +189,20 @@ def extract_bsl(path: Path, source: bytes | None = None,
             return
         # Only the quoted form names a file: `#Использовать fs/asserts` is a
         # library name that happens to contain a slash, not a relative path.
+        target_path = None
         if quoted and (raw.startswith(".") or "/" in raw or "\\" in raw):
-            tgt_nid = _make_id(str(Path(os.path.normpath(path.parent / raw))))
+            target_path = os.path.normpath(path.parent / raw)
+            tgt_nid = _make_id(str(target_path))
         else:
             tgt_nid = _make_id(raw)
         if (tgt_nid, line) in seen_imports:
             return
         seen_imports.add((tgt_nid, line))
         add_edge(file_nid, tgt_nid, "imports", line, context="import")
+        if target_path is not None:
+            # extract() re-keys this target relative to the scan root: an id
+            # minted from the absolute path puts the checkout path into graph.json.
+            edges[-1]["_bsl_import_path"] = str(target_path)
 
     # 1. From the parse tree. The grammar models the OneScript module header, so
     # a directive found here is a real directive — not a mention of one inside a

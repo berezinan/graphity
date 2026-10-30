@@ -679,7 +679,7 @@ def test_configured_core_excludes_file_is_honoured(tmp_path):
     (repo / "a.py").write_text("x = 1")
     (repo / "secret.py").write_text("SECRET = 'abc'")
 
-    code = as_posix_list(detect(repo)["files"]["code"])
+    code = as_posix_list(detect(repo, gitignore=True)["files"]["code"])
     assert not any(f.endswith("secret.py") for f in code)
     assert any(f.endswith("a.py") for f in code)
 
@@ -695,7 +695,7 @@ def test_default_global_git_ignore_is_honoured(tmp_path):
     (tmp_path / "secret.py").write_text("SECRET = 'abc'")
     (tmp_path / "a.py").write_text("x = 1")
 
-    files = as_posix_list(f for fs in detect(tmp_path)["files"].values() for f in fs)
+    files = as_posix_list(f for fs in detect(tmp_path, gitignore=True)["files"].values() for f in fs)
     assert not any(f.endswith("secret.py") or f.endswith("config.local.json") for f in files)
     assert any(f.endswith("a.py") for f in files)
 
@@ -710,7 +710,7 @@ def test_xdg_config_home_global_git_ignore_is_honoured(tmp_path, monkeypatch):
     (repo / "secret.py").write_text("SECRET = 'abc'")
     (repo / "a.py").write_text("x = 1")
 
-    code = as_posix_list(detect(repo)["files"]["code"])
+    code = as_posix_list(detect(repo, gitignore=True)["files"]["code"])
     assert not any(f.endswith("secret.py") for f in code)
     assert any(f.endswith("a.py") for f in code)
 
@@ -725,7 +725,7 @@ def test_global_git_ignore_ranks_lowest_and_respects_no_gitignore(tmp_path):
     (tmp_path / "keep.py").write_text("x = 1")
     (tmp_path / "drop.py").write_text("y = 1")
 
-    code = as_posix_list(detect(tmp_path)["files"]["code"])
+    code = as_posix_list(detect(tmp_path, gitignore=True)["files"]["code"])
     assert any(f.endswith("keep.py") for f in code), "project ! must beat the global file"
     assert not any(f.endswith("drop.py") for f in code)
 
@@ -1528,7 +1528,7 @@ def test_unanchored_pattern_matches_a_name_not_a_path(tmp_path, pattern, ignored
 def _detected(root):
     return {
         Path(p).relative_to(root).as_posix()
-        for paths in detect(root)["files"].values()
+        for paths in detect(root, gitignore=True)["files"].values()
         for p in paths
     }
 
@@ -4752,7 +4752,7 @@ def test_valid_git_dir_is_a_vcs_root(tmp_path, monkeypatch):
     shutil.rmtree(home / ".git")
     _make_git_dir(home)
     assert detect_mod._find_vcs_root(proj) == home.resolve()
-    assert "node_modules" in [p for _, p in _load_graphifyignore(proj)]
+    assert "node_modules" in [p for _, p in _load_graphifyignore(proj, gitignore=True)]
 
 
 def test_git_file_with_gitdir_is_a_vcs_root(tmp_path):

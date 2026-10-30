@@ -497,7 +497,10 @@ def test_skill_snippets_pass_recorded_external_roots():
         if line.startswith(("result = detect(Path('INPUT_PATH')", "result = detect_incremental(Path('INPUT_PATH')"))
     ]
     assert snippets
-    assert all("external_roots=_read_build_external_roots(Path('graphify-out'))" in s for s in snippets)
+    # out_path(): upstream's GRAPHIFY_OUT-aware output dir, which the snippets
+    # also use for the other persisted scan options.
+    missing = [s for s in snippets if "external_roots=_read_build_external_roots(out_path())" not in s]
+    assert not missing, missing
 
 
 def test_extract_without_external_roots_prunes_their_nodes(projects, dir_link):

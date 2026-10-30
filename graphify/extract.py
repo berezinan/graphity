@@ -10017,6 +10017,15 @@ def extract(
         # segments, so collapse to the basename.
         return p.name if updepth > 3 else rel
 
+    # Fork delta: a OneScript `#Использовать "<path>"` import names a library
+    # directory, often one not on disk (installed by opm), so the target_file
+    # remap below (existing files only, #2243) cannot reach it. The BSL
+    # extractor carries the target path; key it relative to the scan root.
+    for _e in all_edges:
+        _bsl_target = _e.pop("_bsl_import_path", None)
+        if _bsl_target:
+            _e["target"] = _make_id(_portable_out_of_root_sf(Path(os.path.abspath(_bsl_target))))
+
     # Symbol node IDs embed the file stem as a prefix (_file_node_id of the path
     # the extractor saw). For a root-level file that stem picks up the absolute
     # parent directory name, so a symbol becomes <rootdir>_main_run while the

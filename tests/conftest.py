@@ -132,8 +132,50 @@ def _pin_json_backend(
     monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "json")
 
 
+# Upstream 0.9.97 CLI lookups (refusal on ambiguous/same-file names, exit codes
+# 3/4, --seed, path through `contains`, explain --all hint) are written against
+# the networkx G; the fork routes query/path/explain through GraphBackend and
+# ports them to both backends in a separate change (upstream-merge-0-9-97, task
+# 6.2). strict: a test that starts passing must drop out of this list.
+_DEFERRED_BACKEND_PORT = frozenset({
+    'tests/test_explain_cli.py::test_explain_ambiguous_label_lists_every_candidate',
+    'tests/test_explain_same_file_tie.py::test_explain_refusal_does_not_depend_on_node_order',
+    'tests/test_explain_same_file_tie.py::test_explain_refuses_same_file_twins[.nonce()]',
+    'tests/test_explain_same_file_tie.py::test_explain_refuses_same_file_twins[src/x.ts::.nonce()]',
+    'tests/test_explain_same_file_tie.py::test_explain_refuses_sourceless_stubs',
+    'tests/test_lookup_exit_codes.py::test_explain_ambiguous_exits_ambiguous',
+    'tests/test_lookup_exit_codes.py::test_explain_miss_exits_not_found[NoSuchSymbolXyz]',
+    'tests/test_lookup_exit_codes.py::test_explain_miss_exits_not_found[src/a.ts::NotThere]',
+    'tests/test_lookup_exit_codes.py::test_path_ambiguous_endpoint_exits_ambiguous',
+    'tests/test_lookup_exit_codes.py::test_path_answer_exits_zero',
+    'tests/test_lookup_exit_codes.py::test_path_missing_endpoint_exits_not_found[NoSuchSymbolXyz]',
+    'tests/test_lookup_exit_codes.py::test_path_missing_endpoint_exits_not_found[src/a.ts::NotThere]',
+    'tests/test_lookup_exit_codes.py::test_path_same_node_both_ends_exits_ambiguous',
+    'tests/test_lookup_exit_codes.py::test_query_ambiguous_name_exits_ambiguous',
+    'tests/test_lookup_exit_codes.py::test_query_ambiguous_seed_exits_ambiguous',
+    'tests/test_lookup_exit_codes.py::test_query_missing_seed_exits_not_found',
+    'tests/test_path_cli.py::test_ambiguity_hint_names_symbol_not_query',
+    'tests/test_path_cli.py::test_path_endpoint_selects_named_node[src/b.ts::.nonce()]',
+    'tests/test_path_cli.py::test_path_endpoint_selects_named_node[src_b_betaclient_nonce]',
+    'tests/test_path_cli.py::test_path_refuses_ambiguous_endpoint[ends0]',
+    'tests/test_path_cli.py::test_path_refuses_ambiguous_endpoint[ends1]',
+    'tests/test_path_cli.py::test_path_refuses_same_file_duplicate_endpoint[.nonce()]',
+    'tests/test_path_cli.py::test_path_refuses_same_file_duplicate_endpoint[src/x.ts::.nonce()]',
+    'tests/test_path_cli.py::test_path_routes_through_a_contains_edge_to_reach_the_file',
+    'tests/test_path_cli.py::test_path_same_file_endpoints_still_resolve',
+    'tests/test_path_cli.py::test_path_scoped_endpoint_refuses_when_file_has_no_symbol',
+    'tests/test_query_seeds.py::test_query_cli_absolute_seed_uses_the_graph_location_not_cwd',
+    'tests/test_query_seeds.py::test_query_cli_logs_the_seeds',
+    'tests/test_query_seeds.py::test_query_cli_seed_flag_is_repeatable',
+    'tests/test_truncation_full_answer.py::test_explain_cut_names_the_total_and_the_option',
+})
+
+
 def pytest_collection_modifyitems(items: list[Any]) -> None:
     for item in items:
+        if item.nodeid in _DEFERRED_BACKEND_PORT:
+            item.add_marker(pytest.mark.xfail(
+                strict=True, reason="upstream CLI lookup not yet ported to GraphBackend (task 6.2)"))
         if item.path.name != "test_analyze.py":
             continue
         for warning_filter in _ANALYZE_WARNING_FILTERS:

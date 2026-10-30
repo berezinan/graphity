@@ -24,7 +24,9 @@ from graphify import install as install_mod
 # id -> (install, uninstall, settings file relative to project, section key)
 _INSTALLERS = {
     "claude": (
-        lambda project: install_mod._install_claude_hook(project),
+        # Fork delta: project-scoped install writes <project>/.claude; the
+        # default scope is the user settings file (user-scope-claude-hooks).
+        lambda project: install_mod._install_claude_hook(project, project=True),
         lambda project: install_mod._uninstall_claude_hook(project),
         ".claude/settings.json",
         "PreToolUse",
@@ -145,8 +147,8 @@ def test_install_removes_legacy_bash_hook_and_stays_idempotent(tmp_path):
         encoding="utf-8",
     )
 
-    install_mod._install_claude_hook(project)
-    install_mod._install_claude_hook(project)
+    install_mod._install_claude_hook(project, project=True)
+    install_mod._install_claude_hook(project, project=True)
 
     groups = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
     assert "graphify-out/graph.json" not in json.dumps(groups), "legacy bash guard survived"
