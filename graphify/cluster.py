@@ -484,12 +484,26 @@ def remap_communities_to_previous(
     return dict(sorted(remapped.items(), key=lambda kv: kv[0]))
 
 
+def previous_members_by_community(previous_node_community: dict[str, int]) -> dict[int, set[str]]:
+    """Invert node -> community once, for `label_still_applies` called per community.
+
+    Fork delta: scanning the whole previous assignment for every community is
+    O(communities x nodes) — on a 1C:EDT graph (55k communities, 2M nodes) that
+    is ~10^11 steps.
+    """
+    members: dict[int, set[str]] = {}
+    for node, old in previous_node_community.items():
+        members.setdefault(old, set()).add(str(node))
+    return members
+
+
 def label_still_applies(
     cid: int,
     current_members: list[str],
     previous_node_community: dict[str, int],
     saved_sig: str | None,
     current_sig: str | None,
+    previous_members: "dict[int, set[str]] | None" = None,
 ) -> bool:
     """Whether a saved label still names this community (#2298).
 
@@ -498,10 +512,16 @@ def label_still_applies(
     majority of both the previous set and the current set. A one-node fragment
     of a large community fails that test, so remap reusing the old id is not
     enough to keep the name.
+
+    ``previous_members`` (from `previous_members_by_community`) replaces the
+    per-call scan of ``previous_node_community`` when calling once per community.
     """
     if saved_sig is not None and current_sig is not None and saved_sig == current_sig:
         return True
-    saved = {str(node) for node, old in previous_node_community.items() if old == cid}
+    if previous_members is not None:
+        saved = previous_members.get(cid, set())
+    else:
+        saved = {str(node) for node, old in previous_node_community.items() if old == cid}
     current = {str(node) for node in current_members}
     if not saved or not current:
         return False

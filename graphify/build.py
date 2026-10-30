@@ -128,6 +128,13 @@ def _lost_saved_semantic_nodes(
         for node in saved_nodes
     ]
     doc_remap = _doc_twin_remap(rewritten)
+    # Fork delta: _is_file_node_label can only hold when label and source_file
+    # end in the same path segment, so bucket the AST file nodes by it, as the
+    # Pass 2b ghost fold does — testing every lost node against every AST file
+    # node is O(n*m) on a 1C:EDT graph.
+    ast_files_by_tail: dict[str, list[tuple[str, str]]] = {}
+    for _nid, _sf in new_ast_file_nodes:
+        ast_files_by_tail.setdefault(_sf.replace("\\", "/").rsplit("/", 1)[-1], []).append((_nid, _sf))
 
     def _renamed_present(node_id: str) -> bool:
         renamed = stem_remap.get(node_id, node_id)
@@ -157,7 +164,10 @@ def _lost_saved_semantic_nodes(
         # A document that names a file stamps the file's name as label but its
         # own path as source_file; Pass 2b folds it into the one AST file node
         # that label names. Two or more matches stay unmerged there.
-        file_twins = [nid for nid, sf in new_ast_file_nodes if _is_file_node_label(lbl, sf)] if lbl else []
+        file_twins = [
+            nid for nid, sf in ast_files_by_tail.get(lbl.rsplit("/", 1)[-1], ())
+            if _is_file_node_label(lbl, sf)
+        ] if lbl else []
         if len(file_twins) == 1:
             if folded is not None:
                 folded[str(node_id)] = file_twins[0]

@@ -2689,6 +2689,7 @@ def dispatch_command(cmd: str) -> None:
                 community_member_sigs,
                 label_communities_by_hub,
                 label_still_applies,
+                previous_members_by_community,
             )
             sig_path = labels_path.parent / (labels_path.name + ".sig")
             saved_sigs: dict[int, str] = {}
@@ -2703,6 +2704,7 @@ def dispatch_command(cmd: str) -> None:
                     saved_sigs = {}
             cur_sigs = community_member_sigs(communities)
             count_mismatch = len(existing_labels) != len(communities)
+            previous_members = previous_members_by_community(previous_node_community)
             labels = {}
             hub_labels: dict[int, str] | None = None
             changed = 0
@@ -2724,6 +2726,7 @@ def dispatch_command(cmd: str) -> None:
                         previous_node_community,
                         saved_sigs.get(cid),
                         cur_sigs.get(cid),
+                        previous_members,
                     )
                 elif count_mismatch:
                     # No signature sidecar. A changed count used to drop every
@@ -2734,6 +2737,7 @@ def dispatch_command(cmd: str) -> None:
                         previous_node_community,
                         None,
                         None,
+                        previous_members,
                     )
                 else:
                     # No signature sidecar and an equal community count: that

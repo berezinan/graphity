@@ -2943,8 +2943,9 @@ def _rebuild_code(
         # hub-fill below renames it, deterministically and correct-by-construction.
         # Without this, an incremental `graphify update` launders stale names into
         # labels.json as though they were current (#label-stale).
-        from graphify.cluster import community_member_sigs, label_still_applies
+        from graphify.cluster import community_member_sigs, label_still_applies, previous_members_by_community
         cur_sigs = community_member_sigs(communities)
+        previous_members = previous_members_by_community(previous_node_community)
         saved_sigs: dict[int, str] = {}
         if sig_file.exists():
             try:
@@ -2966,6 +2967,7 @@ def _rebuild_code(
                     previous_node_community,
                     saved_sigs.get(cid),
                     cur_sigs.get(cid),
+                    previous_members,
                 )
             }
         elif len(raw) != len(communities):
@@ -2982,6 +2984,7 @@ def _rebuild_code(
                     previous_node_community,
                     None,
                     None,
+                    previous_members,
                 )
             }
         else:
