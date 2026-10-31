@@ -2112,19 +2112,22 @@ def dispatch_command(cmd: str) -> None:
         result = backend.shortest_path(source_label, target_label,
                                        max_hops=10**9, undirected=undirected)
         if not result.found:
+            if result.refusal:
+                print(result.refusal.message, file=sys.stderr)
+                sys.exit(EXIT_AMBIGUOUS if result.refusal.ambiguous else EXIT_NOT_FOUND)
             if result.reason == "no-source":
                 print(f"No node matching '{source_label}' found.", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_NOT_FOUND)
             if result.reason == "no-target":
                 print(f"No node matching '{target_label}' found.", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_NOT_FOUND)
             if result.reason == "same-node":
                 print(
                     f"'{source_label}' and '{target_label}' both resolved to the same "
                     f"node '{result.start_label}'. Use a more specific label or the exact node ID.",
                     file=sys.stderr,
                 )
-                sys.exit(1)
+                sys.exit(EXIT_AMBIGUOUS)
             for _w in result.warnings:
                 print(_w, file=sys.stderr)
             # Through render_path, not a second copy of its wording: this branch
@@ -2161,7 +2164,9 @@ def dispatch_command(cmd: str) -> None:
         if len(sys.argv) == 3 and sys.argv[2] in ("--help", "-h"):
             print(_explain_usage)
             return
-        from graphify.query_backend import resolve_backend_config, require_backend, JsonBackend, render_explain
+        from graphify.query_backend import (
+            resolve_backend_config, require_backend, JsonBackend, Refusal, render_explain,
+        )
         from networkx.readwrite import json_graph
         from graphify import querylog
 
@@ -2194,16 +2199,13 @@ def dispatch_command(cmd: str) -> None:
             backend = JsonBackend(G)
             _corpus = str(gp)
         result = backend.explain(label)
-        if result is None:
-            print(f"No node matching '{label}' found.")
-            sys.exit(0)
+        if isinstance(result, Refusal):
+            # Distinct codes (ddc24c7): a script must tell "several candidates"
+            # from "nothing matched", and neither from an answer.
+            print(result.message)
+            sys.exit(EXIT_AMBIGUOUS if result.ambiguous else EXIT_NOT_FOUND)
         print(render_explain(result, label,
                              max_connections=len(result.connections) if show_all else 20))
-        if result.ambiguous:
-            # Ненулевой код: ответ не получен, а не получен один из нескольких.
-            # Нулевой выход здесь читается вызывающим скриптом как успех, и
-            # подсказка про path::symbol остаётся незамеченной.
-            sys.exit(1)
         # Work-memory overlay: a derived experiential hint from `graphify reflect`,
         # merged in display-only from the .graphify_learning.json sidecar next to
         # graph.json. No line when the node has no overlay entry.

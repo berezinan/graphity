@@ -21,6 +21,8 @@ from graphify import arcade_server
 from graphify.query_backend import (
     ArcadeDBBackend,
     JsonBackend,
+    NodeDetail,
+    Refusal,
     render_explain,
     render_node,
     render_neighbors,
@@ -94,6 +96,12 @@ def backends(tmp_path_factory):
         arcade._server(f"drop database {_DB}")
     except Exception:
         pass
+
+
+def _candidate_ids(refusal):
+    """Candidate ids a refusal lists. They follow graph iteration on JSON and id
+    order on ArcadeDB, so parity compares them as a set."""
+    return sorted(l.strip() for l in refusal.message.splitlines() if l.strip().startswith("id:"))
 
 
 def _query_sets(r):
@@ -185,10 +193,11 @@ def test_explain_parity(backends, label):
                     c.source_file, c.source_location) for c in r.connections),
         )
     j, a = jb.explain(label), arc.explain(label)
-    if j.ambiguous:
-        # Узел неоднозначной метки выбирается порядком обхода; его сверяет
-        # test_explain_parity_punctuated, здесь нужны только места связей.
-        assert set(j.ambiguous) == set(a.ambiguous)
+    if isinstance(j, Refusal):
+        # Отказ сверяется видом и множеством кандидатов: их порядок на JSON
+        # задаёт обход графа.
+        assert isinstance(a, Refusal) and j.ambiguous == a.ambiguous
+        assert _candidate_ids(j) == _candidate_ids(a)
         return
     assert norm(j) == norm(a)
     # Полный вывод: место связи и «Defined in:» видит пользователь.
@@ -226,11 +235,13 @@ _PUNCTUATED = ["dbo_Price", "dbo.Price", "dbo Price", "Price.sql",
 def test_explain_parity_punctuated(backends, label):
     jb, arc = backends
     j, a = jb.explain(label), arc.explain(label)
-    assert j is not None and a is not None
     # Порядок кандидатов в тире на JSON задаёт обход графа, поэтому
-    # неоднозначность сравнивается множеством, а узел — только без неё.
-    assert set(j.ambiguous) == set(a.ambiguous)
-    if not j.ambiguous:
+    # отказ сравнивается множеством кандидатов, а узел — только без отказа.
+    assert isinstance(j, Refusal) == isinstance(a, Refusal)
+    if isinstance(j, Refusal):
+        assert j.ambiguous and a.ambiguous, "every label here exists"
+        assert _candidate_ids(j) == _candidate_ids(a)
+    else:
         assert (j.detail.label, j.detail.id, j.detail.source_file) == \
                (a.detail.label, a.detail.id, a.detail.source_file)
 
@@ -239,9 +250,12 @@ def test_explain_parity_punctuated(backends, label):
 def test_get_neighbors_parity_punctuated(backends, label):
     jb, arc = backends
     def norm(n):
-        return None if n is None else (n.label, sorted((x.outgoing, x.label, x.relation, x.confidence) for x in n.neighbors))
-    assert norm(arc.get_neighbors(label)) is not None
-    assert norm(jb.get_neighbors(label)) == norm(arc.get_neighbors(label))
+        if isinstance(n, Refusal):
+            return ("refused", n.ambiguous, _candidate_ids(n))
+        return (n.label, sorted((x.outgoing, x.label, x.relation, x.confidence) for x in n.neighbors))
+    a = norm(arc.get_neighbors(label))
+    assert a[:2] != ("refused", False), "the label must match a node"
+    assert norm(jb.get_neighbors(label)) == a
 
 
 def test_god_nodes_parity(backends):
@@ -317,7 +331,7 @@ def test_sync_graph_incremental(tmp_path_factory):
         assert render_stats(jb.graph_stats()) == render_stats(arc.graph_stats())
         # relabeled node present, pruned node gone
         assert render_node(arc.get_node("extractor"), "extractor") == render_node(jb.get_node("extractor"), "extractor")
-        assert arc.get_node("isolated") is None
+        assert isinstance(arc.get_node("isolated"), Refusal)
         # new edge reachable: query around build still parity on node set
         jn = {n.label for n in jb.query("build", depth=3).nodes}
         an = {n.label for n in arc.query("build", depth=3).nodes}
@@ -596,8 +610,8 @@ def test_sync_graph_inserts_nodes_that_belong_to_no_file(tmp_path_factory):
         assert st["missing_edges"] == 0, "and the edges that end on them with them"
         assert shortfall_warning(st) is None
         # both spellings, not just the empty string
-        assert arc.get_node("Exception") is not None
-        assert arc.get_node("TestCase") is not None
+        assert isinstance(arc.get_node("Exception"), NodeDetail)
+        assert isinstance(arc.get_node("TestCase"), NodeDetail)
         # the edge whose only unresolved end was such a node exists now
         jb = JsonBackend(g2)
         assert {n.label for n in jb.query("Exception", depth=2).nodes} == \
@@ -627,12 +641,12 @@ def test_sync_graph_removes_a_fileless_node_the_graph_dropped(tmp_path_factory):
     arc.ensure_database(drop=True)
     arc.load_from_graph_json(str(p))
     try:
-        assert arc.get_node("Exception") is not None, "precondition: it was loaded"
+        assert isinstance(arc.get_node("Exception"), NodeDetail), "precondition: it was loaded"
         g2 = _make_unattributed_graph()
         g2.remove_node("c1")
         st = arc.sync_graph(g2, changed_sources={"extract.py"}, pruned_sources=set())
 
-        assert arc.get_node("Exception") is None
+        assert isinstance(arc.get_node("Exception"), Refusal)
         assert st["missing_nodes"] == 0 and st["missing_edges"] == 0, \
             "the DB must equal the graph, neither short nor over"
         assert render_stats(arc.graph_stats()) == render_stats(JsonBackend(g2).graph_stats())
@@ -662,7 +676,7 @@ def test_sync_reconciles_fileless_nodes_with_no_dirty_file(tmp_path_factory):
     try:
         g2 = _make_unattributed_graph()
         st = arc.sync_graph(g2, changed_sources=set(), pruned_sources=set())
-        assert arc.get_node("Exception") is not None
+        assert isinstance(arc.get_node("Exception"), NodeDetail)
         assert st.get("missing_nodes") == 0 and st.get("missing_edges") == 0
     finally:
         try:

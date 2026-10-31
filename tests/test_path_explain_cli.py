@@ -84,5 +84,6 @@ def test_explain_no_match(monkeypatch, tmp_path, capsys):
     gp = _write_graph(tmp_path)
     with pytest.raises(SystemExit) as exc:
         _run(monkeypatch, ["graphify", "explain", "zzznope", "--graph", str(gp)])
-    assert exc.value.code == 0
+    # A miss is not an answer: EXIT_NOT_FOUND, upstream's contract (ddc24c7).
+    assert exc.value.code == 4
     assert "No node matching 'zzznope' found." in capsys.readouterr().out

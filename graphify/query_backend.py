@@ -34,14 +34,19 @@ from graphify.serve import (
     _dfs,
     _dfs_core,
     _filter_graph_by_context,
-    _find_node,
     _find_node_tiers,
-    find_node_ambiguity,
     _hub_threshold,
     _idf_value,
+    _is_ambiguity_refusal,
+    _no_scoped_match_message,
     _pick_scored_endpoint,
     _pick_seeds,
+    _PY_QUALIFIED_RE,
+    _query_name_refusal,
     _query_terms,
+    _resolve_path_endpoint,
+    _resolve_single_node,
+    _tier_refusal,
     _resolve_context_filters,
     _score_nodes,
     _score_record,
@@ -55,6 +60,22 @@ from graphify.serve import (
 # --------------------------------------------------------------------------- #
 # Materialized result records (no nx.Graph reference crosses this boundary)
 # --------------------------------------------------------------------------- #
+@dataclass
+class Refusal:
+    """A lookup that has no single answer: the name is ambiguous or matches nothing.
+
+    ``message`` is the text `serve.py` produces for the same lookup, so both
+    backends refuse in the upstream wording. ``ambiguous`` picks the exit code:
+    3 when candidates are listed, 4 when nothing matched.
+    """
+    message: str
+    ambiguous: bool
+
+
+def _refusal(message: str) -> Refusal:
+    return Refusal(message, _is_ambiguity_refusal(message))
+
+
 @dataclass
 class NodeRecord:
     label: str
@@ -83,6 +104,9 @@ class QueryResult:
     filters: list[str] = field(default_factory=list)
     filter_source: str | None = None
     graph_nodes: int | None = None         # size of the WHOLE graph, for the header
+    # The question is itself the exact name of several nodes (#4517): refused
+    # like `explain`/`path`, never answered from one of them.
+    refusal: Refusal | None = None
 
 
 @dataclass
@@ -155,6 +179,7 @@ class PathResult:
     segments: list[PathSegment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)   # ambiguity warnings only
     reason: str = ""                       # populated when found is False
+    refusal: Refusal | None = None         # an endpoint is ambiguous or a file::symbol miss
 
 
 @dataclass
@@ -175,27 +200,29 @@ class Connection:
 class ExplainResult:
     detail: NodeDetail
     connections: list[Connection] = field(default_factory=list)
-    # Кандидаты (source_file, id), когда метка попадает в несколько файлов.
-    # Непустой список означает, что ответ ненадёжен: молча взятый первый
-    # кандидат читается как единственный.
-    ambiguous: list[tuple[str, str]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
 # Backend interface
 # --------------------------------------------------------------------------- #
 class GraphBackend(ABC):
-    """Read-only view over a knowledge graph, addressed by labels/ids."""
+    """Read-only view over a knowledge graph, addressed by labels/ids.
+
+    A point lookup (`get_node`, `get_neighbors`, `explain`, the `shortest_path`
+    endpoints) resolves its label by `serve._resolve_single_node` rules and
+    returns a `Refusal` instead of guessing when that label names several nodes
+    or none.
+    """
 
     @abstractmethod
     def query(self, question: str, *, mode: str = "bfs", depth: int = 3,
               context_filters: list[str] | None = None) -> QueryResult: ...
 
     @abstractmethod
-    def get_node(self, label: str) -> NodeDetail | None: ...
+    def get_node(self, label: str) -> NodeDetail | Refusal: ...
 
     @abstractmethod
-    def get_neighbors(self, label: str, relation_filter: str = "") -> Neighbors | None: ...
+    def get_neighbors(self, label: str, relation_filter: str = "") -> Neighbors | Refusal: ...
 
     @abstractmethod
     def get_community(self, community_id: int) -> CommunityRecord | None: ...
@@ -211,7 +238,7 @@ class GraphBackend(ABC):
                       undirected: bool = False) -> PathResult: ...
 
     @abstractmethod
-    def explain(self, label: str) -> ExplainResult | None: ...
+    def explain(self, label: str) -> ExplainResult | Refusal: ...
 
     @abstractmethod
     def pr_impact(self, files: list[str]) -> tuple[list[int], int]: ...
@@ -231,6 +258,10 @@ class JsonBackend(GraphBackend):
 
     def query(self, question, *, mode="bfs", depth=3, context_filters=None) -> QueryResult:
         G = self.G
+        refused = _query_name_refusal(G, question)
+        if refused:
+            return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
+                               refusal=_refusal(refused))
         terms = _query_terms(question)
         scored = _score_nodes(G, terms)
         seeds = _pick_seeds(scored)
@@ -313,25 +344,29 @@ class JsonBackend(GraphBackend):
             graph_nodes=G.number_of_nodes(),
         )
 
-    def get_node(self, label) -> NodeDetail | None:
-        needle = label.lower()
-        for nid, d in self.G.nodes(data=True):
-            if needle in (d.get("label") or "").lower() or needle == nid.lower():
-                return NodeDetail(
-                    label=d.get("label", nid), id=nid,
-                    source_file=str(d.get("source_file", "")),
-                    source_location=str(d.get("source_location", "")),
-                    file_type=str(d.get("file_type", "")),
-                    community=str(d.get("community", "")),
-                    degree=self.G.degree(nid),
-                )
-        return None
+    def _resolve(self, label: str) -> tuple[str | None, Refusal | None]:
+        nid, err = _resolve_single_node(self.G, label)
+        return nid, (_refusal(err) if err else None)
 
-    def get_neighbors(self, label, relation_filter="") -> Neighbors | None:
-        matches = _find_node(self.G, label.lower())
-        if not matches:
-            return None
-        nid = matches[0]
+    def get_node(self, label) -> NodeDetail | Refusal:
+        # Lowercased like upstream's get_node tool, so a refusal quotes the same label.
+        nid, refused = self._resolve(label.lower())
+        if refused:
+            return refused
+        d = self.G.nodes[nid]
+        return NodeDetail(
+            label=d.get("label", nid), id=nid,
+            source_file=str(d.get("source_file", "")),
+            source_location=str(d.get("source_location", "")),
+            file_type=str(d.get("file_type", "")),
+            community=str(d.get("community", "")),
+            degree=self.G.degree(nid),
+        )
+
+    def get_neighbors(self, label, relation_filter="") -> Neighbors | Refusal:
+        nid, refused = self._resolve(label.lower())
+        if refused:
+            return refused
         rf = relation_filter.lower()
         recs: list[NeighborRecord] = []
         for nb in self.G.successors(nid):
@@ -377,15 +412,19 @@ class JsonBackend(GraphBackend):
 
     def shortest_path(self, source, target, *, max_hops=8, undirected=False) -> PathResult:
         G = self.G
-        src_scored = _score_nodes(G, [t.lower() for t in source.split()])
-        tgt_scored = _score_nodes(G, [t.lower() for t in target.split()])
-        if not src_scored:
-            return PathResult(found=False, reason=f"no-source")
-        if not tgt_scored:
-            return PathResult(found=False, reason=f"no-target")
-        # Full-token label matches win over the raw score head (#1785).
-        s_id = _pick_scored_endpoint(G, src_scored, source)
-        t_id = _pick_scored_endpoint(G, tgt_scored, target)
+        # An exact hit (path::symbol, node id, exact label or path) names the
+        # endpoint outright, a tie or a file::symbol miss is refused, and only
+        # then does scoring pick one (#3913, #4264, #1785).
+        s_id, src_scored, s_err = _resolve_path_endpoint(G, source)
+        if s_err:
+            return PathResult(found=False, reason="refused", refusal=_refusal(s_err))
+        if s_id is None:
+            return PathResult(found=False, reason="no-source")
+        t_id, tgt_scored, t_err = _resolve_path_endpoint(G, target)
+        if t_err:
+            return PathResult(found=False, reason="refused", refusal=_refusal(t_err))
+        if t_id is None:
+            return PathResult(found=False, reason="no-target")
         if s_id == t_id:
             return PathResult(found=False, reason="same-node", start_label=s_id)
         warnings: list[str] = []
@@ -467,11 +506,10 @@ class JsonBackend(GraphBackend):
         return PathResult(found=True, start_label=G.nodes[s_id].get("label", s_id),
                           hops=hops, segments=segments, warnings=warnings)
 
-    def explain(self, label) -> ExplainResult | None:
-        matches = _find_node(self.G, label)
-        if not matches:
-            return None
-        nid = matches[0]
+    def explain(self, label) -> ExplainResult | Refusal:
+        nid, refused = self._resolve(label)
+        if refused:
+            return refused
         d = self.G.nodes[nid]
         detail = NodeDetail(
             label=d.get("label", nid), id=nid,
@@ -481,11 +519,6 @@ class JsonBackend(GraphBackend):
             definition_file=str(d.get("definition_file", "") or ""),
             definition_location=str(d.get("definition_location", "") or ""),
         )
-        # Взятый молча первый кандидат читается как единственный: две рабочих
-        # области, каждая со своим MetricsPort, попадают в один тир и
-        # различаются только порядком обхода графа.
-        rivals = find_node_ambiguity(self.G, label)
-        ambiguous = [(str(self.G.nodes[r].get("source_file") or r), r) for r in rivals]
         conns: list[Connection] = []
 
         def _outgoing(e: dict, other: str, default: bool) -> bool:
@@ -513,7 +546,7 @@ class JsonBackend(GraphBackend):
                                     str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
                                     source_file=str(e.get("source_file", "") or ""),
                                     source_location=str(e.get("source_location", "") or "")))
-        return ExplainResult(detail=detail, connections=conns, ambiguous=ambiguous)
+        return ExplainResult(detail=detail, connections=conns)
 
     def pr_impact(self, files) -> tuple[list[int], int]:
         from graphify.prs import compute_pr_impact
@@ -534,6 +567,8 @@ def render_query(r: QueryResult, token_budget: int = 2000, *,
     accepted so the CLI can show what it resolved even when the backend
     reported none.
     """
+    if r.refusal:
+        return r.refusal.message
     if not r.seeds:
         return "No matching nodes found."
     parts = [f"Traversal: {r.mode.upper()} depth={r.depth}", f"Start: {r.seeds}"]
@@ -613,9 +648,9 @@ def render_query(r: QueryResult, token_budget: int = 2000, *,
     return header + output
 
 
-def render_node(d: NodeDetail | None, label: str) -> str:
-    if d is None:
-        return f"No node matching '{label}' found."
+def render_node(d: NodeDetail | Refusal, label: str) -> str:
+    if isinstance(d, Refusal):
+        return d.message
     return "\n".join([
         f"Node: {sanitize_label(d.label)}",
         f"  ID: {sanitize_label(d.id)}",
@@ -626,7 +661,7 @@ def render_node(d: NodeDetail | None, label: str) -> str:
     ])
 
 
-def render_neighbors(n: Neighbors | None, label: str,
+def render_neighbors(n: Neighbors | Refusal, label: str,
                      token_budget: int | None = None) -> str:
     """Соседи узла; при заданном бюджете вывод режется по границе строки.
 
@@ -634,8 +669,8 @@ def render_neighbors(n: Neighbors | None, label: str,
     заливает контекст вызывающего целиком, и оба бэкенда обязаны обрезать
     одинаково (#2069).
     """
-    if n is None:
-        return f"No node matching '{label}' found."
+    if isinstance(n, Refusal):
+        return n.message
     lines = [f"Neighbors of {sanitize_label(n.label)}:"]
     for nb in n.neighbors:
         arrow = "  -->" if nb.outgoing else "  <--"
@@ -691,6 +726,8 @@ def render_stats(s: GraphStats) -> str:
 
 def render_path(p: PathResult, source: str, target: str, max_hops: int = 8) -> str:
     if not p.found:
+        if p.refusal:
+            return p.refusal.message
         if p.reason == "no-source":
             return f"No node matching source '{source}' found."
         if p.reason == "no-target":
@@ -729,21 +766,10 @@ def render_path(p: PathResult, source: str, target: str, max_hops: int = 8) -> s
     return prefix + f"Shortest path ({p.hops} hops):\n  " + " ".join(segments)
 
 
-def render_explain(r: ExplainResult | None, label: str, *, max_connections: int = 20) -> str:
+def render_explain(r: ExplainResult | Refusal, label: str, *, max_connections: int = 20) -> str:
     """Reproduce the `graphify explain` node card + degree-ranked connections."""
-    if r is None:
-        return f"No node matching '{label}' found."
-    if r.ambiguous:
-        # Печатаем ВСЕХ кандидатов, а не молча берём первого: иначе один
-        # произвольный файл подаётся как ответ, и уверенность вывода ничем не
-        # отличается от случая, когда совпадение единственное.
-        out = [f"Ambiguous: '{label}' matches {len(r.ambiguous)} nodes in different files."]
-        for source_file, nid in r.ambiguous:
-            out.append(f"  {source_file}")
-            out.append(f"    id: {nid}")
-        out.append(f"Retry with path::symbol using one of the paths above "
-                   f"(e.g. <path>::{label}) or the full node id.")
-        return "\n".join(out)
+    if isinstance(r, Refusal):
+        return r.message
     d = r.detail
     lines = [
         f"Node: {d.label}",
@@ -905,7 +931,7 @@ def _dedupe(groups: list[list[_Cond]]) -> list[list[_Cond]]:
 
 
 def _label_substring_tier_filter(label: str) -> list[list[_Cond]]:
-    """Условие выборки узлов тира substring — второй этап `_resolve_one`.
+    """Условие выборки узлов тира substring — второй этап `_resolve`.
 
     Возвращает OR из AND-групп. Правила сопоставления здесь не повторяются:
     база отдаёт надмножество, тиры считает эталонный код на мини-графе. Своя
@@ -956,6 +982,12 @@ def _label_upper_tier_filter(label: str) -> list[list[_Cond]]:
         symbol = label.partition("::")[2].strip()
         if symbol:
             groups += sides(symbol)
+    # A dotted Python symbol (`pkg.mod.func`, `pkg.mod:func`) is resolved by the
+    # reference as `pkg/mod.py::func` (#4366), so its symbol half needs the same
+    # candidates as a `::` query's.
+    qualified = _PY_QUALIFIED_RE.match(label.strip())
+    if qualified:
+        groups += sides(qualified.group(2))
     return _dedupe(groups)
 
 
@@ -1012,8 +1044,10 @@ def _id_key(node_id: str) -> str:
 # once lacked the edge's file in both places at once, and every `explain` on this
 # backend lost its call sites. The community name lives in `Community`, one row
 # per community; the edge's file follows `_edge_doc`.
+# `repo` exists only on a merged graph (the global database): a file is its repo
+# plus its source_file there, so two repos' `dup.py` are two files (#4512).
 _NODE_FIELDS = ("id", "label", "source_file", "source_location", "file_type", "community",
-                "definition_file", "definition_location")
+                "definition_file", "definition_location", "repo")
 _EDGE_FIELDS = ("relation", "confidence", "weight", "context", "source_location")
 
 
@@ -1781,7 +1815,8 @@ class ArcadeDBBackend(GraphBackend):
             idf[t] = _idf_value(N, df)
         return idf
 
-    def _score(self, terms: list[str]) -> list[tuple[float, str]]:
+    def _score(self, terms: list[str], labels: dict | None = None) -> list[tuple[float, str]]:
+        """Scored (score, id) over the database; ``labels`` collects each scored node's label."""
         norm_terms = [tok for t in terms for tok in _search_tokens(t)]
         if not norm_terms:
             return []
@@ -1808,6 +1843,8 @@ class ArcadeDBBackend(GraphBackend):
             if s > 0:
                 scored.append((s, r["id"], r.get("label") or r["id"]))
         scored.sort(key=lambda x: (-x[0], len(x[2]), x[1]))
+        if labels is not None:
+            labels.update((nid, lbl) for _, nid, lbl in scored)
         return [(s, nid) for s, nid, _ in scored]
 
     # ---- traversal (shared core over a DB-fetched neighborhood) -------------
@@ -1880,6 +1917,11 @@ class ArcadeDBBackend(GraphBackend):
         return dict(fdeg)
 
     def query(self, question, *, mode="bfs", depth=3, context_filters=None) -> QueryResult:
+        # The refusal reads only the exact tiers, which the upper-tier candidates cover.
+        refused = _query_name_refusal(self._label_candidates(_label_upper_tier_filter(question)), question)
+        if refused:
+            return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
+                               refusal=_refusal(refused))
         scored = self._score(_query_terms(question))
         seeds = _pick_seeds(scored)
         if not seeds:
@@ -1971,23 +2013,20 @@ class ArcadeDBBackend(GraphBackend):
                            graph_nodes=self._node_count())
 
     # ---- point lookups ------------------------------------------------------
-    def get_node(self, label) -> NodeDetail | None:
-        needle = label.lower()
+    def get_node(self, label) -> NodeDetail | Refusal:
+        nid, refused, _H = self._resolve(label.lower())
+        if refused:
+            return refused
         rows = self._run(
             "SELECT id, label, source_file, source_location, file_type, community, degree FROM Node "
-            "WHERE norm_label LIKE :p OR id_key = :idk",
-            params={"p": f"%{needle}%", "idk": _id_key(label)},
-        )
-        rows.sort(key=_by_id)
-        for r in rows:
-            if needle in (r.get("label") or "").lower() or needle == r["id"].lower():
-                return NodeDetail(label=r.get("label", r["id"]), id=r["id"],
-                                  source_file=str(r.get("source_file", "") or ""),
-                                  source_location=str(r.get("source_location", "") or ""),
-                                  file_type=str(r.get("file_type", "") or ""),
-                                  community=str(r.get("community") if r.get("community") is not None else ""),
-                                  degree=int(r.get("degree") or 0))
-        return None
+            "WHERE id_key = :idk LIMIT 1", params={"idk": _id_key(nid)})
+        r = rows[0]
+        return NodeDetail(label=r.get("label", nid), id=nid,
+                          source_file=str(r.get("source_file", "") or ""),
+                          source_location=str(r.get("source_location", "") or ""),
+                          file_type=str(r.get("file_type", "") or ""),
+                          community=str(r.get("community") if r.get("community") is not None else ""),
+                          degree=int(r.get("degree") or 0))
 
     def _label_candidates(self, groups: list[list[_Cond]]) -> nx.DiGraph:
         """Мини-граф узлов, удовлетворяющих OR из AND-групп условий."""
@@ -2004,41 +2043,35 @@ class ArcadeDBBackend(GraphBackend):
                 ands.append(f"{field_expr} {op} :{key}")
             ors.append("(" + " AND ".join(ands) + ")")
         rows = self._run(
-            "SELECT id, label, norm_label, source_file, source_location FROM Node WHERE "
+            "SELECT id, label, norm_label, source_file, source_location, repo FROM Node WHERE "
             + " OR ".join(ors), params=params, limit=-1)
         rows.sort(key=_by_id)
         for r in rows:
-            H.add_node(r["id"], **{k: r[k] for k in ("label", "norm_label", "source_file", "source_location")
+            H.add_node(r["id"], **{k: r[k] for k in ("label", "norm_label", "source_file",
+                                                     "source_location", "repo")
                                    if r.get(k) is not None})
         return H
 
-    def _resolve_one(self, label: str) -> tuple[str, nx.DiGraph] | None:
-        """First match of `_find_node` over the candidate superset, plus the winning tier.
+    def _resolve(self, label: str) -> tuple[str | None, Refusal | None, nx.DiGraph]:
+        """`serve._resolve_single_node` over the database's candidates for *label*.
 
-        The tier comes back as its own graph: a node's tier does not depend on
-        the other nodes, so `find_node_ambiguity` over it answers as over the
-        whole superset without recomputing tiers for every candidate. Built
-        fresh rather than via `H.subgraph`, which would share `H.graph` and with
-        it the trigram index cached there for H's nodes.
+        A node's tier does not depend on the other nodes, and every refusal reads
+        only the winning tier's nodes, so the reference code answers on the
+        candidate superset exactly as on the whole graph. Candidates come in id
+        order, which can pick a different first member of a file tier than graph
+        iteration order does; every tie between symbols is refused anyway.
         """
         H = self._label_candidates(_label_upper_tier_filter(label))
-        tiers = _find_node_tiers(H, label)
-        if not any(tiers[:3]):
+        if not any(_find_node_tiers(H, label)[:3]):
             # Верхние тиры пусты и полны — ответ может быть только в substring.
             H = self._label_candidates(_label_substring_tier_filter(label))
-            tiers = _find_node_tiers(H, label)
-        for tier in tiers:
-            if tier:
-                T = nx.DiGraph()
-                T.add_nodes_from((nid, H.nodes[nid]) for nid in tier)
-                return tier[0], T
-        return None
+        nid, err = _resolve_single_node(H, label)
+        return nid, (_refusal(err) if err else None), H
 
-    def get_neighbors(self, label, relation_filter="") -> Neighbors | None:
-        hit = self._resolve_one(label.lower())
-        if hit is None:
-            return None
-        nid, H = hit
+    def get_neighbors(self, label, relation_filter="") -> Neighbors | Refusal:
+        nid, refused, H = self._resolve(label.lower())
+        if refused:
+            return refused
         rf = relation_filter.lower()
         out = self._run(
             "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
@@ -2092,19 +2125,50 @@ class ArcadeDBBackend(GraphBackend):
                           inferred_pct=round(counts.get("INFERRED", 0) / total * 100),
                           ambiguous_pct=round(counts.get("AMBIGUOUS", 0) / total * 100))
 
+    def _path_endpoint(self, query: str) -> tuple[str | None, list[tuple[float, str]], str | None]:
+        """`serve._resolve_path_endpoint` over the database, step for step.
+
+        The exact tiers and the `file::symbol` miss run the reference functions
+        on the upper-tier candidates, which hold every exact match of the query
+        and, for `::`, of its symbol half. Only the score fallback differs: it
+        needs whole-graph IDF, so it scores on the server and then picks with
+        the reference `_pick_scored_endpoint` (#1785).
+        """
+        H = self._label_candidates(_label_upper_tier_filter(query))
+        source_exact, exact, _, _ = _find_node_tiers(H, query)
+        hits = source_exact or exact
+        if hits:
+            err = _tier_refusal(H, query, hits, file_query=bool(source_exact) and "::" not in query)
+            return (None, [], err) if err else (hits[0], [], None)
+        path_part, sep, symbol_part = query.partition("::")
+        if sep and path_part.strip() and symbol_part.strip():
+            return None, [], _no_scoped_match_message(H, path_part.strip(), symbol_part.strip())
+        labels: dict = {}
+        scored = self._score([t.lower() for t in query.split()], labels=labels)
+        if not scored:
+            return None, [], None
+        S = nx.DiGraph()
+        S.add_nodes_from((nid, {"label": labels[nid]}) for _, nid in scored)
+        return _pick_scored_endpoint(S, scored, query), scored, None
+
     def shortest_path(self, source, target, *, max_hops=8, undirected=False) -> PathResult:
-        src = self._score([t.lower() for t in source.split()])
-        tgt = self._score([t.lower() for t in target.split()])
-        if not src:
+        s_id, src, s_err = self._path_endpoint(source)
+        if s_err:
+            return PathResult(found=False, reason="refused", refusal=_refusal(s_err))
+        if s_id is None:
             return PathResult(found=False, reason="no-source")
-        if not tgt:
+        t_id, tgt, t_err = self._path_endpoint(target)
+        if t_err:
+            return PathResult(found=False, reason="refused", refusal=_refusal(t_err))
+        if t_id is None:
             return PathResult(found=False, reason="no-target")
-        s_id, t_id = src[0][1], tgt[0][1]
         if s_id == t_id:
             return PathResult(found=False, reason="same-node", start_label=s_id)
         warnings = []
-        for name, sc in (("source", src), ("target", tgt)):
-            if len(sc) >= 2 and sc[0][0] > 0 and (sc[0][0] - sc[1][0]) / sc[0][0] < 0.10:
+        for name, sc, nid in (("source", src, s_id), ("target", tgt, t_id)):
+            # As on the JSON path: only when the raw score head is what got picked.
+            if len(sc) >= 2 and nid == sc[0][1] and sc[0][0] > 0 \
+                    and (sc[0][0] - sc[1][0]) / sc[0][0] < 0.10:
                 warnings.append(f"warning: {name} match was ambiguous (top score {sc[0][0]:g}, runner-up {sc[1][0]:g})")
         s_label = self._label_of(s_id)
         # Clamp the variable-length upper bound so an "unlimited" caller can't ask
@@ -2155,11 +2219,10 @@ class ArcadeDBBackend(GraphBackend):
         rows = self._run("SELECT label FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})
         return rows[0]["label"] if rows and rows[0].get("label") else nid
 
-    def explain(self, label) -> ExplainResult | None:
-        hit = self._resolve_one(label)
-        if hit is None:
-            return None
-        nid, H = hit
+    def explain(self, label) -> ExplainResult | Refusal:
+        nid, refused, _H = self._resolve(label)
+        if refused:
+            return refused
         rows = self._run("SELECT id, label, source_file, source_location, file_type, community, degree, "
                         "definition_file, definition_location "
                         "FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})
@@ -2193,13 +2256,7 @@ class ArcadeDBBackend(GraphBackend):
                               source_file=str(x.get("sfile", "") or ""),
                               source_location=str(x.get("sloc", "") or ""))
         conns = [_conn(x, True) for x in out] + [_conn(x, False) for x in inc]
-        # Неоднозначность решается по узлам базы тем же правилом, что в
-        # JsonBackend: несколько кандидатов ОДНОГО тира в РАЗНЫХ файлах.
-        # Несколько совпадений внутри одного файла — обычное старшинство.
-        # H — узлы победившего тира, поэтому `find_node_ambiguity` видит тех
-        # же конкурентов, что на полном графе.
-        ambiguous = [(str(H.nodes[r].get("source_file") or r), r) for r in find_node_ambiguity(H, label)]
-        return ExplainResult(detail=detail, connections=conns, ambiguous=ambiguous)
+        return ExplainResult(detail=detail, connections=conns)
 
     def pr_impact(self, files) -> tuple[list[int], int]:
         from graphify.prs import _path_match
