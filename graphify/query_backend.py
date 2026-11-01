@@ -855,7 +855,12 @@ def render_god_nodes(nodes: list[GodNode]) -> str:
 
 
 def render_stats(s: GraphStats, *, head: str | None = None) -> str:
-    lines = (
+    """Graph statistics; ``head`` is the repo's current commit, None when unknown.
+
+    The build-commit line is upstream's `_build_commit_line` (748de12): an MCP
+    client cannot stat graph.json, so this is its only staleness signal (#3354).
+    """
+    out = (
         f"Nodes: {s.nodes}\n"
         f"Edges: {s.edges}\n"
         f"Communities: {s.communities}\n"
@@ -863,12 +868,15 @@ def render_stats(s: GraphStats, *, head: str | None = None) -> str:
         f"INFERRED: {s.inferred_pct}%\n"
         f"AMBIGUOUS: {s.ambiguous_pct}%\n"
     )
-    if s.built_at_commit:
-        if head and head != s.built_at_commit:
-            lines += f"HEAD is {head[:7]}, graph built at {s.built_at_commit[:7]}: graph may be stale\n"
-        else:
-            lines += f"Graph built at: {s.built_at_commit[:7]}\n"
-    return lines
+    commit = s.built_at_commit
+    if not commit:
+        return out
+    if not head:
+        return out + f"Built at commit: {commit}\n"
+    if head == commit:
+        return out + f"Built at commit: {commit} (matches HEAD)\n"
+    return out + (f"Built at commit: {commit}\n"
+                  f"HEAD is {head[:7]}, graph built at {commit[:7]}: graph may be stale\n")
 
 
 def render_path(p: PathResult, source: str, target: str, max_hops: int = 8) -> str:
@@ -1978,6 +1986,29 @@ class ArcadeDBBackend(GraphBackend):
             idf[t] = _idf_value(N, df)
         return idf
 
+    def _score_candidates(self, terms: list[str]) -> list[dict]:
+        """Every node that can score > 0 for *terms*: label, path, id, rationale or attributes hit.
+
+        ``limit=-1``: the HTTP endpoint otherwise caps the reply at 20 000 rows
+        silently, and a broad term on a large corpus passes that.
+        """
+        norm_terms = list(dict.fromkeys(tok for t in terms for tok in _search_tokens(t)))
+        if not norm_terms:
+            return []
+        conds, params = [], {}
+        for i, t in enumerate(norm_terms):
+            params[f"t{i}"] = f"%{_like_text(t)}%"
+            # `id` per term too: a per-term seed can win on an id equal to one
+            # term alone (`_score_query`'s singleton tier checks `nid_lower`).
+            for fld in ("norm_label", "source_file", "rationale_norm", "attributes_norm", "id"):
+                conds.append(f"{fld} LIKE :t{i}")
+        joined = " ".join(norm_terms)
+        params["j"] = f"%{_like_text(joined)}%"
+        conds.append("id LIKE :j")
+        return self._run(
+            "SELECT id, label, norm_label, source_file, rationale_norm, attributes_norm, degree "
+            f"FROM Node WHERE {' OR '.join(conds)}", params=params, limit=-1)
+
     def _score(self, terms: list[str], labels: dict | None = None) -> list[tuple[float, str]]:
         """Scored (score, id) over the database; ``labels`` collects each scored node's label."""
         norm_terms = [tok for t in terms for tok in _search_tokens(t)]
@@ -1995,7 +2026,7 @@ class ArcadeDBBackend(GraphBackend):
             params["j"] = f"%{joined}%"
             conds.append("id LIKE :j")
         rows = self._run(
-            f"SELECT id, label, norm_label, source_file, rationale_norm, attributes_norm FROM Node WHERE {' OR '.join(conds)}",
+            f"SELECT id, label, norm_label, source_file FROM Node WHERE {' OR '.join(conds)}",
             params=params,
         )
         scored = []
@@ -2082,11 +2113,15 @@ class ArcadeDBBackend(GraphBackend):
 
     def query(self, question, *, mode="bfs", depth=3, context_filters=None,
               seeds=None, seed_root=None) -> QueryResult:
-        # The refusal reads only the exact tiers, which the upper-tier candidates cover.
-        refused = _query_name_refusal(self._label_candidates(_label_upper_tier_filter(question)), question)
-        if refused:
-            return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
-                               refusal=_refusal(refused))
+        # Given seeds replace the question's keyword matches, so the question is
+        # not checked for an ambiguous name (as in `serve._query_graph_text`).
+        if not seeds:
+            # The refusal reads only the exact tiers, which the upper-tier candidates cover.
+            refused = _query_name_refusal(
+                self._label_candidates(_label_upper_tier_filter(question)), question)
+            if refused:
+                return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
+                                   refusal=_refusal(refused))
         if seeds:
             from graphify.affected import resolve_seed as _rs
             start_nodes: list[str] = []
@@ -2108,44 +2143,32 @@ class ArcadeDBBackend(GraphBackend):
                       "No unique node match for --seed: " + ", ".join(seeds)
                 return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
                                    refusal=_refusal(msg))
-            return self._query_from_seeds_arc(start_nodes, mode=mode, depth=depth,
+            return self._query_from_seeds_arc(question, start_nodes, mode=mode, depth=depth,
                                               context_filters=context_filters, unresolved=unresolved)
         terms = _query_terms(question)
-        # Build a mini-graph of scored candidates so _score_query runs the same
-        # per-term-seed logic as the JSON path. IDF must reflect the WHOLE graph,
-        # not just the candidates, so we pre-fill the cache on the mini-graph
-        # with values from the database (_idf). Degree must also be whole-graph:
-        # a subclass of DiGraph whose .degree() delegates to the stored field.
-        scored_list = self._score(terms)
-        if not scored_list:
+        # `serve._score_query` over a mini-graph of the database's candidates, so
+        # seed choice follows the JSON path (#1445, #1766, #2507, #4357). A node's
+        # score depends only on its own fields, the IDF and its degree; IDF and
+        # degree are whole-graph values, so the mini-graph carries them from the
+        # database instead of counting its own nodes.
+        rows = self._score_candidates(terms)
+        if not rows:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
-        scored_ids = {nid for _, nid in scored_list}
-        # Fetch labels for all candidates in one query
-        lbl_rows = self._run(
-            "SELECT id, label, norm_label, degree, rationale_norm, attributes_norm FROM Node WHERE id_key IN :k",
-            params={"k": [_id_key(n) for n in scored_ids]}, limit=-1)
-        lbl_map = {r["id"]: r for r in lbl_rows}
+        stored_degree = {r["id"]: int(r.get("degree") or 0) for r in rows}
 
         class _MiniGraph(nx.DiGraph):
-            """DiGraph with stored degree and pre-filled IDF cache."""
-            def degree(self_inner, nid=None, weight=None):
-                if nid is None:
-                    return super().degree(weight=weight)
-                return int((lbl_map.get(nid) or {}).get("degree") or 0)
+            def degree(self_inner, nbunch=None, weight=None):
+                if nbunch is None or not isinstance(nbunch, str):
+                    return super().degree(nbunch, weight=weight)
+                return stored_degree.get(nbunch, 0)
 
         S = _MiniGraph()
-        for nid in scored_ids:
-            r = lbl_map.get(nid, {})
-            S.add_node(nid, label=r.get("label", nid), norm_label=r.get("norm_label", ""),
-                       degree=int(r.get("degree") or 0),
-                       rationale_norm=r.get("rationale_norm") or "",
-                       attributes_norm=r.get("attributes_norm") or "")
-        # Pre-fill IDF cache from the database so _score_query uses whole-graph
-        # weights, not mini-graph counts.
-        norm_terms_list = list(dict.fromkeys(
-            tok for t in terms for tok in _search_tokens(t)))
-        S.graph["_idf_cache"] = {t: self._idf(norm_terms_list).get(t, 0.0)
-                                 for t in norm_terms_list}
+        for r in rows:
+            S.add_node(r["id"], **{k: r[k] for k in ("label", "norm_label", "source_file",
+                                                     "rationale_norm", "attributes_norm")
+                                   if r.get(k) is not None})
+        norm_terms = list(dict.fromkeys(tok for t in terms for tok in _search_tokens(t)))
+        S.graph["_idf_cache"] = self._idf(norm_terms)
         qs = _score_query(S, terms, collect_per_term_seeds=True)
         best_seed_by_term = qs.best_seed_by_term
         intent = {t for t in best_seed_by_term if t in _RELATIONAL_INTENT_TERMS}
@@ -2154,12 +2177,12 @@ class ArcadeDBBackend(GraphBackend):
         seeds = _pick_seeds(qs.ranked, G=S, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
         if not seeds:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
-        return self._query_from_seeds_arc(seeds, mode=mode, depth=depth,
+        return self._query_from_seeds_arc(question, seeds, mode=mode, depth=depth,
                                          context_filters=context_filters)
 
-    def _query_from_seeds_arc(self, seeds, *, mode, depth, context_filters=None,
+    def _query_from_seeds_arc(self, question, seeds, *, mode, depth, context_filters=None,
                               unresolved=None) -> QueryResult:
-        question = ""  # only used for context-filter resolution
+        # The question still names the context filter ("who calls X" -> call).
         filters, fsource = _resolve_context_filters(question, context_filters)
         node_attrs, erows = self._neighborhood(seeds, depth)
 
@@ -2255,55 +2278,42 @@ class ArcadeDBBackend(GraphBackend):
                            unresolved=list(unresolved or []))
         return result
 
-    def _candidate_graph_for_seed(self, value: str, seed_root):
-        """Mini-graph for `affected.resolve_seed` over the database.
+    def _candidate_graph_for_seed(self, value: str, seed_root) -> nx.DiGraph:
+        """Mini-graph on which `affected.resolve_seed` answers as on the whole graph.
 
-        ``resolve_seed`` walks the graph by label/id/source_file/contains; each
-        predicate becomes a label-candidates query, so the same resolution that
-        runs on the JSON graph answers on the database. Absolute file paths are
-        anchored at ``seed_root`` (the graph's root) like the CLI.
+        `resolve_seed` tries, in order, the node id, a unique exact label, a
+        unique bare name (`name` for `name()`), a unique file path and a unique
+        label substring; each step needs every match, because it answers only
+        when there is exactly one. The first four are equalities, so they are
+        fetched in full. The substring step needs only "one or several", so it
+        fetches at most three: more than one candidate already means no answer.
+
+        Known gaps, both on labels whose spelling differs only by diacritics or
+        `casefold` (`ß` vs `ss`): `resolve_seed` compares by `casefold`, the
+        database by `norm_label` (diacritics stripped, `lower`). An equality can
+        then miss a node, and the three substring rows can be three that
+        `resolve_seed` rejects, hiding the one it would accept.
         """
-        from pathlib import Path
-        H = nx.DiGraph()
-        # id / exact label / bare name / source_file / contains — in resolve_seed order.
-        candidates: set[str] = set()
-        # id and exact label
+        from graphify.affected import _as_repo_relative
+        q = value.rstrip("/\\") or value
+        norm_q = _strip_diacritics(q).lower()
+        bare = norm_q[:-2] if norm_q.endswith("()") else norm_q
+        paths = list(dict.fromkeys(
+            p for p in (q, _as_repo_relative(q, seed_root)) if p))
+        fields = "id, label, norm_label, source_file, source_location"
         rows = self._run(
-            "SELECT id, label, norm_label, source_file, source_location FROM Node "
-            "WHERE id_key = :k OR norm_label = :l",
-            params={"k": _id_key(value), "l": value.lower()})
-        for r in rows:
-            candidates.add(r["id"])
-        # bare name (label without trailing parens)
-        bare = value.rstrip("()")
-        if bare and bare != value:
-            for r in self._run("SELECT id FROM Node WHERE norm_label = :l",
-                               params={"l": bare.lower()}):
-                candidates.add(r["id"])
-        # repo-relative / absolute source_file
-        sf = value
-        if seed_root and Path(value).is_absolute():
-            try:
-                sf = str(Path(value).relative_to(seed_root)).replace("\\", "/")
-            except ValueError:
-                pass
-        for r in self._run("SELECT id, label, norm_label, source_file, source_location FROM Node "
-                           "WHERE source_file = :sf", params={"sf": sf}):
-            candidates.add(r["id"])
-        # contains (file contains symbol)
-        for r in self._run(
-            "MATCH (f:Node)-[:Rel]->(s:Node) WHERE f.source_file = :sf AND r.relation = 'contains' "
-            "RETURN s.id AS id, s.label AS label, s.norm_label AS norm_label, "
-            "s.source_file AS source_file, s.source_location AS source_location",
-            kind="query", language="cypher", params={"sf": sf}):
-            candidates.add(r["id"])
-        if not candidates:
-            return H
-        for r in self._run("SELECT id, label, norm_label, source_file, source_location, degree FROM Node "
-                           "WHERE id_key IN :k", params={"k": [_id_key(c) for c in candidates]}, limit=-1):
-            H.add_node(r["id"], **{k: r.get(k) for k in
-                                    ("label", "norm_label", "source_file", "source_location")
-                                    if r.get(k) is not None}, degree=int(r.get("degree") or 0))
+            f"SELECT {fields} FROM Node WHERE id_key = :k OR norm_label IN :labels",
+            params={"k": _id_key(q), "labels": list(dict.fromkeys((norm_q, bare, bare + "()")))},
+            limit=-1)
+        for p in paths:
+            rows += self._run(f"SELECT {fields} FROM Node WHERE source_file MATCHES :p",
+                              params={"p": f"(?iu){_fold_rx(p.replace(chr(92), '/'))}"}, limit=-1)
+        rows += self._run(f"SELECT {fields} FROM Node WHERE norm_label LIKE :s LIMIT 3",
+                          params={"s": f"%{_like_text(norm_q)}%"})
+        H = nx.DiGraph()
+        for r in sorted(rows, key=_by_id):
+            H.add_node(r["id"], **{k: r[k] for k in ("label", "norm_label", "source_file",
+                                                     "source_location") if r.get(k) is not None})
         return H
 
     # ---- point lookups ------------------------------------------------------

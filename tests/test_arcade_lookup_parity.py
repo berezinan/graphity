@@ -97,6 +97,15 @@ def _graph() -> nx.MultiDiGraph:
     node("p_callee", "pairCallee()", "p.py", "L2")
     edge("p_caller", "p_callee", "calls")
     G.add_edge("p_caller", "p_callee", relation="references", confidence="INFERRED")
+    # #2293 / #3625: a question word that lives only in rationale or attributes.
+    node("why_node", "throttleGate()", "w.py", "L1",
+         rationale="Exists because the upstream quokka limiter drops bursts.")
+    node("tf_bucket", "aws_s3_bucket.logs", "main.tf", "L5",
+         attributes={"versioning": "zebrafish-retention"})
+    # #1445: one term exact-matches an unrelated node, the other only a substring.
+    node("t_plain", "ledger", "t/a.py", "L1")
+    node("t_sub", "computeMarmotTotals()", "t/b.py", "L1")
+    edge("t_sub", "f_alpha", "calls")
     # #1785: IDF ranks the decoy above the full-token match.
     node("target", "Degenerate Reject-Everything Judge")
     node("decoy", "Rejection Summary")
@@ -290,6 +299,84 @@ def test_parallel_edge_renders_two_lines(backends):
         assert isinstance(n, Neighbors)
         rels = {r.relation for r in n.neighbors}
         assert "calls" in rels and "references" in rels, f"{label} on {b!r}: {rels}"
+
+
+def _query_shape(r):
+    if r.refusal:
+        return ("refused", r.refusal.ambiguous, r.refusal.message)
+    return (r.given, r.seeds, r.unresolved, sorted(n.label for n in r.nodes), r.filters)
+
+
+@pytest.mark.parametrize("question", [
+    "quokka", "zebrafish", "ledger marmot", "who calls sharedThing", "alpha", "run",
+])
+def test_query_seed_choice_agrees(backends, question):
+    """Seed choice follows `_score_query`: per-term guarantee, rationale and
+    attributes tiers, and the context filter the question implies."""
+    jb, arc = backends
+    assert _query_shape(jb.query(question, depth=1)) == _query_shape(arc.query(question, depth=1))
+
+
+def test_rationale_and_attributes_reach_the_answer(backends):
+    _, arc = backends
+    assert arc.query("quokka", depth=1).seeds == ["throttleGate()"]
+    assert arc.query("zebrafish", depth=1).seeds == ["aws_s3_bucket.logs"]
+
+
+@pytest.mark.parametrize("seeds", [
+    ["src_x_run"],                       # node id
+    ["throttleGate"],                    # bare name of `throttleGate()`
+    ["w.py"],                            # file path
+    ["d.py"],                            # several nodes of one file, none an L1 file node
+    ["no_such_node", "throttleGate()"],  # one skipped
+    ["no_such_node"],                    # none: fail closed
+    [".nonce()"],                        # ambiguous: refused
+    ["marmot"],                          # unique label substring
+])
+def test_given_seeds_agree(backends, seeds):
+    jb, arc = backends
+    j = jb.query("anything", depth=1, seeds=seeds)
+    a = arc.query("anything", depth=1, seeds=seeds)
+    assert _query_shape(j) == _query_shape(a)
+
+
+def test_absolute_seed_is_anchored_at_the_graph_root(backends, tmp_path):
+    jb, arc = backends
+    seed = str(tmp_path / "w.py")
+    j = jb.query("q", depth=1, seeds=[seed], seed_root=tmp_path)
+    a = arc.query("q", depth=1, seeds=[seed], seed_root=tmp_path)
+    assert j.seeds == a.seeds == ["throttleGate()"] and j.given and a.given
+
+
+def test_build_commit_survives_load_and_sync(backends, tmp_path):
+    """graph_stats names the build commit on ArcadeDB as on JSON (748de12)."""
+    from graphify.query_backend import render_stats
+    _, arc = backends
+    G = nx.DiGraph()
+    G.add_node("a", label="a", source_file="a.py")
+    data = {**json_graph.node_link_data(G, edges="links"), "built_at_commit": "c0ffee1234567"}
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    host, _, port = arc.base.split("://", 1)[-1].partition(":")
+    other = ArcadeDBBackend(_DB + "_commit", host=host, port=int(port), password=_PW)
+    other.ensure_database(drop=True)
+    try:
+        other.load_from_graph_json(str(p))
+        assert other.graph_stats().built_at_commit == "c0ffee1234567"
+        G.graph["_built_at_commit"] = "deadbeef9999"
+        G.add_node("b", label="b", source_file="b.py")
+        other.sync_graph(G, changed_sources={"b.py"}, pruned_sources=set())
+        s = other.graph_stats()
+        assert s.built_at_commit == "deadbeef9999"
+        assert render_stats(s, head="0123456789") .endswith(
+            "HEAD is 0123456, graph built at deadbee: graph may be stale\n")
+        assert render_stats(JsonBackend(G).graph_stats(), head="deadbeef9999").endswith(
+            "Built at commit: deadbeef9999 (matches HEAD)\n")
+    finally:
+        try:
+            other._server(f"drop database {_DB}_commit")
+        except Exception:
+            pass
 
 
 def test_full_token_endpoint_wins_on_arcadedb(backends):

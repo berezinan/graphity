@@ -2417,7 +2417,13 @@ def _build_server(graph_path: str):
                         _arcade_ctx[path] = ent
             return ent["G"], ent["communities"], ent["backend"]
         resolved_path = str(Path(path).resolve())
-        return _ctx_cache.load(resolved_path, pinned=resolved_path == _default_graph_path)
+        g, comms = _ctx_cache.load(resolved_path, pinned=resolved_path == _default_graph_path)
+        # Fork delta: the tools read through a backend. Cached on the graph like
+        # the trigram index, so a hot reload (a fresh G) never reuses a stale one.
+        be = g.graph.get("_json_backend")
+        if be is None:
+            be = g.graph["_json_backend"] = JsonBackend(g, comms)
+        return g, comms, be
 
     def _resolve_graph_path(project_path) -> str:
         """Map an optional project_path to a concrete graph.json path. ``None``
@@ -2661,7 +2667,13 @@ def _build_server(graph_path: str):
         return render_god_nodes(backend.god_nodes(top_n=int(arguments.get("top_n", 10))))
 
     def _tool_graph_stats(_: dict) -> str:
-        return render_stats(backend.graph_stats())
+        stats = backend.graph_stats()
+        head = None
+        if stats.built_at_commit:
+            # HEAD of the repo holding the graph, the anchor export.to_json stamps from.
+            from graphify.export import _git_head
+            head = _git_head(Path(active_graph_path).parent)
+        return render_stats(stats, head=head)
 
     def _tool_shortest_path(arguments: dict) -> str:
         max_hops = int(arguments.get("max_hops", 8))
