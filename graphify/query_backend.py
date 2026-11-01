@@ -38,6 +38,8 @@ from graphify.serve import (
     _hub_threshold,
     _idf_value,
     _is_ambiguity_refusal,
+    _node_attributes_text,
+    _node_rationale_text,
     _no_scoped_match_message,
     _path_search_graph,
     _pick_scored_endpoint,
@@ -45,8 +47,10 @@ from graphify.serve import (
     _PY_QUALIFIED_RE,
     _query_name_refusal,
     _query_terms,
+    _RELATIONAL_INTENT_TERMS,
     _resolve_path_endpoint,
     _resolve_single_node,
+    _score_query,
     _tier_refusal,
     _resolve_context_filters,
     _score_nodes,
@@ -165,6 +169,7 @@ class GraphStats:
     extracted_pct: int
     inferred_pct: int
     ambiguous_pct: int
+    built_at_commit: str = ""   # commit the graph was built on, empty when unknown
 
 
 @dataclass
@@ -367,8 +372,12 @@ class JsonBackend(GraphBackend):
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
                                refusal=_refusal(refused))
         terms = _query_terms(question)
-        scored = _score_nodes(G, terms)
-        seeds = _pick_seeds(scored)
+        qs = _score_query(G, terms, collect_per_term_seeds=True)
+        best_seed_by_term = qs.best_seed_by_term
+        intent = {t for t in best_seed_by_term if t in _RELATIONAL_INTENT_TERMS}
+        if intent and any(t not in _RELATIONAL_INTENT_TERMS for t in terms):
+            best_seed_by_term = {t: nid for t, nid in best_seed_by_term.items() if t not in intent}
+        seeds = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
         if not seeds:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
         filters, fsource = _resolve_context_filters(question, context_filters)
@@ -520,6 +529,7 @@ class JsonBackend(GraphBackend):
             extracted_pct=round(confs.count("EXTRACTED") / total * 100),
             inferred_pct=round(confs.count("INFERRED") / total * 100),
             ambiguous_pct=round(confs.count("AMBIGUOUS") / total * 100),
+            built_at_commit=str(self.G.graph.get("_built_at_commit") or ""),
         )
 
     def shortest_path(self, source, target, *, max_hops=8, undirected=False) -> PathResult:
@@ -805,8 +815,8 @@ def render_god_nodes(nodes: list[GodNode]) -> str:
     return "\n".join(lines)
 
 
-def render_stats(s: GraphStats) -> str:
-    return (
+def render_stats(s: GraphStats, *, head: str | None = None) -> str:
+    lines = (
         f"Nodes: {s.nodes}\n"
         f"Edges: {s.edges}\n"
         f"Communities: {s.communities}\n"
@@ -814,6 +824,12 @@ def render_stats(s: GraphStats) -> str:
         f"INFERRED: {s.inferred_pct}%\n"
         f"AMBIGUOUS: {s.ambiguous_pct}%\n"
     )
+    if s.built_at_commit:
+        if head and head != s.built_at_commit:
+            lines += f"HEAD is {head[:7]}, graph built at {s.built_at_commit[:7]}: graph may be stale\n"
+        else:
+            lines += f"Graph built at: {s.built_at_commit[:7]}\n"
+    return lines
 
 
 def render_path(p: PathResult, source: str, target: str, max_hops: int = 8) -> str:
@@ -886,7 +902,7 @@ def render_explain(r: ExplainResult | Refusal, label: str, *, max_connections: i
             lines.append(f"  {arrow} {c.label} [{c.relation}] [{c.confidence}]{at}")
         cut = ranked[max_connections:]
         if cut:
-            lines.append(f"  ... and {len(cut)} more")
+            lines.append(f"  ... and {len(cut)} more (--all lists all {len(conns)})")
             # Голое «и ещё N» прячет ответ на вопрос «кто это вызывает» на узле
             # высокой степени и отправляет обратно к grep. Сводим срезанное по
             # файлам — счётчики обязаны сходиться к len(cut).
@@ -1153,6 +1169,14 @@ def _node_doc(nid: str, data: dict, degree: int) -> dict:
     doc["norm_label"] = (data.get("norm_label") or _strip_diacritics(str(data.get("label", "")))).lower()
     doc["degree"] = int(degree)
     doc["id_key"] = _id_key(nid)
+    # Normalised text fields for scoring (#2293, #3625): stored once at load and
+    # kept up to date by sync_graph, so a query never re-derives them at read time.
+    rationale = _node_rationale_text(data)
+    if rationale:
+        doc["rationale_norm"] = rationale
+    attr_norm, _attr_tokens = _node_attributes_text(data)
+    if attr_norm:
+        doc["attributes_norm"] = attr_norm
     return doc
 
 
@@ -1459,6 +1483,10 @@ class ArcadeDBBackend(GraphBackend):
             self._run(";".join(stmts), language="sqlscript")
 
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
+        commit = str(raw.get("built_at_commit") or "")
+        if commit:
+            self._run("DELETE FROM Meta WHERE key = 'built_at_commit'")
+            self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "built_at_commit", "value": commit}, ensure_ascii=False))
         self._replace_community_names(
             {n["community"]: n["community_name"] for n in nodes
              if isinstance(n.get("community"), int) and isinstance(n.get("community_name"), str)},
@@ -1877,6 +1905,10 @@ class ArcadeDBBackend(GraphBackend):
         gods = _god(G, top_n=64)
         self._run("DELETE FROM Meta WHERE key = 'god_nodes'")
         self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "god_nodes", "value": gods}, ensure_ascii=False))
+        commit = str(G.graph.get("_built_at_commit") or "")
+        if commit:
+            self._run("DELETE FROM Meta WHERE key = 'built_at_commit'")
+            self._run("INSERT INTO Meta CONTENT " + json.dumps({"key": "built_at_commit", "value": commit}, ensure_ascii=False))
         # `pruned_stale_sources` is reported apart from `deleted_sources`, not
         # folded into it: the two answer different questions. `deleted_sources`
         # is this run's delta, which the caller already knows; this one is
@@ -1924,7 +1956,7 @@ class ArcadeDBBackend(GraphBackend):
             params["j"] = f"%{joined}%"
             conds.append("id LIKE :j")
         rows = self._run(
-            f"SELECT id, label, norm_label, source_file FROM Node WHERE {' OR '.join(conds)}",
+            f"SELECT id, label, norm_label, source_file, rationale_norm, attributes_norm FROM Node WHERE {' OR '.join(conds)}",
             params=params,
         )
         scored = []
@@ -2015,8 +2047,48 @@ class ArcadeDBBackend(GraphBackend):
         if refused:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
                                refusal=_refusal(refused))
-        scored = self._score(_query_terms(question))
-        seeds = _pick_seeds(scored)
+        terms = _query_terms(question)
+        # Build a mini-graph of scored candidates so _score_query runs the same
+        # per-term-seed logic as the JSON path. IDF must reflect the WHOLE graph,
+        # not just the candidates, so we pre-fill the cache on the mini-graph
+        # with values from the database (_idf). Degree must also be whole-graph:
+        # a subclass of DiGraph whose .degree() delegates to the stored field.
+        scored_list = self._score(terms)
+        if not scored_list:
+            return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
+        scored_ids = {nid for _, nid in scored_list}
+        # Fetch labels for all candidates in one query
+        lbl_rows = self._run(
+            "SELECT id, label, norm_label, degree, rationale_norm, attributes_norm FROM Node WHERE id_key IN :k",
+            params={"k": [_id_key(n) for n in scored_ids]}, limit=-1)
+        lbl_map = {r["id"]: r for r in lbl_rows}
+
+        class _MiniGraph(nx.DiGraph):
+            """DiGraph with stored degree and pre-filled IDF cache."""
+            def degree(self_inner, nid=None, weight=None):
+                if nid is None:
+                    return super().degree(weight=weight)
+                return int((lbl_map.get(nid) or {}).get("degree") or 0)
+
+        S = _MiniGraph()
+        for nid in scored_ids:
+            r = lbl_map.get(nid, {})
+            S.add_node(nid, label=r.get("label", nid), norm_label=r.get("norm_label", ""),
+                       degree=int(r.get("degree") or 0),
+                       rationale_norm=r.get("rationale_norm") or "",
+                       attributes_norm=r.get("attributes_norm") or "")
+        # Pre-fill IDF cache from the database so _score_query uses whole-graph
+        # weights, not mini-graph counts.
+        norm_terms_list = list(dict.fromkeys(
+            tok for t in terms for tok in _search_tokens(t)))
+        S.graph["_idf_cache"] = {t: self._idf(norm_terms_list).get(t, 0.0)
+                                 for t in norm_terms_list}
+        qs = _score_query(S, terms, collect_per_term_seeds=True)
+        best_seed_by_term = qs.best_seed_by_term
+        intent = {t for t in best_seed_by_term if t in _RELATIONAL_INTENT_TERMS}
+        if intent and any(t not in _RELATIONAL_INTENT_TERMS for t in terms):
+            best_seed_by_term = {t: nid for t, nid in best_seed_by_term.items() if t not in intent}
+        seeds = _pick_seeds(qs.ranked, G=S, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
         if not seeds:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
         filters, fsource = _resolve_context_filters(question, context_filters)
@@ -2225,10 +2297,16 @@ class ArcadeDBBackend(GraphBackend):
         rows = self._run("SELECT confidence, count(*) AS c FROM Rel GROUP BY confidence")
         counts = {r.get("confidence") or "EXTRACTED": r["c"] for r in rows}
         total = (e or 1)
+        try:
+            commit_row = self._run("SELECT value FROM Meta WHERE key = 'built_at_commit' LIMIT 1")
+            commit = str(commit_row[0].get("value") or "") if commit_row else ""
+        except RuntimeError:
+            commit = ""
         return GraphStats(nodes=n, edges=e, communities=comm,
                           extracted_pct=round(counts.get("EXTRACTED", 0) / total * 100),
                           inferred_pct=round(counts.get("INFERRED", 0) / total * 100),
-                          ambiguous_pct=round(counts.get("AMBIGUOUS", 0) / total * 100))
+                          ambiguous_pct=round(counts.get("AMBIGUOUS", 0) / total * 100),
+                          built_at_commit=commit)
 
     def _path_endpoint(self, query: str) -> tuple[str | None, list[tuple[float, str]], str | None]:
         """`serve._resolve_path_endpoint` over the database, step for step.

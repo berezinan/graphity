@@ -364,18 +364,26 @@ def _flatten_attr_text(val, parts: list[str]) -> None:
 
 
 def _node_attributes_text(data: dict) -> tuple[str, str]:
-    """The node's `attributes` key-value pairs normalized and tokenized for search."""
+    """The node's `attributes` key-value pairs normalized and tokenized for search.
+
+    A DB-loaded node carries the text pre-normalized as ``attributes_norm``;
+    that takes over when ``attributes`` is absent (#3625).
+    """
     attrs = data.get("attributes")
-    if not isinstance(attrs, dict) or not attrs:
-        return "", ""
-    parts: list[str] = []
-    _flatten_attr_text(attrs, parts)
-    if not parts:
-        return "", ""
-    raw_text = " ".join(parts)
-    norm = _strip_diacritics(raw_text).lower()
-    tokens = " ".join(_search_tokens(norm))
-    return norm, tokens
+    if isinstance(attrs, dict) and attrs:
+        parts: list[str] = []
+        _flatten_attr_text(attrs, parts)
+        if not parts:
+            return "", ""
+        raw_text = " ".join(parts)
+        norm = _strip_diacritics(raw_text).lower()
+        tokens = " ".join(_search_tokens(norm))
+        return norm, tokens
+    pre = data.get("attributes_norm")
+    if pre:
+        norm = str(pre)
+        return norm, " ".join(_search_tokens(norm))
+    return "", ""
 
 
 
@@ -497,10 +505,15 @@ def _node_rationale_text(data: dict) -> str:
     folded, lower-cased) for substring matching. Semantic cleanup writes it as
     one string (several sources joined with blank lines); an extractor may hand
     over a list — join it. Missing or empty -> "" so callers can `if rationale`.
+
+    A DB-loaded node carries the text pre-normalized as ``rationale_norm``;
+    that takes over when ``rationale`` is absent so the ArcadeDB backend feeds
+    the same scoring tier (#2293) without re-deriving it at read time.
     """
     raw = data.get("rationale")
     if not raw:
-        return ""
+        pre = data.get("rationale_norm")
+        return str(pre) if pre else ""
     if isinstance(raw, (list, tuple)):
         raw = " ".join(str(part) for part in raw if part)
     return _strip_diacritics(str(raw)).lower()

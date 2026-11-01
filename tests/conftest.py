@@ -143,7 +143,7 @@ _DEFERRED_BACKEND_PORT = frozenset({
     'tests/test_query_seeds.py::test_query_cli_absolute_seed_uses_the_graph_location_not_cwd',
     'tests/test_query_seeds.py::test_query_cli_logs_the_seeds',
     'tests/test_query_seeds.py::test_query_cli_seed_flag_is_repeatable',
-    'tests/test_truncation_full_answer.py::test_explain_cut_names_the_total_and_the_option',
+    'tests/test_query_seeds.py::test_query_cli_absolute_seed_uses_the_graph_location_not_cwd',
 })
 
 
