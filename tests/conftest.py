@@ -138,12 +138,6 @@ def _pin_json_backend(
 # ports them to both backends in a separate change (upstream-merge-0-9-97, task
 # 6.2). strict: a test that starts passing must drop out of this list.
 _DEFERRED_BACKEND_PORT = frozenset({
-    'tests/test_lookup_exit_codes.py::test_query_ambiguous_seed_exits_ambiguous',
-    'tests/test_lookup_exit_codes.py::test_query_missing_seed_exits_not_found',
-    'tests/test_query_seeds.py::test_query_cli_absolute_seed_uses_the_graph_location_not_cwd',
-    'tests/test_query_seeds.py::test_query_cli_logs_the_seeds',
-    'tests/test_query_seeds.py::test_query_cli_seed_flag_is_repeatable',
-    'tests/test_query_seeds.py::test_query_cli_absolute_seed_uses_the_graph_location_not_cwd',
 })
 
 

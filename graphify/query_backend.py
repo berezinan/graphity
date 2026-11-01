@@ -114,6 +114,8 @@ class QueryResult:
     # The question is itself the exact name of several nodes (#4517): refused
     # like `explain`/`path`, never answered from one of them.
     refusal: Refusal | None = None
+    given: bool = False                    # True when seeds came from --seed
+    unresolved: list[str] = field(default_factory=list)  # --seed values that could not be resolved
 
 
 @dataclass
@@ -325,7 +327,9 @@ class GraphBackend(ABC):
 
     @abstractmethod
     def query(self, question: str, *, mode: str = "bfs", depth: int = 3,
-              context_filters: list[str] | None = None) -> QueryResult: ...
+              context_filters: list[str] | None = None,
+              seeds: list[str] | None = None,
+              seed_root: "Path | None" = None) -> QueryResult: ...
 
     @abstractmethod
     def get_node(self, label: str) -> NodeDetail | Refusal: ...
@@ -365,8 +369,32 @@ class JsonBackend(GraphBackend):
         self.G = G
         self.communities = communities if communities is not None else _communities_from_graph(G)
 
-    def query(self, question, *, mode="bfs", depth=3, context_filters=None) -> QueryResult:
+    def query(self, question, *, mode="bfs", depth=3, context_filters=None,
+              seeds=None, seed_root=None) -> QueryResult:
         G = self.G
+        if seeds:
+            from graphify.affected import resolve_seed as _rs
+            start_nodes: list[str] = []
+            unresolved: list[str] = []
+            ambiguous: list[str] = []
+            for val in seeds:
+                nid = _rs(G, val, seed_root)
+                if nid is None:
+                    ref = _query_name_refusal(G, val)
+                    if ref:
+                        if ref not in ambiguous:
+                            ambiguous.append(ref)
+                    elif val not in unresolved:
+                        unresolved.append(val)
+                elif nid not in start_nodes:
+                    start_nodes.append(nid)
+            if not start_nodes:
+                msg = "\n".join(ambiguous) if ambiguous else \
+                      "No unique node match for --seed: " + ", ".join(seeds)
+                return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
+                                   refusal=_refusal(msg))
+            return self._query_from_seeds(G, question, start_nodes, mode=mode, depth=depth,
+                                          context_filters=context_filters, unresolved=unresolved)
         refused = _query_name_refusal(G, question)
         if refused:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
@@ -380,6 +408,11 @@ class JsonBackend(GraphBackend):
         seeds = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
         if not seeds:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
+        return self._query_from_seeds(G, question, seeds, mode=mode, depth=depth,
+                                      context_filters=context_filters)
+
+    def _query_from_seeds(self, G, question, seeds, *, mode, depth, context_filters=None,
+                          unresolved=None) -> QueryResult:
         filters, fsource = _resolve_context_filters(question, context_filters)
         # Through _traversal_view, exactly as serve._query_graph_text does: on a
         # DiGraph `neighbors()` yields successors only, so a leaf that is merely
@@ -451,13 +484,16 @@ class JsonBackend(GraphBackend):
                         source_file=str(d.get("source_file", "") or ""),
                         source_location=str(d.get("source_location", "") or ""),
                     ))
-        return QueryResult(
+        result = QueryResult(
             mode=mode, depth=depth,
             seeds=[G.nodes[n].get("label", n) for n in seeds],
             total_nodes=len(visited), nodes=node_recs, edges=edge_recs,
             filters=filters, filter_source=fsource,
             graph_nodes=G.number_of_nodes(),
+            given=bool(unresolved is not None),
+            unresolved=list(unresolved or []),
         )
+        return result
 
     def _resolve(self, label: str) -> tuple[str | None, Refusal | None]:
         nid, err = _resolve_single_node(self.G, label)
@@ -667,10 +703,13 @@ def render_query(r: QueryResult, token_budget: int = 2000, *,
         return r.refusal.message
     if not r.seeds:
         return "No matching nodes found."
-    parts = [f"Traversal: {r.mode.upper()} depth={r.depth}", f"Start: {r.seeds}"]
+    seed_label = f"Start (given): {r.seeds}" if r.given else f"Start: {r.seeds}"
+    parts = [f"Traversal: {r.mode.upper()} depth={r.depth}", seed_label]
     filters = r.filters or (list(context_filters) if context_filters else [])
     if filters:
         parts.append(f"Context: {', '.join(filters)} ({r.filter_source})")
+    if r.unresolved:
+        parts.append(f"Unresolved seeds (skipped): {r.unresolved}")
     parts.append(f"{r.total_nodes} nodes found")
     if graph_path:
         from graphify.serve import _display_graph_path
@@ -2041,12 +2080,36 @@ class ArcadeDBBackend(GraphBackend):
                     fdeg[r["id"]] += int(r.get("c") or 0)
         return dict(fdeg)
 
-    def query(self, question, *, mode="bfs", depth=3, context_filters=None) -> QueryResult:
+    def query(self, question, *, mode="bfs", depth=3, context_filters=None,
+              seeds=None, seed_root=None) -> QueryResult:
         # The refusal reads only the exact tiers, which the upper-tier candidates cover.
         refused = _query_name_refusal(self._label_candidates(_label_upper_tier_filter(question)), question)
         if refused:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
                                refusal=_refusal(refused))
+        if seeds:
+            from graphify.affected import resolve_seed as _rs
+            start_nodes: list[str] = []
+            unresolved: list[str] = []
+            ambiguous: list[str] = []
+            for val in seeds:
+                nid = _rs(self._candidate_graph_for_seed(val, seed_root), val, seed_root)
+                if nid is None:
+                    ref = _query_name_refusal(self._label_candidates(_label_upper_tier_filter(val)), val)
+                    if ref:
+                        if ref not in ambiguous:
+                            ambiguous.append(ref)
+                    elif val not in unresolved:
+                        unresolved.append(val)
+                elif nid not in start_nodes:
+                    start_nodes.append(nid)
+            if not start_nodes:
+                msg = "\n".join(ambiguous) if ambiguous else \
+                      "No unique node match for --seed: " + ", ".join(seeds)
+                return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
+                                   refusal=_refusal(msg))
+            return self._query_from_seeds_arc(start_nodes, mode=mode, depth=depth,
+                                              context_filters=context_filters, unresolved=unresolved)
         terms = _query_terms(question)
         # Build a mini-graph of scored candidates so _score_query runs the same
         # per-term-seed logic as the JSON path. IDF must reflect the WHOLE graph,
@@ -2091,6 +2154,12 @@ class ArcadeDBBackend(GraphBackend):
         seeds = _pick_seeds(qs.ranked, G=S, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
         if not seeds:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[])
+        return self._query_from_seeds_arc(seeds, mode=mode, depth=depth,
+                                         context_filters=context_filters)
+
+    def _query_from_seeds_arc(self, seeds, *, mode, depth, context_filters=None,
+                              unresolved=None) -> QueryResult:
+        question = ""  # only used for context-filter resolution
         filters, fsource = _resolve_context_filters(question, context_filters)
         node_attrs, erows = self._neighborhood(seeds, depth)
 
@@ -2179,9 +2248,63 @@ class ArcadeDBBackend(GraphBackend):
                         source_location=str(d.get("source_location", "") or ""),
                     ))
         seed_labels = [node_attrs.get(s, {}).get("label", s) for s in seeds]
-        return QueryResult(mode=mode, depth=depth, seeds=seed_labels, total_nodes=len(visited),
+        result = QueryResult(mode=mode, depth=depth, seeds=seed_labels, total_nodes=len(visited),
                            nodes=nodes_rec, edges=edge_rec, filters=filters, filter_source=fsource,
-                           graph_nodes=self._node_count())
+                           graph_nodes=self._node_count(),
+                           given=bool(unresolved is not None),
+                           unresolved=list(unresolved or []))
+        return result
+
+    def _candidate_graph_for_seed(self, value: str, seed_root):
+        """Mini-graph for `affected.resolve_seed` over the database.
+
+        ``resolve_seed`` walks the graph by label/id/source_file/contains; each
+        predicate becomes a label-candidates query, so the same resolution that
+        runs on the JSON graph answers on the database. Absolute file paths are
+        anchored at ``seed_root`` (the graph's root) like the CLI.
+        """
+        from pathlib import Path
+        H = nx.DiGraph()
+        # id / exact label / bare name / source_file / contains — in resolve_seed order.
+        candidates: set[str] = set()
+        # id and exact label
+        rows = self._run(
+            "SELECT id, label, norm_label, source_file, source_location FROM Node "
+            "WHERE id_key = :k OR norm_label = :l",
+            params={"k": _id_key(value), "l": value.lower()})
+        for r in rows:
+            candidates.add(r["id"])
+        # bare name (label without trailing parens)
+        bare = value.rstrip("()")
+        if bare and bare != value:
+            for r in self._run("SELECT id FROM Node WHERE norm_label = :l",
+                               params={"l": bare.lower()}):
+                candidates.add(r["id"])
+        # repo-relative / absolute source_file
+        sf = value
+        if seed_root and Path(value).is_absolute():
+            try:
+                sf = str(Path(value).relative_to(seed_root)).replace("\\", "/")
+            except ValueError:
+                pass
+        for r in self._run("SELECT id, label, norm_label, source_file, source_location FROM Node "
+                           "WHERE source_file = :sf", params={"sf": sf}):
+            candidates.add(r["id"])
+        # contains (file contains symbol)
+        for r in self._run(
+            "MATCH (f:Node)-[:Rel]->(s:Node) WHERE f.source_file = :sf AND r.relation = 'contains' "
+            "RETURN s.id AS id, s.label AS label, s.norm_label AS norm_label, "
+            "s.source_file AS source_file, s.source_location AS source_location",
+            kind="query", language="cypher", params={"sf": sf}):
+            candidates.add(r["id"])
+        if not candidates:
+            return H
+        for r in self._run("SELECT id, label, norm_label, source_file, source_location, degree FROM Node "
+                           "WHERE id_key IN :k", params={"k": [_id_key(c) for c in candidates]}, limit=-1):
+            H.add_node(r["id"], **{k: r.get(k) for k in
+                                    ("label", "norm_label", "source_file", "source_location")
+                                    if r.get(k) is not None}, degree=int(r.get("degree") or 0))
+        return H
 
     # ---- point lookups ------------------------------------------------------
     def get_node(self, label) -> NodeDetail | Refusal:

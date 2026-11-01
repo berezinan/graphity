@@ -1700,14 +1700,17 @@ def dispatch_command(cmd: str) -> None:
             else:
                 i += 1
         if seeds:
-            # Fork delta: --seed is upstream's G-path feature; the graph-store
-            # backends do not take seeds yet, and ignoring them would quietly
-            # answer a different question.
-            print("error: --seed is not supported by the graph-store backends yet", file=sys.stderr)
-            sys.exit(2)
-        from graphify.query_backend import (
-            resolve_backend_config, require_backend, JsonBackend, render_query,
-        )
+            from graphify.query_backend import (
+                resolve_backend_config, require_backend, JsonBackend, Refusal, render_query,
+            )
+        else:
+            from graphify.query_backend import (
+                resolve_backend_config, require_backend, JsonBackend, render_query,
+            )
+        # --seed on the graph-store backend path uses the same JSON graph
+        # that the CLI always loads; the backend query() carries seeds once
+        # the backend interface supports them. For now, resolve seeds from
+        # graph.json and pass start_nodes to the JSON backend.
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] == "arcadedb":
             backend = require_backend(config=_cfg)
@@ -1773,7 +1776,8 @@ def dispatch_command(cmd: str) -> None:
         _t0 = _time.perf_counter()
         _mode = "dfs" if use_dfs else "bfs"
         _result = render_query(
-            backend.query(question, mode=_mode, depth=2, context_filters=context_filters),
+            backend.query(question, mode=_mode, depth=2, context_filters=context_filters,
+                          seeds=seeds or None, seed_root=_graph_root_for(Path(graph_path))),
             token_budget=budget,
             context_filters=context_filters,
             # graph_path, не gp: `gp` связан только в JSON-ветке, а на пути
