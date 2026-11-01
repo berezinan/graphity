@@ -92,6 +92,8 @@ class EdgeRecord:
     relation: str = ""
     confidence: str = ""
     context: str = ""
+    source_file: str = ""      # relation site (#BUG1), not a def line
+    source_location: str = ""  # shown as `at=<file>:<loc>` in EDGE lines
 
 
 @dataclass
@@ -132,6 +134,8 @@ class NeighborRecord:
     label: str
     relation: str = ""
     confidence: str = ""
+    source_file: str = ""      # relation site (#BUG1)
+    source_location: str = ""
 
 
 @dataclass
@@ -419,23 +423,25 @@ class JsonBackend(GraphBackend):
         edge_recs = []
         for u, v in edges:
             if u in visited and v in visited:
-                d = edge_data(TG, u, v)
-                # (u, v) is visit order, not direction: traversing undirected
-                # walks callers and callees alike, so a caller->callee edge
-                # renders backwards whenever the callee is reached first.
-                # _src/_tgt (stashed by _traversal_view and the query loader)
-                # carry the real direction; trust them only when they name THIS
-                # edge's endpoints, else a stray marker would KeyError below.
-                src, tgt = d.get("_src", u), d.get("_tgt", v)
-                if {src, tgt} != {u, v}:
-                    src, tgt = u, v
-                edge_recs.append(EdgeRecord(
-                    source_label=TG.nodes[src].get("label", src),
-                    target_label=TG.nodes[tgt].get("label", tgt),
-                    relation=str(d.get("relation", "")),
-                    confidence=str(d.get("confidence", "")),
-                    context=str(d.get("context", "") or ""),
-                ))
+                for d in edge_datas(TG, u, v):
+                    # (u, v) is visit order, not direction: traversing undirected
+                    # walks callers and callees alike, so a caller->callee edge
+                    # renders backwards whenever the callee is reached first.
+                    # _src/_tgt (stashed by _traversal_view and the query loader)
+                    # carry the real direction; trust them only when they name THIS
+                    # edge's endpoints, else a stray marker would KeyError below.
+                    src, tgt = d.get("_src", u), d.get("_tgt", v)
+                    if {src, tgt} != {u, v}:
+                        src, tgt = u, v
+                    edge_recs.append(EdgeRecord(
+                        source_label=TG.nodes[src].get("label", src),
+                        target_label=TG.nodes[tgt].get("label", tgt),
+                        relation=str(d.get("relation", "")),
+                        confidence=str(d.get("confidence", "")),
+                        context=str(d.get("context", "") or ""),
+                        source_file=str(d.get("source_file", "") or ""),
+                        source_location=str(d.get("source_location", "") or ""),
+                    ))
         return QueryResult(
             mode=mode, depth=depth,
             seeds=[G.nodes[n].get("label", n) for n in seeds],
@@ -470,17 +476,23 @@ class JsonBackend(GraphBackend):
         rf = relation_filter.lower()
         recs: list[NeighborRecord] = []
         for nb in self.G.successors(nid):
-            d = edge_data(self.G, nid, nb)
-            rel = d.get("relation", "")
-            if rf and rf not in rel.lower():
-                continue
-            recs.append(NeighborRecord(True, self.G.nodes[nb].get("label", nb), str(rel), str(d.get("confidence", ""))))
+            for d in edge_datas(self.G, nid, nb):
+                rel = d.get("relation", "")
+                if rf and rf not in rel.lower():
+                    continue
+                recs.append(NeighborRecord(True, self.G.nodes[nb].get("label", nb), str(rel),
+                                           str(d.get("confidence", "")),
+                                           str(d.get("source_file") or ""),
+                                           str(d.get("source_location") or "")))
         for nb in self.G.predecessors(nid):
-            d = edge_data(self.G, nb, nid)
-            rel = d.get("relation", "")
-            if rf and rf not in rel.lower():
-                continue
-            recs.append(NeighborRecord(False, self.G.nodes[nb].get("label", nb), str(rel), str(d.get("confidence", ""))))
+            for d in edge_datas(self.G, nb, nid):
+                rel = d.get("relation", "")
+                if rf and rf not in rel.lower():
+                    continue
+                recs.append(NeighborRecord(False, self.G.nodes[nb].get("label", nb), str(rel),
+                                           str(d.get("confidence", "")),
+                                           str(d.get("source_file") or ""),
+                                           str(d.get("source_location") or "")))
         return Neighbors(label=self.G.nodes[nid].get("label", nid), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:
@@ -609,17 +621,17 @@ class JsonBackend(GraphBackend):
             return src == nid
 
         for nb in self.G.successors(nid):
-            e = edge_data(self.G, nid, nb)
-            conns.append(Connection(_outgoing(e, nb, True), self.G.nodes[nb].get("label", nb),
-                                    str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
-                                    source_file=str(e.get("source_file", "") or ""),
-                                    source_location=str(e.get("source_location", "") or "")))
+            for e in edge_datas(self.G, nid, nb):
+                conns.append(Connection(_outgoing(e, nb, True), self.G.nodes[nb].get("label", nb),
+                                        str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
+                                        source_file=str(e.get("source_file", "") or ""),
+                                        source_location=str(e.get("source_location", "") or "")))
         for nb in self.G.predecessors(nid):
-            e = edge_data(self.G, nb, nid)
-            conns.append(Connection(_outgoing(e, nb, False), self.G.nodes[nb].get("label", nb),
-                                    str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
-                                    source_file=str(e.get("source_file", "") or ""),
-                                    source_location=str(e.get("source_location", "") or "")))
+            for e in edge_datas(self.G, nb, nid):
+                conns.append(Connection(_outgoing(e, nb, False), self.G.nodes[nb].get("label", nb),
+                                        str(e.get("relation", "")), str(e.get("confidence", "")), self.G.degree(nb),
+                                        source_file=str(e.get("source_file", "") or ""),
+                                        source_location=str(e.get("source_location", "") or "")))
         return ExplainResult(detail=detail, connections=conns)
 
     def pr_impact(self, files) -> tuple[list[int], int]:
@@ -666,9 +678,12 @@ def render_query(r: QueryResult, token_budget: int = 2000, *,
     ]
     for e in r.edges:
         ctx = f" context={sanitize_label(e.context)}" if e.context else ""
+        loc = str(e.source_location or "")
+        at = (f" at={sanitize_label(str(e.source_file or ''))}:{sanitize_label(loc)}"
+              if loc else "")
         lines.append(
             f"EDGE {sanitize_label(e.source_label)} --{sanitize_label(e.relation)} "
-            f"[{sanitize_label(e.confidence)}{ctx}]--> {sanitize_label(e.target_label)}"
+            f"[{sanitize_label(e.confidence)}{ctx}]--> {sanitize_label(e.target_label)}{at}"
         )
     output = "\n".join(lines)
     char_budget = token_budget * 3
@@ -748,7 +763,10 @@ def render_neighbors(n: Neighbors | Refusal, label: str,
     lines = [f"Neighbors of {sanitize_label(n.label)}:"]
     for nb in n.neighbors:
         arrow = "  -->" if nb.outgoing else "  <--"
-        lines.append(f"{arrow} {sanitize_label(nb.label)} [{sanitize_label(nb.relation)}] [{sanitize_label(nb.confidence)}]")
+        loc = str(nb.source_location or "")
+        at = (f" at={sanitize_label(str(nb.source_file or ''))}:{sanitize_label(loc)}"
+              if loc else "")
+        lines.append(f"{arrow} {sanitize_label(nb.label)} [{sanitize_label(nb.relation)}] [{sanitize_label(nb.confidence)}]{at}")
     if token_budget:
         from graphify.serve import _cut_lines_to_budget
         return _cut_lines_to_budget(
@@ -1939,7 +1957,8 @@ class ArcadeDBBackend(GraphBackend):
         # projects null); MATCH binds both endpoints and the edge props.
         erows = self._run(
             "MATCH (a:Node)-[r:Rel]->(b:Node) WHERE a.id_key IN $v AND b.id_key IN $v "
-            "RETURN a.id AS s, b.id AS t, r.relation AS relation, r.confidence AS confidence, r.context AS context",
+            "RETURN a.id AS s, b.id AS t, r.relation AS relation, r.confidence AS confidence, "
+            "r.context AS context, r.source_file AS edge_source_file, r.source_location AS edge_source_location",
             kind="query", language="cypher", params={"v": [_id_key(v) for v in vids]},
         )
         return node_attrs, erows
@@ -2003,15 +2022,19 @@ class ArcadeDBBackend(GraphBackend):
         filters, fsource = _resolve_context_filters(question, context_filters)
         node_attrs, erows = self._neighborhood(seeds, depth)
 
-        # Rebuild the (context-filtered) adjacency locally and run the SAME kernel.
-        H = nx.DiGraph()
+        # MultiDiGraph preserves parallel edges (a pair may carry `contains` and
+        # `calls`); DiGraph would silently collapse them on add_edge (#4500).
+        H = nx.MultiDiGraph()
         for nid, a in node_attrs.items():
             H.add_node(nid, **a)
         fset = set(filters)
         for e in erows:
             if not fset or (e.get("context") in fset):
                 H.add_edge(e["s"], e["t"], relation=e.get("relation", ""),
-                           confidence=e.get("confidence", ""), context=e.get("context") or "")
+                           confidence=e.get("confidence", ""),
+                           context=e.get("context") or "",
+                           source_file=e.get("edge_source_file") or "",
+                           source_location=e.get("edge_source_location") or "")
         # Hub threshold + degree match JsonBackend: over the WHOLE graph's degree
         # distribution (filtered when a context filter is active), not just the
         # fetched neighborhood.
@@ -2075,12 +2098,14 @@ class ArcadeDBBackend(GraphBackend):
         edge_rec = []
         for u, v in edges:
             if u in visited and v in visited and H.has_edge(u, v):
-                d = H[u][v]
-                edge_rec.append(EdgeRecord(
-                    source_label=node_attrs[u].get("label", u), target_label=node_attrs[v].get("label", v),
-                    relation=str(d.get("relation", "")), confidence=str(d.get("confidence", "")),
-                    context=str(d.get("context", "") or ""),
-                ))
+                for d in edge_datas(H, u, v):
+                    edge_rec.append(EdgeRecord(
+                        source_label=node_attrs[u].get("label", u), target_label=node_attrs[v].get("label", v),
+                        relation=str(d.get("relation", "")), confidence=str(d.get("confidence", "")),
+                        context=str(d.get("context", "") or ""),
+                        source_file=str(d.get("source_file", "") or ""),
+                        source_location=str(d.get("source_location", "") or ""),
+                    ))
         seed_labels = [node_attrs.get(s, {}).get("label", s) for s in seeds]
         return QueryResult(mode=mode, depth=depth, seeds=seed_labels, total_nodes=len(visited),
                            nodes=nodes_rec, edges=edge_rec, filters=filters, filter_source=fsource,
@@ -2149,21 +2174,27 @@ class ArcadeDBBackend(GraphBackend):
         rf = relation_filter.lower()
         out = self._run(
             "MATCH (a:Node {id_key:$id})-[r:Rel]->(b:Node) "
-            "RETURN b.id AS nb, b.label AS lbl, r.relation AS relation, r.confidence AS confidence",
+            "RETURN b.id AS nb, b.label AS lbl, r.relation AS relation, r.confidence AS confidence, "
+            "r.source_file AS sf, r.source_location AS sl",
             kind="query", language="cypher", params={"id": _id_key(nid)})
         inc = self._run(
             "MATCH (a:Node)-[r:Rel]->(b:Node {id_key:$id}) "
-            "RETURN a.id AS nb, a.label AS lbl, r.relation AS relation, r.confidence AS confidence",
+            "RETURN a.id AS nb, a.label AS lbl, r.relation AS relation, r.confidence AS confidence, "
+            "r.source_file AS sf, r.source_location AS sl",
             kind="query", language="cypher", params={"id": _id_key(nid)})
         recs = []
         for r in out:
             if rf and rf not in (r.get("relation") or "").lower():
                 continue
-            recs.append(NeighborRecord(True, r.get("lbl", r["nb"]), str(r.get("relation", "")), str(r.get("confidence", ""))))
+            recs.append(NeighborRecord(True, r.get("lbl", r["nb"]), str(r.get("relation", "")),
+                                       str(r.get("confidence", "")),
+                                       str(r.get("sf") or ""), str(r.get("sl") or "")))
         for r in inc:
             if rf and rf not in (r.get("relation") or "").lower():
                 continue
-            recs.append(NeighborRecord(False, r.get("lbl", r["nb"]), str(r.get("relation", "")), str(r.get("confidence", ""))))
+            recs.append(NeighborRecord(False, r.get("lbl", r["nb"]), str(r.get("relation", "")),
+                                       str(r.get("confidence", "")),
+                                       str(r.get("sf") or ""), str(r.get("sl") or "")))
         return Neighbors(label=H.nodes[nid].get("label", nid), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:

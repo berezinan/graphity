@@ -16,7 +16,8 @@ from networkx.readwrite import json_graph
 
 from graphify import arcade_server
 from graphify.query_backend import (
-    ArcadeDBBackend, JsonBackend, Refusal, render_explain, render_neighbors, render_node, render_path,
+    ArcadeDBBackend, JsonBackend, Neighbors, NodeDetail,
+    Refusal, render_explain, render_neighbors, render_node, render_path, render_query,
 )
 
 _MACHINE = arcade_server.read_machine_config()
@@ -257,6 +258,38 @@ def test_parallel_relations_share_one_segment(backends, undirected):
         p = b.shortest_path("pairCaller()", "pairCallee()", undirected=undirected)
         assert p.found and p.segments[0].relation == "calls/references"
         assert p.segments[0].confidence == "EXTRACTED/INFERRED" and p.segments[0].outgoing
+
+
+def test_query_edge_at_suffix_parity(backends):
+    """EDGE lines carry `at=<file>:<loc>` when the edge has source_location."""
+    jb, arc = backends
+    def edge_lines(r):
+        return sorted(l for l in render_query(r).splitlines() if l.startswith("EDGE "))
+    j = jb.query("run()", depth=2)
+    a = arc.query("run()", depth=2)
+    assert edge_lines(j) == edge_lines(a)
+
+
+def test_neighbor_at_suffix_parity(backends):
+    """Neighbor lines carry `at=` when the edge has source_location."""
+    jb, arc = backends
+    def neighbor_lines(r):
+        return sorted(l.strip() for l in render_neighbors(r, "run()").splitlines()
+                      if l.strip().startswith(("-->", "<--")))
+    j = jb.get_neighbors("run()")
+    a = arc.get_neighbors("run()")
+    assert isinstance(j, Neighbors) and isinstance(a, Neighbors)
+    assert neighbor_lines(j) == neighbor_lines(a)
+
+
+def test_parallel_edge_renders_two_lines(backends):
+    """pairCaller–pairCallee carries `calls` and `references`; both must appear."""
+    jb, arc = backends
+    for label, b in (("pairCaller()", jb), ("pairCaller()", arc)):
+        n = b.get_neighbors(label)
+        assert isinstance(n, Neighbors)
+        rels = {r.relation for r in n.neighbors}
+        assert "calls" in rels and "references" in rels, f"{label} on {b!r}: {rels}"
 
 
 def test_full_token_endpoint_wins_on_arcadedb(backends):

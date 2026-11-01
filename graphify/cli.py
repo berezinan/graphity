@@ -2191,7 +2191,11 @@ def dispatch_command(cmd: str) -> None:
             if "links" not in _raw and "edges" in _raw:
                 _raw = dict(_raw, links=_raw["edges"])
             # Force directed so the renderer can recover stored caller→callee direction.
-            _raw = {**_raw, "directed": True}
+            # Force multigraph when the file actually carries parallel edges (#4500):
+            # omitting it silently collapses them on load, then explain misses relations.
+            from graphify.build import has_parallel_links as _hpl
+            _is_multi = _hpl(_raw.get("links"), directed=True)
+            _raw = {**_raw, "directed": True, **({"multigraph": True} if _is_multi else {})}
             try:
                 G = json_graph.node_link_graph(_raw, edges="links")
             except TypeError:
