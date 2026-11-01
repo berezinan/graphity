@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
-from graphify.build import edge_data
+from graphify.build import edge_data, edge_datas
 from graphify.security import sanitize_label
 from graphify.serve import (
     _bfs,
@@ -39,6 +39,7 @@ from graphify.serve import (
     _idf_value,
     _is_ambiguity_refusal,
     _no_scoped_match_message,
+    _path_search_graph,
     _pick_scored_endpoint,
     _pick_seeds,
     _PY_QUALIFIED_RE,
@@ -200,6 +201,105 @@ class Connection:
 class ExplainResult:
     detail: NodeDetail
     connections: list[Connection] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Shortest route, shared by both backends
+# --------------------------------------------------------------------------- #
+def _lexmin_shortest_path(expand, s: str, t: str) -> list[str] | None:
+    """The shortest s→t route, and among equal-length routes the smallest by node ids.
+
+    ``expand(frontier, forward)`` returns, for each node of ``frontier``, its
+    neighbours in the search graph: successors when ``forward``, predecessors
+    otherwise. Both backends search through it, so they pick the same route
+    (#2074) — JSON over the in-memory search graph, ArcadeDB one query batch per
+    BFS level, never enumerating paths.
+
+    Bidirectional: the smaller frontier expands by a full level until the two
+    sides meet. Every parent link of a newly reached node is kept, so the nodes
+    lying on SOME shortest route are known exactly when they meet, and a greedy
+    walk from ``s`` taking the smallest valid id at each step is the
+    lexicographically smallest shortest route. None when ``t`` is unreachable.
+    """
+    if s == t:
+        return [s]
+    ds, dt = {s: 0}, {t: 0}
+    fs, ft = {s}, {t}
+    par_s: dict[str, set[str]] = {}       # node -> its parents one level nearer s
+    kid_t: dict[str, set[str]] = {}       # node -> its children one level nearer t
+    while fs and ft:
+        if len(fs) <= len(ft):
+            frontier, dist, links, forward = fs, ds, par_s, True
+        else:
+            frontier, dist, links, forward = ft, dt, kid_t, False
+        level = dist[next(iter(frontier))] + 1
+        adj = expand(frontier, forward)
+        nxt: set[str] = set()
+        for u in frontier:
+            for x in adj.get(u, ()):
+                if x not in dist:
+                    dist[x] = level
+                    nxt.add(x)
+                if dist[x] == level:
+                    links.setdefault(x, set()).add(u)
+        if forward:
+            fs = nxt
+        else:
+            ft = nxt
+        meet = [x for x in nxt if x in (dt if forward else ds)]
+        if meet:
+            break
+    else:
+        return None
+    length = min(ds[x] + dt[x] for x in meet)
+    pos = {x: ds[x] for x in meet if ds[x] + dt[x] == length}
+    stack = list(pos)
+    while stack:                                  # back toward s
+        x = stack.pop()
+        for p in par_s.get(x, ()):
+            if p not in pos:
+                pos[p] = ds[p]
+                stack.append(p)
+    stack = [x for x in pos if x in dt and ds.get(x, -1) + dt[x] == length]
+    while stack:                                  # on toward t
+        x = stack.pop()
+        for c in kid_t.get(x, ()):
+            if c not in pos:
+                pos[c] = length - dt[c]
+                stack.append(c)
+    kids_s: dict[str, set[str]] = {}
+    for x, parents in par_s.items():
+        for p in parents:
+            kids_s.setdefault(p, set()).add(x)
+    route, cur = [s], s
+    for i in range(1, length + 1):
+        cur = min((x for x in kids_s.get(cur, set()) | kid_t.get(cur, set()) if pos.get(x) == i),
+                  key=str)
+        route.append(cur)
+    return route
+
+
+def _path_segment(u: str, v: str, edges, label: str) -> PathSegment:
+    """One hop of a route, naming every stored relation of the pair (#2074).
+
+    ``edges`` are ``(true_source, relation, confidence)`` for each edge between
+    ``u`` and ``v``. Edges running ``u``→``v`` win; only without them is the hop
+    the reverse of a stored edge (a `contains` walked back, #3878, or any edge
+    under --undirected). As in `serve._shortest_path_text`.
+    """
+    fwd = [e for e in edges if e[0] == u]
+    datas = fwd or [e for e in edges if e[0] != u]
+    return PathSegment(outgoing=bool(fwd),
+                       relation="/".join(sorted({str(r) for _, r, _ in datas if r})),
+                       confidence="/".join(sorted({str(c) for _, _, c in datas if c})),
+                       label=label)
+
+
+def _nx_expand(H: nx.Graph):
+    if H.is_directed():
+        return lambda frontier, forward: {
+            u: list(H.successors(u) if forward else H.predecessors(u)) for u in frontier}
+    return lambda frontier, forward: {u: list(H.neighbors(u)) for u in frontier}
 
 
 # --------------------------------------------------------------------------- #
@@ -442,42 +542,19 @@ class JsonBackend(GraphBackend):
         # Направление — намерение вызывающего, а не свойство загрузки: иначе
         # тот же флаг приходится кодировать дважды, и бэкенды расходятся.
         directed = G.is_directed() and not undirected
-        if directed:
-            # Walk by the stored markers, not the arc order: on a canonicalized
-            # graph a link can be persisted flipped, with `_src`/`_tgt` carrying
-            # the truth (#2309). Searching the raw arcs then reports "no directed
-            # path" for an edge that does point the asked-for way.
-            search_g = nx.DiGraph()
-            search_g.add_nodes_from(G.nodes())
-            for u, v in G.edges():
-                e = edge_data(G, u, v)
-                s, tg = e.get("_src", u), e.get("_tgt", v)
-                if {s, tg} != {u, v}:
-                    s, tg = u, v
-                search_g.add_edge(s, tg)
-        else:
-            search_g = G.to_undirected(as_view=True)
-        try:
-            # All shortest paths, then the lexicographically smallest by node id:
-            # several routes of equal length are common (#2074) and nx returns
-            # whichever adjacency order yields first, so the same question
-            # answered differently between runs under a different hash seed.
-            path_nodes = min(
-                (list(p) for p in nx.all_shortest_paths(search_g, s_id, t_id)),
-                key=lambda p: [str(n) for n in p],
-            )
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
+        # Upstream's search graph: directed by the `_src`/`_tgt` markers (#2309)
+        # plus the implied reverse of every `contains` (#3878), cached on G.
+        # Among equal-length routes the smallest by node ids, so the answer does
+        # not depend on hash seed (#2074) and matches ArcadeDB.
+        path_nodes = _lexmin_shortest_path(
+            _nx_expand(_path_search_graph(G, not directed)), s_id, t_id)
+        if path_nodes is None:
             # "No path at all" and "no path THAT WAY" are different answers, and
             # only the second one is fixed by --undirected. Suggesting the flag
             # for genuinely disconnected nodes sends the caller down a retry that
             # cannot work, so ask the undirected question before choosing.
-            blocked_by_direction = False
-            if directed:
-                try:
-                    nx.shortest_path(G.to_undirected(as_view=True), s_id, t_id)
-                    blocked_by_direction = True
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    pass
+            blocked_by_direction = directed and _lexmin_shortest_path(
+                _nx_expand(_path_search_graph(G, True)), s_id, t_id) is not None
             return PathResult(found=False,
                               reason=("no-path-directed" if blocked_by_direction
                                       else "no-path-directed-none" if directed else "no-path"),
@@ -488,21 +565,18 @@ class JsonBackend(GraphBackend):
         if hops > max_hops:
             return PathResult(found=False, reason=f"too-long:{hops}", warnings=warnings)
         segments: list[PathSegment] = []
-        for i in range(len(path_nodes) - 1):
-            u, v = path_nodes[i], path_nodes[i + 1]
-            d = edge_data(G, u, v) if G.has_edge(u, v) else edge_data(G, v, u)
+        for u, v in zip(path_nodes, path_nodes[1:]):
             # Direction from the stored markers, not from which way the walk
             # crossed the edge: on an undirected load has_edge() is true both
-            # ways, so every segment rendered as outgoing and a caller was shown
-            # as the callee (#2309). Markers are trusted only when they name
-            # this edge's endpoints.
-            src, tgt = d.get("_src", u), d.get("_tgt", v)
-            if {src, tgt} != {u, v}:
-                src, tgt = (u, v) if G.has_edge(u, v) else (v, u)
-            outgoing = src == u
-            segments.append(PathSegment(outgoing=outgoing, relation=d.get("relation", ""),
-                                        confidence=d.get("confidence", ""),
-                                        label=G.nodes[v].get("label", v)))
+            # ways (#2309). A marker is trusted only when it names this pair.
+            edges = []
+            for a, b in ((u, v), (v, u)):
+                if G.has_edge(a, b):
+                    for d in edge_datas(G, a, b):
+                        src = d.get("_src", a)
+                        edges.append((src if src in (u, v) else a,
+                                      d.get("relation"), d.get("confidence")))
+            segments.append(_path_segment(u, v, edges, G.nodes[v].get("label", v)))
         return PathResult(found=True, start_label=G.nodes[s_id].get("label", s_id),
                           hops=hops, segments=segments, warnings=warnings)
 
@@ -2170,50 +2244,73 @@ class ArcadeDBBackend(GraphBackend):
             if len(sc) >= 2 and nid == sc[0][1] and sc[0][0] > 0 \
                     and (sc[0][0] - sc[1][0]) / sc[0][0] < 0.10:
                 warnings.append(f"warning: {name} match was ambiguous (top score {sc[0][0]:g}, runner-up {sc[1][0]:g})")
-        s_label = self._label_of(s_id)
-        # Clamp the variable-length upper bound so an "unlimited" caller can't ask
-        # ArcadeDB for a pathological `*..1000000000` expansion.
-        bound = min(max(max_hops, 1), 64)
-        # Стрелка в шаблоне ребра — это и есть направленность поиска. Без неё
-        # --undirected на этом бэкенде молча игнорировался, и тот же вопрос
-        # получал разные ответы на JSON- и DB-пути.
-        arrow = f"-[:Rel*..{bound}]-" if undirected else f"-[:Rel*..{bound}]->"
-        def _find(edge_pattern: str):
-            rows = self._run(
-                f"MATCH (a:Node {{id_key:$s}}),(b:Node {{id_key:$t}}), "
-                f"p=shortestPath((a){edge_pattern}(b)) RETURN [n IN nodes(p) | n.id] AS ids",
-                kind="query", language="cypher",
-                params={"s": _id_key(s_id), "t": _id_key(t_id)})
-            return rows[0]["ids"] if rows and rows[0].get("ids") else None
-        ids = _find(arrow)
-        if not ids:
+        # Searched in Python, one query batch per BFS level, over the same search
+        # graph as JSON: stored direction plus every `contains` walked back
+        # (#3878). Server-side shortestPath cannot express that — a WHERE on the
+        # path filters the one path it already chose — and it picked an
+        # arbitrary route among equal lengths, so the backends disagreed (#2074).
+        seen: dict[frozenset, set] = {}
+        route = _lexmin_shortest_path(self._path_expand(undirected, seen), s_id, t_id)
+        if route is None:
             # Как на JSON-пути: «нет пути вовсе» и «нет пути в эту сторону» —
             # разные ответы, и только второй лечится флагом --undirected.
-            blocked = bool(not undirected and _find(f"-[:Rel*..{bound}]-"))
+            blocked = not undirected and _lexmin_shortest_path(
+                self._path_expand(True, {}), s_id, t_id) is not None
             reason = ("no-path-directed" if blocked
                       else "no-path-directed-none" if not undirected else "no-path")
-            return PathResult(found=False, reason=reason, start_label=s_label,
+            return PathResult(found=False, reason=reason, start_label=self._label_of(s_id),
                               end_label=self._label_of(t_id), warnings=warnings)
-        hops = len(ids) - 1
+        hops = len(route) - 1
         if hops > max_hops:
             return PathResult(found=False, reason=f"too-long:{hops}", warnings=warnings)
-        segments = []
-        labels = {nid: self._label_of(nid) for nid in ids}
-        for i in range(len(ids) - 1):
-            u, v = ids[i], ids[i + 1]
-            fwd = self._run(
-                "MATCH (a:Node {id_key:$u})-[r:Rel]->(b:Node {id_key:$v}) RETURN r.relation AS relation, r.confidence AS confidence",
-                kind="query", language="cypher", params={"u": _id_key(u), "v": _id_key(v)})
-            if fwd:
-                d, outgoing = fwd[0], True
-            else:
-                back = self._run(
-                    "MATCH (a:Node {id_key:$v})-[r:Rel]->(b:Node {id_key:$u}) RETURN r.relation AS relation, r.confidence AS confidence",
-                    kind="query", language="cypher", params={"u": _id_key(u), "v": _id_key(v)})
-                d, outgoing = (back[0] if back else {}), False
-            segments.append(PathSegment(outgoing=outgoing, relation=d.get("relation", ""),
-                                        confidence=d.get("confidence", ""), label=labels[v]))
-        return PathResult(found=True, start_label=s_label, hops=hops, segments=segments, warnings=warnings)
+        labels = {r["id"]: r.get("label") or r["id"] for r in self._run(
+            "SELECT id, label FROM Node WHERE id_key IN :k",
+            params={"k": [_id_key(n) for n in route]}, limit=-1)}
+        segments = [_path_segment(u, v, seen.get(frozenset((u, v)), ()), labels.get(v, v))
+                    for u, v in zip(route, route[1:])]
+        return PathResult(found=True, start_label=labels.get(s_id, s_id), hops=hops,
+                          segments=segments, warnings=warnings)
+
+    def _path_expand(self, undirected: bool, seen: dict, *, batch: int = 2000):
+        """BFS step over the database for `_lexmin_shortest_path`.
+
+        Each call reads every edge touching the frontier, in both directions,
+        in batches of ``batch`` ids, and files it in ``seen`` under its endpoint
+        pair as ``(source, relation, confidence)`` so the route's segments need
+        no second round trip. A search-graph successor of ``u`` is the target of
+        an edge out of ``u``, or the source of a `contains` into ``u``; a
+        predecessor is the mirror. Undirected, every edge counts both ways.
+        """
+        def fetch(ids: list[str]):
+            # SQL over the id_key index, not Cypher: `MATCH … WHERE a.id_key IN $k`
+            # is planned as a scan of every edge — 4–7 s per BFS level on a
+            # 1.7M-edge database even for one id. `@out`/`@in` are the edge's
+            # source and target; plain `out.id` projects null here.
+            rows = []
+            for i in range(0, len(ids), batch):
+                rows += self._run(
+                    "SELECT @out.id AS s, @in.id AS t, relation AS rel, confidence AS conf "
+                    "FROM (SELECT expand(bothE('Rel')) FROM Node WHERE id_key IN :k)",
+                    params={"k": [_id_key(n) for n in ids[i:i + batch]]}, limit=-1)
+            return rows
+
+        def expand(frontier, forward):
+            adj: dict[str, list[str]] = {}
+            done: set = set()
+            for r in fetch(sorted(frontier)):
+                s, t, rel = r["s"], r["t"], r.get("rel")
+                key = (s, t, rel, r.get("conf"))
+                if key in done:            # an edge inside the frontier comes back twice
+                    continue
+                done.add(key)
+                seen.setdefault(frozenset((s, t)), set()).add((s, rel, r.get("conf")))
+                for u, x, ahead in ((s, t, True), (t, s, False)):
+                    if u not in frontier:
+                        continue
+                    if undirected or ahead == forward or rel == "contains":
+                        adj.setdefault(u, []).append(x)
+            return adj
+        return expand
 
     def _label_of(self, nid: str) -> str:
         rows = self._run("SELECT label FROM Node WHERE id_key = :id LIMIT 1", params={"id": _id_key(nid)})

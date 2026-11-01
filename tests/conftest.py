@@ -140,7 +140,6 @@ def _pin_json_backend(
 _DEFERRED_BACKEND_PORT = frozenset({
     'tests/test_lookup_exit_codes.py::test_query_ambiguous_seed_exits_ambiguous',
     'tests/test_lookup_exit_codes.py::test_query_missing_seed_exits_not_found',
-    'tests/test_path_cli.py::test_path_routes_through_a_contains_edge_to_reach_the_file',
     'tests/test_query_seeds.py::test_query_cli_absolute_seed_uses_the_graph_location_not_cwd',
     'tests/test_query_seeds.py::test_query_cli_logs_the_seeds',
     'tests/test_query_seeds.py::test_query_cli_seed_flag_is_repeatable',

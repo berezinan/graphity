@@ -25,8 +25,9 @@ _PW = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or _MACHINE.get("password") or 
 _DB = "graphify_lookup_parity_test"
 
 
-def _graph() -> nx.DiGraph:
-    G = nx.DiGraph()
+def _graph() -> nx.MultiDiGraph:
+    # Multi, as the `path` CLI loads it: a pair may carry several relations.
+    G = nx.MultiDiGraph()
 
     def node(nid, label, sf="", loc="", **kw):
         G.add_node(nid, label=label, source_file=sf, source_location=loc, **kw)
@@ -74,6 +75,27 @@ def _graph() -> nx.DiGraph:
     edge("src_seats_route", "src_seats_route_readroute", "contains")
     edge("src_admin_route", "src_admin_route_listadmins", "contains")
     edge("src_billing_route_readroute", "src_billing_charge_chargecard", "calls")
+    # #3878: alpha.py imports a symbol that beta.py contains; no file-to-file edge.
+    node("f_alpha", "alpha.py", "alpha.py", "L1")
+    node("f_beta", "beta.py", "beta.py", "L1")
+    node("f_beta_shared", "sharedThing()", "beta.py", "L3")
+    edge("f_alpha", "f_beta_shared", "imports")
+    edge("f_beta", "f_beta_shared", "contains")
+    # #2074: two routes of equal length, the larger id inserted first so graph
+    # order and id order disagree; both backends must print d_mid_a.
+    node("d_start", "diamondStart()", "d.py", "L1")
+    node("d_mid_b", "midB()", "d.py", "L2")
+    node("d_mid_a", "midA()", "d.py", "L3")
+    node("d_end", "diamondEnd()", "d.py", "L4")
+    edge("d_start", "d_mid_b", "calls")
+    edge("d_mid_b", "d_end", "calls")
+    edge("d_start", "d_mid_a", "calls")
+    edge("d_mid_a", "d_end", "calls")
+    # Two relations on one pair: the segment names both.
+    node("p_caller", "pairCaller()", "p.py", "L1")
+    node("p_callee", "pairCallee()", "p.py", "L2")
+    edge("p_caller", "p_callee", "calls")
+    G.add_edge("p_caller", "p_callee", relation="references", confidence="INFERRED")
     # #1785: IDF ranks the decoy above the full-token match.
     node("target", "Degenerate Reject-Everything Judge")
     node("decoy", "Rejection Summary")
@@ -181,6 +203,10 @@ _PATHS = [
     ("src/billing/route.ts::readRoute", "chargeCard"),
     ("Reject-everything judge", "Judge Helper 0"),
     ("pkg.mod.start", "run()"),
+    ("alpha.py", "beta.py"),
+    ("beta.py", "alpha.py"),
+    ("diamondStart()", "diamondEnd()"),
+    ("diamondEnd()", "diamondStart()"),
 ]
 
 
@@ -208,6 +234,29 @@ def test_query_refuses_an_exact_name_tie_like_json(backends, question, refused):
     if refused:
         assert _shape(j.refusal, None) == _shape(a.refusal, None)
         assert j.nodes == a.nodes == []
+
+
+def test_path_walks_contains_back_to_the_file(backends):
+    """#3878 on ArcadeDB: the route closes through the file's `contains` edge."""
+    _, arc = backends
+    out = render_path(arc.shortest_path("alpha.py", "beta.py"), "alpha.py", "beta.py")
+    assert "alpha.py --imports [EXTRACTED]--> sharedThing() <--contains [EXTRACTED]-- beta.py" in out
+
+
+@pytest.mark.parametrize("undirected", [False, True])
+def test_equal_routes_pick_the_smallest_ids(backends, undirected):
+    jb, arc = backends
+    for b in backends:
+        p = b.shortest_path("diamondStart()", "diamondEnd()", undirected=undirected)
+        assert p.found and [s.label for s in p.segments] == ["midA()", "diamondEnd()"]
+
+
+@pytest.mark.parametrize("undirected", [False, True])
+def test_parallel_relations_share_one_segment(backends, undirected):
+    for b in backends:
+        p = b.shortest_path("pairCaller()", "pairCallee()", undirected=undirected)
+        assert p.found and p.segments[0].relation == "calls/references"
+        assert p.segments[0].confidence == "EXTRACTED/INFERRED" and p.segments[0].outgoing
 
 
 def test_full_token_endpoint_wins_on_arcadedb(backends):
