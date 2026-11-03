@@ -160,6 +160,64 @@ rest on few samples.
   hundreds of thousands of candidates and traverse large neighbourhoods in
   the Python kernel. The ERP2 threshold (p95 ≤ 1 s, D12) is at risk.
 
+### 6.5 ERP2 (2026-11-03)
+
+2 019 923 nodes, 4 903 605 links, graph.json 11 047 MB. Machine at the start:
+19.5 GB of 48 GB available (ArcadeDB service, other sessions running).
+
+**Write.** `python snap_writer.py <graph.json> <out>`, graph.json loaded by
+`graph_stream.load` (streams the `nodes` / `links` elements; `json.load`
+peaked at 3x the file on Buh30, ~33 GB here).
+
+| | | D12 |
+|---|---:|---|
+| snapshot | 1 165 MB (10.5 % of graph.json) | ≤ 20 % — pass |
+| load graph.json (streaming) | 263 s | not in the threshold |
+| write from loaded data: normalise (Python) / stats / encode + Rust | 391 s / 107 s / 66 s = **564 s** | ≤ 10 min — pass, 36 s to spare |
+| private bytes: after load / peak while writing | 14.1 GB / 17.6 GB = +25 % | ≤ +50 % — pass |
+| least available system memory | 4.9 GB | — |
+
+Deviation from task 6.5: the writer reads graph.json data in file order
+(D13), not the upstream `G`; `G` on ERP2 (~32 GB) was not built.
+
+**Read.** `bench.py --backends snap,arcade --passes 3`, after the scoring
+fix below. JsonBackend not run: on Buh30 it took up to 9 GB for a 4 GB file,
+~25 GB here against 19.5 GB available (refused for memory, as task 6.5
+allows).
+
+| | snapshot | ArcadeDB | D12 (snapshot) |
+|---|---:|---:|---|
+| cold process, first `query` (`SnapBackend`, Python) | 5.1 s | 386 s (HTTP read timeout at 300 s) | — |
+| cold process, `snap-query` (Rust) p50 / p95 | 387 ms / 4.2 s | — | ≤ 200 ms — **fail** |
+| `query` warm p50 / p95 / max | 135 ms / 20.6 s / 23.9 s | — | p50 ≤ 100 ms, p95 ≤ 1 s — **fail** |
+| `query` with `context_filter` p50 / p95 | 422 ms / 1.7 s | 39 s / 157 s | — |
+| `path` p50 / p95 | 39 ms / 5.3 s | 31 s / 41 s | — |
+| `explain` p50 / p95 | 32 ms / 6.3 s | 30 s / 47 s | — |
+| private bytes, `query` process: after open / end | 42 MB / 612 MB | 39–56 MB | ≤ 100 MB — **fail** at end |
+| open | 0.6–0.7 s (Python imports), 0.5 ms in Rust | 0.7–1.0 s | — |
+
+Where the slow `query` answers spend their time (profile on the query set):
+
+| query kind | example | time | where |
+|---|---|---:|---|
+| exact name of tens of thousands of nodes | `Массив` (20 266), `ПриСозданииНаСервере()` (21 528) | 3–27 s | upstream `_find_node_tiers` + `_query_name_refusal` on the candidate mini-graph: 4–9 s + 3–14 s, to print "Ambiguous" with every rival |
+| god-node seed | `ПустаяСтрока`: 80 045 nodes, 184 186 edges | 14 s | building the answer's records in Python; `_complete_induced_edges` 3.9 s |
+| short Cyrillic words match every node | "…Товары в пути и …" (2 017 507 candidates) | 4.4 s | Rust scoring: 1.8 µs per candidate |
+
+Scoring fix during the run: `Graph::score` resolved block names and decoded
+front-coded ids inside the per-node loop. Hoisting the lookups and testing
+`nid.lower() == term` with bitsets from the sorted id permutation took the
+worst `snap-query` from 19.1 s to 3.7 s and its median from 169 to 118 ms;
+parity tests unchanged (109 pass). The remaining cost is scoring every
+candidate; only a different algorithm (e.g. pruning by an upper bound on the
+score) removes it.
+
+Upstream reproduces these costs on the full graph: `_is_searchable` keeps
+one- and two-letter Cyrillic words (it drops only short Latin ones), the
+ambiguity message lists every rival, and a hub seed expands in full. The
+snapshot removes the load (402 s on Buh30 for JsonBackend), not the per-query
+work of the upstream functions it calls.
+
 ### 6.2 `snap-query` (Rust, no interpreter), psn_diadoc
 
 `python snap_query_check.py <graph.snap> <qset.json> 5`.

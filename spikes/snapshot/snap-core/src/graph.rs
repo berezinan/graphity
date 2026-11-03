@@ -189,8 +189,14 @@ impl Graph {
     /// `_score_query` over the snapshot. `w[k]` is `idf.get(terms[k], 1.0)`,
     /// `cov[m]` is `(m / n_terms) ** 2` -- both computed in Python so the
     /// float values are CPython's.
+    /// Search column `f` resolved once: per-node codes and the string pool.
+    fn scol(&self, f: usize) -> (&[u32], Pool<'_>) {
+        (self.u32s(&format!("n.s.{}", SEARCH[f])), self.pool(&format!("s.{}", SEARCH[f])).unwrap())
+    }
+
     pub fn score(&self, terms: &[&[u8]], w: &[f64], joined: &[u8], jw: f64, cov: &[f64], collect: bool) -> ScoreOut {
-        let mut bits = vec![0u64; self.n.div_ceil(64)];
+        let words = self.n.div_ceil(64);
+        let mut bits = vec![0u64; words];
         let mut needles: Vec<&[u8]> = terms.to_vec();
         if !joined.is_empty() {
             needles.push(joined);
@@ -198,10 +204,36 @@ impl Graph {
         for f in [S_NL, 2, 3, 5, 6, 7] {
             self.mark(f, Mode::Substring, &needles, &mut bits);
         }
-        self.mark_ids("lower", Mode::Equal, &needles, &mut bits);
+        // `nid.lower() == x` for each needle, from the sorted id permutation:
+        // no id is decoded in the loop below.
+        let id_eq: Vec<Vec<u64>> = needles
+            .iter()
+            .map(|nd| {
+                let mut b = vec![0u64; words];
+                self.mark_ids("lower", Mode::Equal, &[*nd], &mut b);
+                for (x, y) in bits.iter_mut().zip(&b) {
+                    *x |= *y;
+                }
+                b
+            })
+            .collect();
+        let has = |b: &[u64], i: usize| b[i / 64] >> (i % 64) & 1 == 1;
+        let joined_k = terms.len();
 
         let finders: Vec<memmem::Finder> = terms.iter().map(|t| memmem::Finder::new(t)).collect();
-        let (lt_f, src_f, rat_f, atn_f, att_f) = (2, 3, 5, 6, 7);
+        let col = |f: usize| self.scol(f);
+        let (nl_c, nl_p) = col(S_NL);
+        let (lt_c, lt_p) = col(2);
+        let (src_c, src_p) = col(3);
+        let (rat_c, rat_p) = col(5);
+        let (atn_c, atn_p) = col(6);
+        let (att_c, att_p) = col(7);
+        fn get<'a>(c: &[u32], p: &Pool<'a>, i: usize) -> &'a [u8] {
+            match c[i] {
+                0 => b"",
+                x => p.get(x as usize - 1),
+            }
+        }
         let degq = self.u32s("n.degq");
         let llen = self.u32s("n.llen");
         let rank = self.u32s("n.idrank");
@@ -210,18 +242,16 @@ impl Graph {
         let mut best: Vec<Option<(f64, u32)>> = vec![None; terms.len()];
         for i in drain(&bits) {
             let i_us = i as usize;
-            let nl = self.sget(S_NL, i_us);
+            let nl = get(nl_c, &nl_p, i_us);
             let bare = rstrip_parens(nl);
-            let lt = self.sget(lt_f, i_us);
-            let src = self.sget(src_f, i_us);
-            let rat = self.sget(rat_f, i_us);
-            let atn = self.sget(atn_f, i_us);
-            let att = self.sget(att_f, i_us);
-            let nid_lower_buf = if !joined.is_empty() || collect { self.key_lower(i_us) } else { Vec::new() };
-            let nid_lower: &[u8] = &nid_lower_buf;
+            let lt = get(lt_c, &lt_p, i_us);
+            let src = get(src_c, &src_p, i_us);
+            let rat = get(rat_c, &rat_p, i_us);
+            let atn = get(atn_c, &atn_p, i_us);
+            let att = get(att_c, &att_p, i_us);
             let mut score = 0.0f64;
             if !joined.is_empty() {
-                if joined == nl || joined == bare || joined == lt || joined == nid_lower {
+                if joined == nl || joined == bare || joined == lt || has(&id_eq[joined_k], i_us) {
                     score += 1000.0 * 10.0 * jw;
                 } else if nl.starts_with(joined) || bare.starts_with(joined) || lt.starts_with(joined) {
                     score += 100.0 * 10.0 * jw;
@@ -262,7 +292,7 @@ impl Graph {
                 }
                 tiered += tier_value;
                 if collect {
-                    let mut singleton = if t == nl || t == bare || t == lt || t == nid_lower {
+                    let mut singleton = if t == nl || t == bare || t == lt || has(&id_eq[k], i_us) {
                         1000.0 * 10.0 * wk
                     } else if nl.starts_with(t) || bare.starts_with(t) || lt.starts_with(t) {
                         100.0 * 10.0 * wk

@@ -293,17 +293,64 @@ def _peak_memory() -> dict:
         return {}
 
 
+class _MemWatch:
+    """Samples this process's private bytes and the system's available memory."""
+
+    def __init__(self, every: float = 1.0):
+        import threading
+        import psutil
+        self._p, self._vm = psutil.Process(), psutil.virtual_memory
+        self.peak_private = 0
+        self.min_available = None
+        self._stop = threading.Event()
+        self._every = every
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def sample(self) -> int:
+        priv = self._p.memory_info().private
+        avail = self._vm().available
+        self.peak_private = max(self.peak_private, priv)
+        self.min_available = avail if self.min_available is None else min(self.min_available, avail)
+        return priv
+
+    def _run(self):
+        while not self._stop.wait(self._every):
+            self.sample()
+
+    def __enter__(self):
+        self.sample()
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._t.join()
+        self.sample()
+
+
 def main(argv: list[str]) -> int:
+    import graph_stream
     src, out_dir = Path(argv[1]), Path(argv[2])
-    mem0 = _peak_memory()
-    t = time.perf_counter()
-    with open(src, encoding="utf-8") as f:
-        data = json.load(f)
-    load_s = time.perf_counter() - t
-    mem_loaded = _peak_memory()
-    report = publish_snapshot(data, out_dir, source=src)
+    mb = lambda b: round(b / 2**20, 1)
+    with _MemWatch() as mw:
+        mem0 = _peak_memory()
+        t = time.perf_counter()
+        data = graph_stream.load(src)
+        load_s = time.perf_counter() - t
+        mem_loaded = _peak_memory()
+        after_load_private = mw.sample()
+        peak_during_load = mw.peak_private
+        mw.peak_private = after_load_private
+        report = publish_snapshot(data, out_dir, source=src)
     report["times"]["json_load"] = load_s
-    report["memory"] = {"start": mem0, "after_json_load": mem_loaded, "end": _peak_memory()}
+    report["memory"] = {
+        "start": mem0, "after_json_load": mem_loaded, "end": _peak_memory(),
+        "private_after_load_mb": mb(after_load_private),
+        "peak_private_during_load_mb": mb(peak_during_load),
+        "peak_private_during_write_mb": mb(mw.peak_private),
+        "write_growth_over_data_pct": round((mw.peak_private / after_load_private - 1) * 100, 1),
+        "min_system_available_mb": mb(mw.min_available),
+    }
     print(json.dumps(report, indent=2))
     return 0
 
