@@ -1,0 +1,13 @@
+[package]
+name = "graphify_snap"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "graphify_snap"
+crate-type = ["cdylib"]
+
+[dependencies]
+snap-core = { path = "../snap-core" }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }

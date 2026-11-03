@@ -1,0 +1,8 @@
+target/
+.venv/
+*.snap
+*.snap.tmp
+*.snap.lock
+*.pyd
+__pycache__/
+out/

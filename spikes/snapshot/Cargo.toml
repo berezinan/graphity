@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["snap-core", "graphify_snap", "snap-query"]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+publish = false
+
+[profile.release]
+debug = 1
