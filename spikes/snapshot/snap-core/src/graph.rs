@@ -148,7 +148,7 @@ impl Graph {
                 let hit = match mode {
                     Mode::Equal => k.as_slice() == *nd,
                     Mode::Prefix => k.starts_with(nd),
-                    Mode::Substring => panic!("ids support equal / prefix only"),
+                    Mode::Substring | Mode::Bare => panic!("ids support equal / prefix only"),
                 };
                 if !hit {
                     break;

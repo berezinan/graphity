@@ -129,7 +129,7 @@ class _TG:
         out = self._nbrs.get(n)
         if out is None:
             be = self._be
-            out = [be._id(j) for j in be.snap.tneighbors(be._idx[n], self._f)]
+            out = be._ids_of(be.snap.tneighbors(be._idx[n], self._f))
             self._nbrs[n] = out
         return out
 
@@ -233,6 +233,16 @@ class SnapBackend(GraphBackend):
             self._idx[nid] = i
         return nid
 
+    def _ids_of(self, idx) -> list[str]:
+        """Ids of many nodes, decoding the missing ones in one call."""
+        ids = self._ids
+        missing = [i for i in idx if i not in ids]
+        if missing:
+            for i, nid in zip(missing, self.snap.node_ids(missing)):
+                ids[i] = nid
+                self._idx[nid] = i
+        return [ids[i] for i in idx]
+
     def _val(self, kind, field, code):
         key = (kind, field, code)
         try:
@@ -265,7 +275,12 @@ class SnapBackend(GraphBackend):
         return self._node(i).get("label", self._id(i))
 
     # ---- name resolution (mini-graph of candidates) ----------------------------
-    def _tier_graph(self, label: str, *, substring: bool = False) -> nx.DiGraph:
+    def _tier_graph(self, label: str, level: str = "prefix") -> nx.DiGraph:
+        """Mini-graph holding every node `_find_node_tiers` can place in the
+        tiers up to `level` ("exact": source_exact + exact, "prefix": also
+        prefix, "substring": all four), in graph.json order. A node's tier
+        depends only on its own fields, so the upstream function answers on
+        this superset exactly as on the whole graph for those tiers."""
         term = " ".join(_search_tokens(label))
         nq = _strip_diacritics(str(label)).lower().strip()
         needles = {term, nq}
@@ -281,22 +296,32 @@ class SnapBackend(GraphBackend):
         cand: set[int] = set()
         snap = self.snap
         if needles:
-            for f in ("nl", "lt"):
-                cand.update(snap.match_nodes(f, "prefix", needles))
-                if substring:
-                    cand.update(snap.match_nodes(f, "substring", needles))
-            cand.update(snap.match_ids("lower", "prefix", needles))
+            # exact tier: norm_label / bare_label / label_tokens / id equal
+            cand.update(snap.match_nodes("nl", "bare", needles))
+            cand.update(snap.match_nodes("lt", "equal", needles))
+            cand.update(snap.match_ids("lower", "equal", needles))
             cand.update(snap.match_ids("norm", "equal", needles))
+            if level in ("prefix", "substring"):
+                for f in ("nl", "lt"):
+                    cand.update(snap.match_nodes(f, "prefix", needles))
+                cand.update(snap.match_ids("lower", "prefix", needles))
+            if level == "substring":
+                for f in ("nl", "lt"):
+                    cand.update(snap.match_nodes(f, "substring", needles))
         if term:
             cand.update(snap.match_nodes("st", "equal", [term]))
+        order = sorted(cand)
         H = nx.DiGraph()
-        H.add_nodes_from((self._id(i), self._node(i)) for i in sorted(cand))
+        H.add_nodes_from(zip(self._ids_of(order), (self._node(i) for i in order)))
         return H
 
     def _resolve(self, label: str) -> tuple[str | None, Refusal | None]:
-        H = self._tier_graph(label)
-        if not any(_find_node_tiers(H, label)[:3]):
-            H = self._tier_graph(label, substring=True)
+        H = self._tier_graph(label, "exact")
+        tiers = _find_node_tiers(H, label)
+        if not (tiers[0] or tiers[1]):
+            H = self._tier_graph(label, "prefix")
+            if not any(_find_node_tiers(H, label)[:3]):
+                H = self._tier_graph(label, "substring")
         nid, err = _resolve_single_node(H, label)
         return nid, (_refusal(err) if err else None)
 
@@ -335,7 +360,7 @@ class SnapBackend(GraphBackend):
         self._begin()
         if seeds:
             raise NotImplementedError(UNSUPPORTED[0])
-        refused = _query_name_refusal(self._tier_graph(question), question)
+        refused = _query_name_refusal(self._tier_graph(question, "exact"), question)
         if refused:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
                                refusal=_refusal(refused))
@@ -496,7 +521,7 @@ class SnapBackend(GraphBackend):
     def _path_endpoint(self, query: str):
         """`serve._resolve_path_endpoint`, tiers on the candidate mini-graph,
         scoring over the whole snapshot."""
-        H = self._tier_graph(query)
+        H = self._tier_graph(query, "exact")
         source_exact, exact, _, _ = _find_node_tiers(H, query)
         hits = source_exact or exact
         if hits:

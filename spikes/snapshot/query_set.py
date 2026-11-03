@@ -21,9 +21,31 @@ def report_questions(graph_json: Path, limit: int = 10) -> list[str]:
     return qs[:limit]
 
 
-def build(raw: dict, graph_json: Path | None, god_labels: list[str]) -> dict:
+def labels_of(raw: dict) -> list:
+    return [n.get("label") for n in raw["nodes"]]
+
+
+def labels_of_snapshot(sb) -> list:
+    """Node labels in graph.json order, read from the snapshot's label column."""
+    import json
+    codes = memoryview(sb.snap.block_bytes("n.v.label")).cast("I")
+    cache: dict[int, object] = {}
+    out = []
+    for c in codes:
+        if not c:
+            out.append(None)
+            continue
+        v = cache.get(c)
+        if v is None:
+            v = cache[c] = json.loads(sb.snap.value("n", "label", c))
+        out.append(v)
+    return out
+
+
+def build(labels: list, graph_json: Path | None, god_labels: list[str]) -> dict:
+    """`labels`: every node's label in graph.json order (None when absent)."""
     rnd = random.Random(SEED)
-    labels = [n["label"] for n in raw["nodes"] if isinstance(n.get("label"), str) and n["label"].strip()]
+    labels = [l for l in labels if isinstance(l, str) and l.strip()]
     pick = lambda k: rnd.sample(labels, min(k, len(labels)))
     queries = (report_questions(graph_json) if graph_json else []) + god_labels + pick(30)
     return {

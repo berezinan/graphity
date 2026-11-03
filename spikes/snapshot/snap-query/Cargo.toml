@@ -6,3 +6,4 @@ publish.workspace = true
 
 [dependencies]
 snap-core = { path = "../snap-core" }
+unicode-normalization = "0.1"

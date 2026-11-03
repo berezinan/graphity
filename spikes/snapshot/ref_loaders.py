@@ -12,6 +12,10 @@ from graphify.build import has_parallel_links
 
 
 def _links(raw: dict) -> dict:
+    """Own copy of the `graph` dict: `node_link_graph` stores it as `G.graph`
+    itself, and JsonBackend caches into `G.graph`. The CLI loads a fresh file
+    per process; graphs built from one shared dict would share those caches."""
+    raw = dict(raw, graph=dict(raw.get("graph") or {}))
     if "links" not in raw and "edges" in raw:
         raw = dict(raw, links=raw["edges"])
     return raw

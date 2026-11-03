@@ -129,6 +129,9 @@ pub enum Mode {
     Substring,
     Prefix,
     Equal,
+    /// The string is the needle followed only by `(` / `)`:
+    /// `s.rstrip("()") == needle` for a needle that does not end in a paren.
+    Bare,
 }
 
 impl Mode {
@@ -137,6 +140,7 @@ impl Mode {
             "substring" => Mode::Substring,
             "prefix" => Mode::Prefix,
             "equal" => Mode::Equal,
+            "bare" => Mode::Bare,
             _ => return None,
         })
     }
@@ -165,7 +169,7 @@ impl<'a> Pool<'a> {
     /// Ascending, deduplicated indices of the strings matching `needle`.
     pub fn matching(&self, needle: &[u8], mode: Mode) -> Vec<u32> {
         let n = self.len();
-        if needle.is_empty() && mode != Mode::Equal {
+        if needle.is_empty() && matches!(mode, Mode::Substring | Mode::Prefix) {
             return (0..n as u32).collect();
         }
         let mut pat = Vec::with_capacity(needle.len() + 2);
@@ -186,7 +190,10 @@ impl<'a> Pool<'a> {
                 // The match starts on the NUL in front of the string.
                 _ => self.which(p + 1),
             };
-            if j < n && out.last() != Some(&(j as u32)) {
+            let keep = j < n
+                && (mode != Mode::Bare
+                    || self.get(j)[needle.len()..].iter().all(|&b| b == b'(' || b == b')'));
+            if keep && out.last() != Some(&(j as u32)) {
                 out.push(j as u32);
             }
             // Prefix / equality patterns start with the separator they share
@@ -262,6 +269,17 @@ mod tests {
         assert_eq!(p.matching(b"", Mode::Equal), vec![3]);
         assert_eq!(p.matching(b"o", Mode::Substring), vec![0, 1, 2, 4]);
         assert_eq!(p.matching(b"zz", Mode::Substring), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn bare_mode() {
+        let mut b = PoolBuilder::new(false);
+        for w in ["foo", "foo()", "foo(x)", "foobar", "foo)(", "xfoo()", "fo()"] {
+            b.push(w.as_bytes()).unwrap();
+        }
+        let p = Pool { blob: &b.blob, off: &b.off };
+        assert_eq!(p.matching(b"foo", Mode::Bare), vec![0, 1, 4]);
+        assert_eq!(p.matching(b"fo", Mode::Bare), vec![6]);
     }
 
     #[test]

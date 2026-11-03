@@ -28,7 +28,12 @@ def graphs(psn_data):
 @pytest.fixture(scope="module")
 def qset(psn_data, graphs):
     gods = [g.label for g in JsonBackend(graphs["mcp"]).god_nodes(top_n=10)]
-    return query_set.build(psn_data, PSN, gods)
+    return query_set.build(query_set.labels_of(psn_data), PSN, gods)
+
+
+def test_query_set_from_snapshot_matches_raw(psn_data, psn_snap, qset):
+    gods = [g.label for g in psn_snap.god_nodes(top_n=10)]
+    assert query_set.build(query_set.labels_of_snapshot(psn_snap), PSN, gods) == qset
 
 
 # ---- 2.2 / 2.3: lossless round trip ---------------------------------------- #

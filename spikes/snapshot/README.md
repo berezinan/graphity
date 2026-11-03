@@ -100,6 +100,95 @@ stand reported 1 223 "mismatches": BFS answers order their EDGE lines by a
 hash-ordered set (upstream `serve._bfs_core`), so two processes can print the
 same answer in different orders. JsonBackend has the same property.
 
+### 6.1 / 6.4 psn_diadoc: snapshot vs JsonBackend vs ArcadeDB (2026-11-03)
+
+`python bench.py run <graph.json> <graph.snap> <out> [--passes N]`. One
+subprocess per backend and command, `PYTHONHASHSEED=0` in every child.
+JsonBackend loads graph.json the way that CLI command does (`ref_loaders.py`).
+"Cold process" is spawn to first answer, OS file cache warm (the shell is not
+elevated, so the standby list could not be flushed: no cold-cache numbers).
+Warm figures are over 4 more passes of the same set (`--passes 5`); ArcadeDB
+one pass.
+
+| | snapshot | JsonBackend | ArcadeDB |
+|---|---:|---:|---:|
+| cold process, first `query` | 1.2–1.5 s | 14.5–16.8 s | 24.4–26.7 s |
+| of which open (imports + backend init) | 0.6 s | 3.1–4.1 s | 0.6–0.7 s |
+| `query` warm p50 / p95 | 15 / 520 ms | 30 / 2 100 ms | 600 / 23 000 ms |
+| `query` with `context_filter` p50 / p95 | 16 / 80 ms | 600–670 / 1 900 ms | 2 080 / 9 500 ms |
+| `path` p50 / p95 | 3 / 55 ms | 1.1 / 38 ms | 560 / 3 800 ms |
+| `explain` p50 / p95 | 2.5 / 9 ms | 0.6 / 14 ms | 580 / 960 ms |
+| private bytes at end | 35–62 MB | 320–470 MB | 39–78 MB |
+| answers equal to JsonBackend | 112 / 112 | — | 49 / 112 |
+
+- Warm `path` and `explain` are faster on JsonBackend once its graph is in
+  memory: each snapshot record crosses PyO3 and its values are JSON-decoded.
+- ArcadeDB answers differ from JsonBackend on 28 of 47 `query`, 19 of 30
+  `path` and 16 of 30 `explain`; not investigated in this spike.
+- Reproducibility (two runs, `--passes 5`): identical answers; p50 spread
+  3 % (snapshot) and 7 % (JsonBackend) for `query`, 1 % / 11 % with a context
+  filter, but 22 % for snapshot `path` (3.7 vs 2.9 ms) and 19 % for
+  JsonBackend `explain` (0.65 vs 0.52 ms). Below ~4 ms the 10 % criterion of
+  task 6.1 is not met.
+
+### 6.4 Buh30: snapshot vs JsonBackend vs ArcadeDB (2026-11-03)
+
+885 006 nodes, 1 716 200 links, graph.json 4 094 MB. One run, `--budget 300`
+s per backend and command, one pass. JsonBackend answered only the items
+that fit the budget (4 of 40 `query`, 6 of 30 `path`), so its percentiles
+rest on few samples.
+
+| | snapshot | JsonBackend | ArcadeDB |
+|---|---:|---:|---:|
+| snapshot size | 505 MB (11.8 % of graph.json) | — | — |
+| write: json.load / normalise / encode + Rust / total | 161 s / 191 s / 43 s / 247 s (+161) | — | — |
+| writer peak working set | 12.3 GB (all of it `json.load`) | — | — |
+| open | 0.6–0.7 s | 72–119 s | 0.6–0.8 s |
+| cold process, first answer: `query` / `path` / `explain` | 2.8 / 2.0 / 7.1 s | 402 / 337 / 336 s | timeout / 27 / 18 s |
+| `query` p50 / p95 / max | 44 ms / 4.1 s / 13.1 s | 5.1 s / 9.7 s (n=3) | first query > 300 s, HTTP read timeout |
+| `query` with `context_filter` p50 / p95 | 137 / 660 ms | 205 / 570 ms | 10.3 / 13.0 s |
+| `path` p50 / p95 | 106 / 900 ms | 425 ms / 55 s (n=5) | 13.2 / 27.4 s |
+| `explain` p50 / p95 | 18 ms / 2.2 s | 138 ms / 2.5 s | 13.3 / 17.0 s |
+| private bytes at end | 45–382 MB | 5.6–9.0 GB | 43–68 MB |
+| answers equal to JsonBackend (items both answered) | 45 / 45 | — | 7 / 34 |
+
+- JsonBackend's first answer costs ~4.5 minutes beyond the load: the
+  trigram index (`serve._get_trigram_index`) is built on first use.
+- Snapshot `query` private bytes reach 382 MB: the Python-side caches of
+  `SnapBackend` (decoded nodes, ids). The Rust side holds no copy.
+- Snapshot `query` p95 4.1 s and max 13.1 s: broad labels on Buh30 score
+  hundreds of thousands of candidates and traverse large neighbourhoods in
+  the Python kernel. The ERP2 threshold (p95 ≤ 1 s, D12) is at risk.
+
+### 6.2 `snap-query` (Rust, no interpreter), psn_diadoc
+
+`python snap_query_check.py <graph.snap> <qset.json> 5`.
+
+| | |
+|---|---:|
+| tokenisation vs `_query_terms` + `_search_tokens` | 0 mismatches on 137 queries |
+| cold process (spawn, open, score, exit), 50 runs | p50 152 ms, p95 269 ms |
+| of which open | 0.46 ms |
+| in-process open + df + score | p50 116 ms, p95 227 ms |
+
+`snap-query` answers with the combined ranking only (no seed picking, no
+traversal, no rendering); it bounds the start-up cost of a native reader.
+
+### 6.3 Are the ArcadeDB databases comparable? (2026-11-03)
+
+`python arcade_check.py <graph.json> ...`: graph.json counted by streaming
+its lines, the database by `count(*)` over HTTP. Read-only.
+
+| project | graph.json | nodes / links in graph.json | database | nodes / edges in database | comparable |
+|---|---:|---|---|---|---|
+| psn_diadoc | 155 MB | 40 988 / 96 315 | `proj_psn_diadoc_4_67_3_pravka_f7b6d35e` | 40 988 / 96 315 | yes |
+| Buh30 | 4 094 MB | 885 006 / 1 716 200 | `proj_buh30_c2bb55ef` | 885 006 / 1 716 200 | yes |
+| ERP2 | 11 047 MB | 2 019 923 / 4 903 605 | `proj_erp2_e368a057` | 2 019 923 / 4 903 605 | yes |
+
+Equal counts do not prove equal content. The ERP2 database was not reloaded
+from the 6.18 GB file the design table mentions; its counts match the
+current 11 GB graph.json.
+
 ### Size and write time, psn_diadoc (40 988 nodes, 96 315 links, graph.json 155.5 MB)
 
 | | |
