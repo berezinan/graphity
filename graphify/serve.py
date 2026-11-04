@@ -7,7 +7,7 @@ import re
 import sys
 import warnings
 from array import array
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
 import threading
 from typing import NamedTuple
@@ -2033,7 +2033,8 @@ def _ambiguity_message(G: nx.Graph, label: str, rivals: list[str]) -> str:
     # nest a path-scoped one (`index.ts::foo()`) behind a second path.
     symbol = G.nodes[rivals[0]].get("label") or label
     sources = [str(G.nodes[r].get("source_file") or "") for r in rivals]
-    if any(sources.count(src) > 1 for src in sources if src):
+    # Counted once: `sources.count` per rival was quadratic (~6 s for 20 k rivals).
+    if any(c > 1 for src, c in Counter(sources).items() if src):
         # The same path in two repos: `<path>::symbol` matches both, so it would be a
         # dead end. Only the node id tells them apart.
         retry = ("Retry with the full node id: the same path exists in more than one repo, "

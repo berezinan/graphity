@@ -2088,3 +2088,61 @@ def test_query_graph_text_surfaces_parallel_relationships(tmp_path):
     text = _query_graph_text(G, "applySeed", token_budget=2000)
     assert "--contains " in text, text
     assert "--calls " in text, text
+
+
+# --- _ambiguity_message: linear repeated-path check (fork) ---
+
+def _quadratic_ambiguity_message(G, label, rivals):
+    """The implementation before the linear check, kept as the reference."""
+    from graphify.serve import _AMBIGUOUS
+    several_repos = len({str(G.nodes[r].get("repo") or "") for r in rivals}) > 1
+
+    def where(r):
+        source = G.nodes[r].get("source_file") or ""
+        repo = G.nodes[r].get("repo")
+        return f"{repo}/{source}" if several_repos and repo and source else source
+
+    listing = "\n".join(f"  {where(r) or r}\n    id: {r}" for r in rivals)
+    symbol = G.nodes[rivals[0]].get("label") or label
+    sources = [str(G.nodes[r].get("source_file") or "") for r in rivals]
+    if any(sources.count(src) > 1 for src in sources if src):
+        retry = ("Retry with the full node id: the same path exists in more than one repo, "
+                 "so a path cannot tell them apart.")
+    else:
+        retry = (f"Retry with path::symbol using one of the paths above (e.g. "
+                 f"<path>::{symbol}) or the full node id.")
+    return (
+        f"{_AMBIGUOUS}'{label}' matches {len(rivals)} nodes in different files.\n"
+        f"{listing}\n"
+        f"{retry}"
+    )
+
+
+@pytest.mark.parametrize("repos", [None, ("r1", "r1", "r2"), ("r1", "r2", "r3")])
+@pytest.mark.parametrize("files", [("a.py", "b.py", "c.py"), ("a.py", "a.py", "c.py"),
+                                   ("", "a.py", ""), ("", "", "")])
+def test_ambiguity_message_matches_quadratic_reference(repos, files):
+    from graphify.serve import _ambiguity_message
+    G = nx.DiGraph()
+    for k, f in enumerate(files):
+        attrs = {"label": "foo()", "source_file": f}
+        if repos:
+            attrs["repo"] = repos[k]
+        G.add_node(f"n{k}", **attrs)
+    rivals = list(G.nodes)
+    assert _ambiguity_message(G, "foo", rivals) == _quadratic_ambiguity_message(G, "foo", rivals)
+
+
+def test_ambiguity_message_is_linear_in_rivals():
+    """20 266 nodes share `Массив` on ERP2; the quadratic check took ~6 s there."""
+    import time
+    from graphify.serve import _ambiguity_message
+    G = nx.DiGraph()
+    for k in range(20_000):
+        G.add_node(f"n{k}", label="Массив", source_file=f"src/m{k}.bsl")
+    rivals = list(G.nodes)
+    t = time.perf_counter()
+    msg = _ambiguity_message(G, "Массив", rivals)
+    assert time.perf_counter() - t < 1.0
+    assert msg.endswith("or the full node id.")
+
