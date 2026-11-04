@@ -2146,3 +2146,24 @@ def test_ambiguity_message_is_linear_in_rivals():
     assert time.perf_counter() - t < 1.0
     assert msg.endswith("or the full node id.")
 
+
+# --- short Cyrillic words are not query terms (fork) ---
+
+@pytest.mark.parametrize("question, expected", [
+    ("Товары в пути и на складе", ["товары", "пути", "складе"]),
+    ("1с в", ["1с"]),                    # mixed characters stay
+    ("в и", []),                         # never reach the stopword fallback, as "in of"
+    ("in of", []),
+    ("in of form", ["form"]),            # Latin rule unchanged
+    ("Ёж ӑӑ ԯ", []),                     # Cyrillic Supplement and Ё are Cyrillic too
+])
+def test_query_terms_drop_short_cyrillic_words(question, expected):
+    assert _query_terms(question) == expected
+
+
+def test_explain_still_resolves_short_cyrillic_name():
+    from graphify.serve import _resolve_single_node
+    G = nx.DiGraph()
+    G.add_node("os", label="ОС", source_file="src/os.bsl")
+    G.add_node("other", label="Товары", source_file="src/t.bsl")
+    assert _resolve_single_node(G, "ОС") == ("os", None)

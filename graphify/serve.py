@@ -249,9 +249,17 @@ def _segment_chinese(text: str) -> list[str]:
 
 
 def _is_searchable(term: str) -> bool:
-    """True if term is Chinese, non-English, or an English word longer than 2 chars."""
+    """True if term is Chinese, non-English, or an English word longer than 2 chars.
+
+    One- and two-letter Cyrillic words ("в", "и", "на") are dropped like short
+    English ones: they substring-match nearly every Cyrillic label, so a question
+    such as "Товары в пути и на складе" scored 2 017 507 candidates on a 2.02 M
+    node 1C graph. Mixed words ("1с") and other scripts keep the old rule.
+    """
     if all("a" <= ch <= "z" for ch in term):
         return len(term) > 2
+    if len(term) <= 2 and all("Ѐ" <= ch <= "ԯ" for ch in term):
+        return False
     return True
 
 
