@@ -114,6 +114,11 @@ def _graph() -> nx.MultiDiGraph:
         node(f"e{i}", f"Everything Widget {i}")
     edge("target", "j0", "verified_by")
     edge("decoy", "e0", "mentions")
+    # Short Cyrillic words are not query terms; "в"/"и" sit inside both labels.
+    node("c_goods", "ТоварыНаСкладах", "src/goods.bsl", "L1")
+    node("c_kind", "ВидНоменклатуры", "src/kind.bsl", "L1")
+    node("c_os", "ОС", "src/os.bsl", "L1")
+    edge("c_goods", "c_kind", "calls")
     return G
 
 
@@ -159,7 +164,7 @@ _LABELS = [
     ".nonce()", "src/x.ts::.nonce()", "src/x.ts", "src_x_betaclient_nonce",
     ".close()", "EntityManagerInterface", "mailcontroller", "EmailController",
     "pkg.mod.start", "pkg2.util.helper", "pkg2.util:helper", "f()",
-    "NoSuchSymbolXyz", "src/a.ts::NotThere",
+    "NoSuchSymbolXyz", "src/a.ts::NotThere", "ОС",
 ]
 
 _EXPECTED_KIND = {
@@ -309,6 +314,7 @@ def _query_shape(r):
 
 @pytest.mark.parametrize("question", [
     "quokka", "zebrafish", "ledger marmot", "who calls sharedThing", "alpha", "run",
+    "товары в пути и на складе", "в и",
 ])
 def test_query_seed_choice_agrees(backends, question):
     """Seed choice follows `_score_query`: per-term guarantee, rationale and
