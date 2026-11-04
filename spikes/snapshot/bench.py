@@ -79,6 +79,9 @@ def _answer(b, kind: str, item) -> str:
 
 def child(a) -> int:
     sys.path.insert(0, str(HERE))
+    import spike_patches
+    if not a.upstream_tokens:
+        spike_patches.apply()   # same tokenisation for every backend (2026-11-04)
     items = json.loads(Path(a.qset).read_text(encoding="utf-8"))[a.kind]
     mem0 = _mem()
     t = time.perf_counter()
@@ -142,13 +145,13 @@ def _qset(graph_json: Path, snap: Path, out_dir: Path) -> Path:
     return path
 
 
-def _spawn(backend, kind, graph_json, snap, qset, out, budget, passes=1) -> dict:
+def _spawn(backend, kind, graph_json, snap, qset, out, budget, passes=1, upstream_tokens=False) -> dict:
     env = dict(os.environ, PYTHONHASHSEED="0", PYTHONIOENCODING="utf-8")
     env.pop("GRAPHIFY_GRAPH_STORE", None)
     # No -I: it implies -E, which ignores PYTHONHASHSEED and PYTHONIOENCODING.
     cmd = [sys.executable, str(Path(__file__).resolve()), "child", backend, kind,
            str(graph_json), str(snap), str(qset), str(out), "--budget", str(budget),
-           "--passes", str(passes)]
+           "--passes", str(passes)] + (["--upstream-tokens"] if upstream_tokens else [])
     t0 = time.perf_counter()
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
                          encoding="utf-8")
@@ -176,7 +179,7 @@ def run(a) -> int:
         for kind in a.kinds.split(","):
             out = out_dir / f"{a.tag}_{backend}_{kind}.json"
             r = _spawn(backend, kind, graph_json, snap, qset, out, a.budget,
-                       1 if backend == "arcade" else a.passes)
+                       1 if backend == "arcade" else a.passes, a.upstream_tokens)
             results.append(r)
             brief = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()
                      if k in ("backend", "kind", "n", "open_s", "cold_process_ms", "first_ms", "p50_ms",
@@ -215,6 +218,8 @@ def main(argv) -> int:
     r.add_argument("--tag", default="run")
     r.add_argument("--passes", type=int, default=1,
                    help="passes over the item set (snap and json; arcade always 1)")
+    r.add_argument("--upstream-tokens", action="store_true",
+                   help="keep upstream _is_searchable (default: spike_patches rule)")
     c = sub.add_parser("child")
     c.add_argument("backend")
     c.add_argument("kind")
@@ -224,6 +229,7 @@ def main(argv) -> int:
     c.add_argument("out")
     c.add_argument("--budget", type=float, default=300.0)
     c.add_argument("--passes", type=int, default=1)
+    c.add_argument("--upstream-tokens", action="store_true")
     a = ap.parse_args(argv[1:])
     return run(a) if a.cmd == "run" else child(a)
 

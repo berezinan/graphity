@@ -8,6 +8,11 @@ from networkx.readwrite import json_graph
 SPIKE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPIKE))
 
+import spike_patches  # noqa: E402
+
+# Same tokenisation for JsonBackend and SnapBackend in every test (2026-11-04).
+spike_patches.apply()
+
 PSN = Path(r"C:\_dev\ANB\AI\psn_diadoc_4_67_3_Pravka\graphify-out\graph.json")
 
 
@@ -35,3 +40,18 @@ def psn_data():
 def psn_snap(psn_data, tmp_path_factory):
     d = tmp_path_factory.mktemp("psn")
     return snap_of(psn_data, d)
+
+
+@pytest.fixture(scope="session")
+def graphs_psn(psn_data):
+    import ref_loaders
+    return ref_loaders.query_graph(psn_data)
+
+
+@pytest.fixture(scope="session")
+def qset_psn(psn_data):
+    import query_set
+    import ref_loaders
+    from graphify.query_backend import JsonBackend
+    gods = [g.label for g in JsonBackend(ref_loaders.mcp_graph(psn_data)).god_nodes(top_n=10)]
+    return query_set.build(query_set.labels_of(psn_data), PSN, gods)

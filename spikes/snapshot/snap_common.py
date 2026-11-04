@@ -9,6 +9,8 @@ import inspect
 from graphify import analyze, prs, serve
 from graphify import query_backend as qb
 
+import spike_patches
+
 # Hot value columns. Every other attribute goes to COLD as JSON, losslessly.
 NODE_FIELDS = ["label", "norm_label", "source_file", "source_location", "community",
                "community_name", "file_type", "_origin"]
@@ -56,6 +58,15 @@ PORT_FUNCS = (
     serve._resolve_path_scoped_symbol, serve._resolve_python_qualified,
     serve._communities_from_graph, serve._read_graph, prs.compute_pr_impact,
     analyze.god_nodes,
+    # 2026-11-04: Rust tiers + upstream refusal helpers on the winning tier,
+    # Rust `_complete_induced_edges`, light node dicts for the seed helpers.
+    serve._resolve_single_node, serve._query_name_refusal, serve._tier_refusal,
+    # `serve._ambiguity_message` is guarded through UPSTREAM_AMBIGUITY below:
+    # after spike_patches.apply() the module attribute is the spike's copy.
+    serve._rivals_across_files, serve._near_miss_message,
+    serve._same_file_ambiguity_message, serve._complete_induced_edges,
+    serve._pick_seeds, serve._pick_scored_endpoint, serve._query_terms,
+    spike_patches.UPSTREAM, spike_patches.UPSTREAM_AMBIGUITY,
 )
 
 
@@ -64,7 +75,7 @@ def port_hash() -> str:
 
 
 # Recorded when the port was written (graphify 0.9.97, staging 8d9526c3).
-PORT_HASH = "20c5bfa2f18370dfb173230f90e0c87f5ce24632a8f4939d2eb4b5aa78e2dea1"
+PORT_HASH = "36fb223f052d7ae0d49fd59f4843ae7abd13424d0cc4678c8e5f83064a8e053a"
 
 
 class Unsupported(ValueError):

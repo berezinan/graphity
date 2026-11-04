@@ -28,7 +28,7 @@ def labels_of(raw: dict) -> list:
 def labels_of_snapshot(sb) -> list:
     """Node labels in graph.json order, read from the snapshot's label column."""
     import json
-    codes = memoryview(sb.snap.block_bytes("n.v.label")).cast("I")
+    codes = sb._ncol["label"]
     cache: dict[int, object] = {}
     out = []
     for c in codes:

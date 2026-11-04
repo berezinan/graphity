@@ -218,6 +218,46 @@ ambiguity message lists every rival, and a hub seed expands in full. The
 snapshot removes the load (402 s on Buh30 for JsonBackend), not the per-query
 work of the upstream functions it calls.
 
+### 6.5b Re-run after the 2026-11-04 fixes
+
+Fixes, none of which changes the output (parity re-checked, 121 tests):
+
+- `_find_node_tiers` tiers computed in Rust with the upstream predicates;
+  the upstream refusal / message helpers run on the winning tier only.
+- `_complete_induced_edges` and the merged edge attributes of the answer in
+  Rust, in upstream order.
+- Hot columns read through zero-copy buffers over the mapping; bounded caches.
+- Spike-only, applied to JsonBackend and SnapBackend alike
+  (`spike_patches.py`, decided 2026-11-04): one- and two-letter Cyrillic
+  words are not query terms; `serve._ambiguity_message`'s quadratic
+  `sources.count` replaced by a `Counter` (byte-identical message, tested).
+
+| | ERP2 before | ERP2 after | Buh30 after | D12 (ERP2) |
+|---|---:|---:|---:|---|
+| cold process, first `query` (`SnapBackend`) | 5.1 s | 1.3 s | 1.8 s | — |
+| `snap-query` cold process p50 / p95 | 387 ms / 4.2 s | 288 / 516 ms | — | ≤ 200 ms — fail |
+| `query` warm p50 / p95 / max | 135 ms / 20.6 s / 23.9 s | 37 ms / 4.4 s / 8.6 s | 15 ms / 1.4 s | p50 pass, p95 fail |
+| `query` with `context_filter` p50 / p95 | 422 ms / 1.7 s | 43 / 659 ms | 17 / 66 ms | — |
+| `path` p50 / p95 | 39 ms / 5.3 s | 13 / 138 ms | 15 / 201 ms | — |
+| `explain` p50 / p95 | 32 ms / 6.3 s | 13 / 146 ms | 10 / 81 ms | — |
+| private bytes, `query` process after the set | 612 MB | 135 MB | 87 MB | ≤ 100 MB — fail |
+
+Buh30, same items on JsonBackend (`--budget 600`): 105 / 105 answers equal.
+JsonBackend there: open 64–109 s, first answer 4–6 min, `query` p50 218 ms,
+private bytes 5.6–10.0 GB.
+
+`snap-query` time is the query, not the start: open 0.42 ms, the rest is
+`df` + scoring of short-term candidate sets (the ≤ 200 ms threshold was
+meant as initialisation cost).
+
+What still exceeds 1 s on ERP2, all upstream behaviour reproduced exactly:
+
+| query | time | where |
+|---|---:|---|
+| `ПустаяСтрока` (hub: 80 045 nodes, 184 186 edges in the answer) | 6–8 s | records for 80 k nodes + `render_query` (1.5 M `sanitize_label` calls) before cutting to the 2 000-token budget |
+| `ОткрытьФорму`, `ПоказатьВопрос` (hubs, 37–46 k nodes) | 3–4 s | same |
+| `Массив`, `ПриСозданииНаСервере()` (20–21 k nodes share the name) | ~1 s | Ambiguous message of 4.3 MB / 40 k lines, built in Python |
+
 ### 6.2 `snap-query` (Rust, no interpreter), psn_diadoc
 
 `python snap_query_check.py <graph.snap> <qset.json> 5`.

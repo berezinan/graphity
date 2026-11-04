@@ -11,11 +11,19 @@ emulates (D13):
 - `shortest_path`: the CLI `path` loader (MultiDiGraph / MultiGraph, markers).
 - `graph_stats`, `god_nodes`, `get_community`: `_read_graph` (MCP).
 
-Name resolution runs the upstream functions on a mini-graph of candidates in
-graph.json order (as `ArcadeDBBackend` does). Traversal runs the upstream
-kernels `_bfs_core` / `_dfs_core` over neighbours from Rust (decision
-2026-11-03: the BFS frontier is a hash-ordered set, so only the Python kernel
-reproduces its edge order).
+Name resolution: for an ordinary label the tiers of `_find_node_tiers` come
+from Rust (`Snap.tiers`, same predicates), and the upstream refusal and
+message functions run on a mini-graph of the winning tier only. A label with
+`::` or a dotted Python symbol runs the upstream functions on a mini-graph of
+candidates (as `ArcadeDBBackend` does). Traversal runs the upstream kernels
+`_bfs_core` / `_dfs_core` over neighbours from Rust (the BFS frontier is a
+hash-ordered set, so only the Python kernel reproduces its edge order);
+`_complete_induced_edges` and the answer's edge attributes are computed in
+Rust with the upstream order (decision 2026-11-04: speed-ups must not change
+the output).
+
+Hot columns are read through zero-copy views of the mapping
+(`Snap.view`), so the process holds decoded values only in bounded caches.
 
 Not reproduced natively, refused or marked xfail(strict): `query --seed`
 (`affected.resolve_seed`), `god_nodes(top_n)` beyond the stored list, and the
@@ -56,10 +64,11 @@ from graphify.serve import (
     _QueryScores,
     _RELATIONAL_INTENT_TERMS,
     _bfs_core,
-    _complete_induced_edges,
     _dfs_core,
     _find_node_tiers,
     _idf_value,
+    _is_ambiguity_refusal,
+    _near_miss_message,
     _no_scoped_match_message,
     _pick_scored_endpoint,
     _pick_seeds,
@@ -79,7 +88,13 @@ UNSUPPORTED = (
     "query(seeds=...): --seed resolves through affected.resolve_seed, not ported",
     "god_nodes(top_n) beyond the stored list",
 )
-_CACHE_LIMIT = 200_000
+# Bounded caches: cleared at the start of a request once over the limit.
+_ID_CACHE = 50_000
+_NODE_CACHE = 10_000
+_VAL_CACHE = 50_000
+_NONE = 0xFFFFFFFF
+_EDGE_FIELDS = ("relation", "confidence", "context", "source_file", "source_location")
+_LIGHT_FIELDS = ("label", "norm_label", "source_file", "source_location")
 
 
 class _Ranked(Sequence):
@@ -99,19 +114,36 @@ class _Ranked(Sequence):
         return (self._s[k], self._be._id(self._i[k]))
 
 
-class _LazyNodes:
+class _LazyIds(Sequence):
+    """Node ids of an index list, decoded on access (`_near_miss_message`
+    reads only the first few and the length)."""
+
+    def __init__(self, be: "SnapBackend", idx):
+        self._be, self._idx = be, idx
+
+    def __len__(self):
+        return len(self._idx)
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            return self._be._ids_of(self._idx[k])
+        return self._be._id(self._idx[k])
+
+
+class _LightNodes:
+    """`G.nodes[nid]` for the upstream helpers that read only hot fields
+    (`_pick_seeds`, `_pick_scored_endpoint`; see snap_common.PORT_FUNCS)."""
+
     def __init__(self, be):
         self._be = be
 
     def __getitem__(self, nid):
-        return self._be._node(self._be._idx[nid])
+        return self._be._light(self._be._idx[nid])
 
 
 class _Duck:
-    """What `_pick_seeds` / `_pick_scored_endpoint` read from G: `G.nodes[nid]`."""
-
     def __init__(self, be):
-        self.nodes = _LazyNodes(be)
+        self.nodes = _LightNodes(be)
 
 
 class _TG:
@@ -120,7 +152,6 @@ class _TG:
     def __init__(self, be: "SnapBackend", fcodes):
         self._be, self._f = be, fcodes
         self._nbrs: dict[str, list[str]] = {}
-        self.nodes = _LazyNodes(be)
 
     def is_directed(self):
         return False
@@ -134,21 +165,16 @@ class _TG:
         return out
 
     def degree(self, n):
-        return self._be.snap.tdegree(self._be._idx[n], self._f)
+        be = self._be
+        if self._f is None:
+            return be._degt[be._idx[n]]
+        return be.snap.tdegree(be._idx[n], self._f)
 
     def hub_threshold(self):
         return self._be.snap.hub_threshold(self._f)
 
-    def edges(self, nbunch):
-        # nx.Graph.edges(nbunch): each pair once, at its first endpoint in nbunch order.
-        seen = set()
-        for n in nbunch:
-            for nbr in self.neighbors(n):
-                if nbr not in seen:
-                    yield (n, nbr)
-            seen.add(n)
-
     def pair_data(self, u, v) -> dict:
+        """Merged attributes of the pair (tests; the query path uses pair_codes)."""
         be = self._be
         d: dict = {}
         for j in be.snap.pair_links(be._idx[u], be._idx[v]):
@@ -194,9 +220,19 @@ class SnapBackend(GraphBackend):
                 self._contains = c
         self._cids = {c: k for k, c in enumerate(self._stats["cids"])}
         self._duck = _Duck(self)
+        view = lambda name, fmt: memoryview(snap.view(name)).cast(fmt)
+        self._ncol = {f: view(f"n.v.{f}", "I") for f in ("label", "norm_label", "source_file",
+                                                         "source_location", "community")}
+        self._lcol = {f: view(f"l.v.{f}", "I") for f in _EDGE_FIELDS}
+        self._lsrc, self._ltgt = view("l.src", "I"), view("l.tgt", "I")
+        self._ooff, self._olink = view("o.off", "Q"), view("o.link", "I")
+        self._ioff, self._ilink = view("i.off", "Q"), view("i.link", "I")
+        self._degt = view("n.degt", "I")
+        self._coff, self._cmem = view("c.off", "Q"), view("c.mem", "I")
+        self._cold_repo: bool | None = None
 
     def _begin(self):
-        """Per request: follow a newer generation, re-check staleness."""
+        """Per request: follow a newer generation, re-check staleness, bound caches."""
         gen = graphify_snap.peek_generation(str(self._path))
         if gen is not None and gen != self.snap.generation:
             for _ in range(3):
@@ -205,8 +241,13 @@ class SnapBackend(GraphBackend):
                     break
                 except OSError:
                     continue
-        if len(self._ncache) > _CACHE_LIMIT:
+        if len(self._ids) > _ID_CACHE:
+            self._ids.clear()
+            self._idx.clear()
+        if len(self._ncache) > _NODE_CACHE:
             self._ncache.clear()
+        if len(self._vcache) > _VAL_CACHE:
+            self._vcache.clear()
         self.stale_warning = None
         if self._graph_json is not None:
             try:
@@ -251,6 +292,24 @@ class SnapBackend(GraphBackend):
             v = self._vcache[key] = json.loads(self.snap.value(kind, field, code))
             return v
 
+    def _nget(self, i: int, field: str, default=None):
+        """`G.nodes[nid].get(field, default)` for a hot node field."""
+        c = self._ncol[field][i]
+        return self._val("n", field, c) if c else default
+
+    def _lget(self, j: int, field: str, default=None):
+        c = self._lcol[field][j]
+        return self._val("l", field, c) if c else default
+
+    def _label(self, i: int) -> str:
+        """`G.nodes[nid].get("label", nid)`."""
+        c = self._ncol["label"][i]
+        return self._val("n", "label", c) if c else self._id(i)
+
+    def _light(self, i: int) -> dict:
+        """The hot fields the upstream message and seed helpers read."""
+        return {f: self._val("n", f, c) for f in _LIGHT_FIELDS if (c := self._ncol[f][i])}
+
     def _node(self, i: int) -> dict:
         d = self._ncache.get(i)
         if d is None:
@@ -267,20 +326,57 @@ class SnapBackend(GraphBackend):
         if cold:
             d.update(json.loads(cold))
         if markers:
-            s, t = self.snap.link_endpoints(j)
-            d["_src"], d["_tgt"] = self._id(s), self._id(t)
+            d["_src"], d["_tgt"] = self._id(self._lsrc[j]), self._id(self._ltgt[j])
         return d
 
-    def _label(self, i: int) -> str:
-        return self._node(i).get("label", self._id(i))
+    def _deg_dir(self, i: int) -> int:
+        return (self._ooff[i + 1] - self._ooff[i]) + (self._ioff[i + 1] - self._ioff[i])
 
-    # ---- name resolution (mini-graph of candidates) ----------------------------
+    # ---- name resolution ---------------------------------------------------------
+    @staticmethod
+    def _special(label: str) -> bool:
+        """Labels `_find_node_tiers` handles with whole-graph helpers first."""
+        return "::" in label or bool(_PY_QUALIFIED_RE.match(label.strip()))
+
+    def _has_cold_repo(self) -> bool:
+        """Whether any node may carry `repo` (read by `_rivals_across_files`).
+        Cold JSON is written by json.dumps, so a `repo` key appears as `"repo": `."""
+        if self._cold_repo is None:
+            self._cold_repo = self.snap.cold_contains("n", '"repo": ')
+        return self._cold_repo
+
+    def _light_graph(self, idx) -> tuple[nx.DiGraph, list[str]]:
+        """Mini-graph of `idx` (graph order) for the upstream refusal helpers."""
+        ids = self._ids_of(idx)
+        H = nx.DiGraph()
+        if self._has_cold_repo():
+            H.add_nodes_from(zip(ids, (self._node(i) for i in idx)))
+        else:
+            H.add_nodes_from(zip(ids, (self._light(i) for i in idx)))
+        return H, ids
+
+    def _tiers(self, label: str, level: int):
+        """`_find_node_tiers(G, label)` as index lists, tiers up to `level` complete."""
+        term = " ".join(_search_tokens(label))
+        nq = _strip_diacritics(str(label)).lower().strip()
+        se, ex, pr, sub = self.snap.tiers(term, nq, level)
+        if se:
+            query_basename = _strip_diacritics(Path(label).name).lower()
+            preferred = []
+            for i in se:
+                if str(self._nget(i, "source_location", "")) != "L1":
+                    continue
+                lbl = _strip_diacritics(str(self._nget(i, "label") or "")).lower()
+                if lbl == query_basename or lbl.endswith("/" + query_basename):
+                    preferred.append(i)
+            if len(preferred) == 1:
+                se = preferred + [i for i in se if i != preferred[0]]
+        return se, ex, pr, sub
+
     def _tier_graph(self, label: str, level: str = "prefix") -> nx.DiGraph:
-        """Mini-graph holding every node `_find_node_tiers` can place in the
-        tiers up to `level` ("exact": source_exact + exact, "prefix": also
-        prefix, "substring": all four), in graph.json order. A node's tier
-        depends only on its own fields, so the upstream function answers on
-        this superset exactly as on the whole graph for those tiers."""
+        """For `::` and dotted labels: mini-graph holding every node
+        `_find_node_tiers` can place in the tiers up to `level`, plus the
+        symbol half's candidates, in graph.json order."""
         term = " ".join(_search_tokens(label))
         nq = _strip_diacritics(str(label)).lower().strip()
         needles = {term, nq}
@@ -296,7 +392,6 @@ class SnapBackend(GraphBackend):
         cand: set[int] = set()
         snap = self.snap
         if needles:
-            # exact tier: norm_label / bare_label / label_tokens / id equal
             cand.update(snap.match_nodes("nl", "bare", needles))
             cand.update(snap.match_nodes("lt", "equal", needles))
             cand.update(snap.match_ids("lower", "equal", needles))
@@ -316,14 +411,44 @@ class SnapBackend(GraphBackend):
         return H
 
     def _resolve(self, label: str) -> tuple[str | None, Refusal | None]:
-        H = self._tier_graph(label, "exact")
-        tiers = _find_node_tiers(H, label)
-        if not (tiers[0] or tiers[1]):
-            H = self._tier_graph(label, "prefix")
-            if not any(_find_node_tiers(H, label)[:3]):
-                H = self._tier_graph(label, "substring")
-        nid, err = _resolve_single_node(H, label)
-        return nid, (_refusal(err) if err else None)
+        """`serve._resolve_single_node`."""
+        if self._special(label):
+            H = self._tier_graph(label, "exact")
+            tiers = _find_node_tiers(H, label)
+            if not (tiers[0] or tiers[1]):
+                H = self._tier_graph(label, "prefix")
+                if not any(_find_node_tiers(H, label)[:3]):
+                    H = self._tier_graph(label, "substring")
+            nid, err = _resolve_single_node(H, label)
+            return nid, (_refusal(err) if err else None)
+        se, ex, pr, sub = self._tiers(label, 0)
+        if not (se or ex):
+            se, ex, pr, sub = self._tiers(label, 1)
+            if not pr:
+                se, ex, pr, sub = self._tiers(label, 2)
+        if not (se or ex or pr):
+            if not sub:
+                return None, _refusal(f"No node matching '{label}' found.")
+            H, _ = self._light_graph(sub[:5])
+            return None, _refusal(_near_miss_message(H, label, _LazyIds(self, sub)))
+        tier = se or ex or pr
+        H, ids = self._light_graph(tier)
+        err = _tier_refusal(H, label, ids, file_query=bool(se) and "::" not in label)
+        if err:
+            return None, _refusal(err)
+        return ids[0], None
+
+    def _query_name_refusal(self, label: str) -> str | None:
+        """`serve._query_name_refusal`."""
+        if self._special(label):
+            return _query_name_refusal(self._tier_graph(label, "exact"), label)
+        se, ex, _, _ = self._tiers(label, 0)
+        tier = se or ex
+        if not tier:
+            return None
+        H, ids = self._light_graph(tier)
+        refusal = _tier_refusal(H, label, ids, file_query=bool(se) and "::" not in label)
+        return refusal if _is_ambiguity_refusal(refusal) else None
 
     # ---- scoring (mirror of serve._score_query) ----------------------------------
     def _score_query(self, terms, *, collect_per_term_seeds: bool) -> _QueryScores:
@@ -360,7 +485,7 @@ class SnapBackend(GraphBackend):
         self._begin()
         if seeds:
             raise NotImplementedError(UNSUPPORTED[0])
-        refused = _query_name_refusal(self._tier_graph(question, "exact"), question)
+        refused = self._query_name_refusal(question)
         if refused:
             return QueryResult(mode=mode, depth=depth, seeds=[], total_nodes=0, nodes=[], edges=[],
                                refusal=_refusal(refused))
@@ -386,7 +511,11 @@ class SnapBackend(GraphBackend):
         TG = _TG(self, fcodes)
         core = _dfs_core if mode == "dfs" else _bfs_core
         visited, edges = core(TG.neighbors, TG.degree, seeds, depth, TG.hub_threshold())
-        _complete_induced_edges(TG, visited, edges)
+        # serve._complete_induced_edges(TG, visited, edges), in Rust.
+        idx = self._idx
+        eu, ev = self.snap.complete_induced([idx[n] for n in visited], [idx[u] for u, _ in edges],
+                                            [idx[v] for _, v in edges], fcodes)
+        edges.extend(zip(self._ids_of(eu), self._ids_of(ev)))
 
         seed_set = set(seeds)
         seed_hits = [n for n in seeds if n in visited]
@@ -407,32 +536,38 @@ class SnapBackend(GraphBackend):
         )
         node_recs = []
         for n in ordered:
-            d = TG.nodes[n]
+            i = idx[n]
             node_recs.append(NodeRecord(
-                label=d.get("label", n),
-                source_file=str(d.get("source_file", "")),
-                source_location=str(d.get("source_location", "")),
-                community=str(d.get("community", "")),
+                label=self._nget(i, "label", n),
+                source_file=str(self._nget(i, "source_file", "")),
+                source_location=str(self._nget(i, "source_location", "")),
+                community=str(self._nget(i, "community", "")),
             ))
+        pairs = [(u, v) for u, v in edges if u in visited and v in visited]
+        codes = memoryview(self.snap.pair_codes([idx[u] for u, _ in pairs], [idx[v] for _, v in pairs],
+                                                list(_EDGE_FIELDS))).cast("I")
+        w = len(_EDGE_FIELDS) + 2
+        lv = lambda f, c, default: self._val("l", f, c) if c else default
         edge_recs = []
-        for u, v in edges:
-            if u in visited and v in visited:
-                for d in [TG.pair_data(u, v)]:
-                    src, tgt = d.get("_src", u), d.get("_tgt", v)
-                    if {src, tgt} != {u, v}:
-                        src, tgt = u, v
-                    edge_recs.append(EdgeRecord(
-                        source_label=TG.nodes[src].get("label", src),
-                        target_label=TG.nodes[tgt].get("label", tgt),
-                        relation=str(d.get("relation", "")),
-                        confidence=str(d.get("confidence", "")),
-                        context=str(d.get("context", "") or ""),
-                        source_file=str(d.get("source_file", "") or ""),
-                        source_location=str(d.get("source_location", "") or ""),
-                    ))
+        for k, (u, v) in enumerate(pairs):
+            b = k * w
+            if codes[b + 5] == _NONE:
+                raise KeyError((u, v))      # not adjacent: edge_datas(TG, u, v) raises too
+            src, tgt = self._id(codes[b + 5]), self._id(codes[b + 6])
+            if {src, tgt} != {u, v}:
+                src, tgt = u, v
+            edge_recs.append(EdgeRecord(
+                source_label=self._label(idx[src]),
+                target_label=self._label(idx[tgt]),
+                relation=str(lv("relation", codes[b], "")),
+                confidence=str(lv("confidence", codes[b + 1], "")),
+                context=str(lv("context", codes[b + 2], "") or ""),
+                source_file=str(lv("source_file", codes[b + 3], "") or ""),
+                source_location=str(lv("source_location", codes[b + 4], "") or ""),
+            ))
         return QueryResult(
             mode=mode, depth=depth,
-            seeds=[self._duck.nodes[n].get("label", n) for n in seeds],
+            seeds=[self._label(idx[n]) for n in seeds],
             total_nodes=len(visited), nodes=node_recs, edges=edge_recs,
             filters=filters, filter_source=fsource,
             graph_nodes=self.snap.node_count,
@@ -453,15 +588,15 @@ class SnapBackend(GraphBackend):
             source_location=str(d.get("source_location", "")),
             file_type=str(d.get("file_type", "")),
             community=str(d.get("community", "")),
-            degree=self.snap.deg_dir(i),
+            degree=self._deg_dir(i),
         )
 
     def _arcs(self, i: int):
         """(outgoing, neighbour index, link) in DiGraph successor / predecessor order."""
-        for j in self.snap.out_links(i):
-            yield True, self.snap.link_endpoints(j)[1], j
-        for j in self.snap.in_links(i):
-            yield False, self.snap.link_endpoints(j)[0], j
+        for j in self._olink[self._ooff[i]:self._ooff[i + 1]]:
+            yield True, self._ltgt[j], j
+        for j in self._ilink[self._ioff[i]:self._ioff[i + 1]]:
+            yield False, self._lsrc[j], j
 
     def get_neighbors(self, label, relation_filter="") -> Neighbors | Refusal:
         self._begin()
@@ -471,14 +606,13 @@ class SnapBackend(GraphBackend):
         rf = relation_filter.lower()
         recs: list[NeighborRecord] = []
         for out, nb, j in self._arcs(self._idx[nid]):
-            d = self._link(j, markers=False)
-            rel = d.get("relation", "")
+            rel = self._lget(j, "relation", "")
             if rf and rf not in rel.lower():
                 continue
             recs.append(NeighborRecord(out, self._label(nb), str(rel),
-                                       str(d.get("confidence", "")),
-                                       str(d.get("source_file") or ""),
-                                       str(d.get("source_location") or "")))
+                                       str(self._lget(j, "confidence", "")),
+                                       str(self._lget(j, "source_file") or ""),
+                                       str(self._lget(j, "source_location") or "")))
         return Neighbors(label=self._label(self._idx[nid]), neighbors=recs)
 
     def get_community(self, community_id) -> CommunityRecord | None:
@@ -486,12 +620,10 @@ class SnapBackend(GraphBackend):
         k = self._cids.get(int(community_id))
         if k is None:
             return None
-        off = memoryview(self.snap.block_bytes("c.off")).cast("Q")
-        mem = memoryview(self.snap.block_bytes("c.mem")).cast("I")
-        members = list(mem[off[k]:off[k + 1]])
+        members = list(self._cmem[self._coff[k]:self._coff[k + 1]])
         if not members:
             return None
-        recs = [NodeRecord(label=self._label(i), source_file=str(self._node(i).get("source_file", "")))
+        recs = [NodeRecord(label=self._label(i), source_file=str(self._nget(i, "source_file", "")))
                 for i in members]
         name = self._node(members[0]).get("community_name")
         return CommunityRecord(cid=int(community_id), members=recs, name=name)
@@ -519,19 +651,30 @@ class SnapBackend(GraphBackend):
         )
 
     def _path_endpoint(self, query: str):
-        """`serve._resolve_path_endpoint`, tiers on the candidate mini-graph,
-        scoring over the whole snapshot."""
-        H = self._tier_graph(query, "exact")
-        source_exact, exact, _, _ = _find_node_tiers(H, query)
-        hits = source_exact or exact
-        if hits:
-            refusal = _tier_refusal(H, query, hits, file_query=bool(source_exact) and "::" not in query)
-            if refusal:
-                return None, [], refusal
-            return hits[0], [], None
-        path_part, sep, symbol_part = query.partition("::")
-        if sep and path_part.strip() and symbol_part.strip():
-            return None, [], _no_scoped_match_message(H, path_part.strip(), symbol_part.strip())
+        """`serve._resolve_path_endpoint`, exact tiers from Rust (or the
+        candidate mini-graph for `::` / dotted labels), scoring over the
+        whole snapshot."""
+        if self._special(query):
+            H = self._tier_graph(query, "exact")
+            source_exact, exact, _, _ = _find_node_tiers(H, query)
+            hits = source_exact or exact
+            if hits:
+                refusal = _tier_refusal(H, query, hits, file_query=bool(source_exact) and "::" not in query)
+                if refusal:
+                    return None, [], refusal
+                return hits[0], [], None
+            path_part, sep, symbol_part = query.partition("::")
+            if sep and path_part.strip() and symbol_part.strip():
+                return None, [], _no_scoped_match_message(H, path_part.strip(), symbol_part.strip())
+        else:
+            se, ex, _, _ = self._tiers(query, 0)
+            hits = se or ex
+            if hits:
+                H, ids = self._light_graph(hits)
+                refusal = _tier_refusal(H, query, ids, file_query=bool(se) and "::" not in query)
+                if refusal:
+                    return None, [], refusal
+                return ids[0], [], None
         scored = self._score_nodes([t.lower() for t in query.split()])
         if not scored:
             return None, [], None
@@ -541,7 +684,7 @@ class SnapBackend(GraphBackend):
         def expand(frontier, forward):
             fr = list(frontier)
             res = self.snap.path_expand([self._idx[u] for u in fr], forward, undirected, self._contains)
-            return {u: [self._id(x) for x in lst] for u, lst in zip(fr, res)}
+            return {u: self._ids_of(lst) for u, lst in zip(fr, res)}
         return expand
 
     def shortest_path(self, source, target, *, max_hops=8, undirected=False) -> PathResult:
@@ -587,7 +730,7 @@ class SnapBackend(GraphBackend):
                 ia = self._idx[a]
                 # MultiDiGraph: arcs a->b; MultiGraph: every link of the pair, both times.
                 for j in between:
-                    if directed and self.snap.link_endpoints(j)[0] != ia:
+                    if directed and self._lsrc[j] != ia:
                         continue
                     d = self._link(j, markers=True)
                     src = d.get("_src", a)
@@ -607,33 +750,27 @@ class SnapBackend(GraphBackend):
             label=d.get("label", nid), id=nid,
             source_file=str(d.get("source_file", "")), source_location=str(d.get("source_location", "")),
             file_type=str(d.get("file_type", "")), community=str(d.get("community", "")),
-            degree=self.snap.deg_dir(i),
+            degree=self._deg_dir(i),
             definition_file=str(d.get("definition_file", "") or ""),
             definition_location=str(d.get("definition_location", "") or ""),
         )
-        conns: list[Connection] = []
-
-        def _outgoing(e: dict, other: str, default: bool) -> bool:
-            src, tgt = e.get("_src"), e.get("_tgt")
-            if src is None or tgt is None or {src, tgt} != {nid, other}:
-                return default
-            return src == nid
-
-        for out, nb, j in self._arcs(i):
-            e = self._link(j, markers=False)
-            other = self._id(nb)
-            conns.append(Connection(_outgoing(e, other, out), self._label(nb),
-                                    str(e.get("relation", "")), str(e.get("confidence", "")),
-                                    self.snap.deg_dir(nb),
-                                    source_file=str(e.get("source_file", "") or ""),
-                                    source_location=str(e.get("source_location", "") or "")))
+        # JsonBackend's `_outgoing` trusts `_src`/`_tgt` markers; the explain
+        # graph has none (the writer refuses links that carry them), so the
+        # direction is the adjacency list each arc came from.
+        conns = [
+            Connection(out, self._label(nb),
+                       str(self._lget(j, "relation", "")), str(self._lget(j, "confidence", "")),
+                       self._deg_dir(nb),
+                       source_file=str(self._lget(j, "source_file", "") or ""),
+                       source_location=str(self._lget(j, "source_location", "") or ""))
+            for out, nb, j in self._arcs(i)
+        ]
         return ExplainResult(detail=detail, connections=conns)
 
     def pr_impact(self, files) -> tuple[list[int], int]:
         self._begin()
         from graphify.prs import _path_match
-        sf = memoryview(self.snap.block_bytes("n.v.source_file")).cast("I")
-        cm = memoryview(self.snap.block_bytes("n.v.community")).cast("I")
+        sf, cm = self._ncol["source_file"], self._ncol["community"]
         file_comms: dict[str, set[int]] = {}
         file_count: dict[str, int] = {}
         for a, b in zip(sf, cm):

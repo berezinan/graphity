@@ -10,4 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 snap-core = { path = "../snap-core" }
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }
+# No abi3: zero-copy views need the buffer protocol, which the limited API
+# exposes only from 3.11; the spike builds for its own interpreter.
+pyo3 = { version = "0.25", features = ["extension-module"] }

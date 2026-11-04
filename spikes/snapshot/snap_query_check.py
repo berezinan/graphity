@@ -18,6 +18,8 @@ EXE = HERE / "target" / "release" / "snap-query.exe"
 
 def main(argv) -> int:
     sys.path.insert(0, str(HERE))
+    import spike_patches
+    spike_patches.apply()   # snap-query implements the spike rule
     from graphify.serve import _query_terms, _search_tokens
     from snap_common import norm_fingerprint
     snap, qset = argv[1], json.loads(Path(argv[2]).read_text(encoding="utf-8"))

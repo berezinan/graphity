@@ -32,6 +32,11 @@ fn searchable(t: &str) -> bool {
     if t.chars().all(|c| c.is_ascii_lowercase()) {
         return t.chars().count() > 2;
     }
+    // spike_patches.is_searchable: one- and two-letter Cyrillic words drop out.
+    let n = t.chars().count();
+    if n > 0 && n <= 2 && t.chars().all(|c| ('\u{0400}'..='\u{052f}').contains(&c)) {
+        return false;
+    }
     true
 }
 

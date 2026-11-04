@@ -1,9 +1,11 @@
 //! PyO3 surface of the snapshot: `Encoder` for the Python writer, `Snap` for
 //! `SnapBackend`. Node and link indices are positions in graph.json.
 
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyBufferError, PyIOError, PyKeyError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::os::raw::{c_int, c_void};
 use snap_core::graph::Graph;
 use snap_core::header::hex;
 use snap_core::pool::Mode;
@@ -115,6 +117,52 @@ struct Snap {
     g: Arc<Graph>,
 }
 
+/// Read-only buffer over one block of the mapping, without a copy. Holds the
+/// generation alive (`Arc`) for as long as any memoryview of it exists.
+#[pyclass(frozen)]
+struct Block {
+    g: Arc<Graph>,
+    off: usize,
+    len: usize,
+}
+
+#[pymethods]
+impl Block {
+    unsafe fn __getbuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer, flags: c_int) -> PyResult<()> {
+        if view.is_null() {
+            return Err(PyBufferError::new_err("view is null"));
+        }
+        if (flags & ffi::PyBUF_WRITABLE) == ffi::PyBUF_WRITABLE {
+            return Err(PyBufferError::new_err("snapshot blocks are read-only"));
+        }
+        let b = slf.get();
+        let bytes = &b.g.snap.bytes()[b.off..b.off + b.len];
+        (*view).obj = slf.clone().into_any().into_ptr();
+        (*view).buf = bytes.as_ptr() as *mut c_void;
+        (*view).len = bytes.len() as ffi::Py_ssize_t;
+        (*view).readonly = 1;
+        (*view).itemsize = 1;
+        (*view).format = if (flags & ffi::PyBUF_FORMAT) == ffi::PyBUF_FORMAT {
+            c"B".as_ptr() as *mut _
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).ndim = 1;
+        (*view).shape =
+            if (flags & ffi::PyBUF_ND) == ffi::PyBUF_ND { &mut (*view).len } else { std::ptr::null_mut() };
+        (*view).strides = if (flags & ffi::PyBUF_STRIDES) == ffi::PyBUF_STRIDES {
+            &mut (*view).itemsize
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).suboffsets = std::ptr::null_mut();
+        (*view).internal = std::ptr::null_mut();
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
+}
+
 #[pymethods]
 impl Snap {
     #[new]
@@ -166,6 +214,43 @@ impl Snap {
 
     fn block_bytes<'py>(&self, py: Python<'py>, name: &str) -> Option<Bound<'py, PyBytes>> {
         self.g.block(name).map(|b| PyBytes::new(py, b))
+    }
+
+    /// Zero-copy buffer over a block: `memoryview(snap.view("l.src")).cast("I")`.
+    fn view(&self, name: &str) -> PyResult<Block> {
+        let (off, len) = self.g.block_range(name).ok_or_else(|| PyKeyError::new_err(name.to_owned()))?;
+        Ok(Block { g: self.g.clone(), off, len })
+    }
+
+    /// `_find_node_tiers` (no `::`, not a dotted Python symbol), see Graph::tiers.
+    fn tiers(&self, py: Python<'_>, term: String, nq: String, level: u8) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let g = self.g.clone();
+        let [a, b, c, d] = py.allow_threads(move || g.tiers(term.as_bytes(), nq.as_bytes(), level));
+        (a, b, c, d)
+    }
+
+    /// Merged field codes and last-link endpoints per traversal pair (flat u32).
+    fn pair_codes<'py>(&self, py: Python<'py>, us: Vec<u32>, vs: Vec<u32>, fields: Vec<String>) -> Bound<'py, PyBytes> {
+        let g = self.g.clone();
+        let out = py.allow_threads(move || g.pair_codes(&us, &vs, &fields));
+        PyBytes::new(py, snap_core::blocks::as_bytes(&out))
+    }
+
+    #[pyo3(signature = (visited, seen_u, seen_v, filt=None))]
+    fn complete_induced(
+        &self,
+        py: Python<'_>,
+        visited: Vec<u32>,
+        seen_u: Vec<u32>,
+        seen_v: Vec<u32>,
+        filt: Option<Vec<u32>>,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let g = self.g.clone();
+        py.allow_threads(move || g.complete_induced(&visited, &seen_u, &seen_v, filt.as_deref()))
+    }
+
+    fn cold_contains(&self, kind: &str, needle: &str) -> bool {
+        self.g.cold_contains(kind, needle.as_bytes())
     }
 
     fn node_id(&self, i: usize) -> PyResult<String> {
@@ -319,6 +404,7 @@ fn format_version() -> u32 {
 fn graphify_snap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoder>()?;
     m.add_class::<Snap>()?;
+    m.add_class::<Block>()?;
     m.add_function(wrap_pyfunction!(publish, m)?)?;
     m.add_function(wrap_pyfunction!(peek_generation, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

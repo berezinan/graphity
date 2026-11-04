@@ -335,6 +335,164 @@ impl Graph {
         ScoreOut { idx: scored.iter().map(|x| x.1).collect(), score: scored.iter().map(|x| x.0).collect(), best }
     }
 
+    // ---- name resolution (mirror of serve._find_node_tiers) ---------------------
+    /// `_find_node_tiers` for a label without `::` that is not a dotted Python
+    /// symbol: (source_exact, exact, prefix, substring), each in graph order,
+    /// before the source_exact L1 preference (applied in Python). Candidates
+    /// cover the tiers up to `level` completely (0: source_exact and exact,
+    /// 1: also prefix, 2: all four); every candidate is classified with the
+    /// upstream predicates, so the complete tiers equal a full scan.
+    pub fn tiers(&self, term: &[u8], nq: &[u8], level: u8) -> [Vec<u32>; 4] {
+        const S_LT: usize = 2;
+        const S_ST: usize = 4;
+        let mut out: [Vec<u32>; 4] = Default::default();
+        if term.is_empty() {
+            return out;
+        }
+        let mut bits = vec![0u64; self.n.div_ceil(64)];
+        let both: Vec<&[u8]> = if term == nq { vec![term] } else { vec![term, nq] };
+        self.mark(S_ST, Mode::Equal, &[term], &mut bits);
+        self.mark(S_NL, Mode::Bare, &both, &mut bits);
+        self.mark(S_LT, Mode::Equal, &[term], &mut bits);
+        self.mark_ids("lower", Mode::Equal, &[term], &mut bits);
+        self.mark_ids("norm", Mode::Equal, &[nq], &mut bits);
+        if level >= 1 {
+            self.mark(S_NL, Mode::Prefix, &both, &mut bits);
+            self.mark(S_LT, Mode::Prefix, &[term], &mut bits);
+            self.mark_ids("lower", Mode::Prefix, &[term], &mut bits);
+        }
+        if level >= 2 {
+            self.mark(S_NL, Mode::Substring, &both, &mut bits);
+            self.mark(S_LT, Mode::Substring, &[term], &mut bits);
+        }
+        let (nl_c, nl_p) = self.scol(S_NL);
+        let (lt_c, lt_p) = self.scol(S_LT);
+        let (st_c, st_p) = self.scol(S_ST);
+        let ft = memmem::Finder::new(term);
+        let fq = memmem::Finder::new(nq);
+        for i in drain(&bits) {
+            let iu = i as usize;
+            let st = col_get(st_c, &st_p, iu);
+            let nl = col_get(nl_c, &nl_p, iu);
+            let bare = rstrip_parens(nl);
+            let lt = col_get(lt_c, &lt_p, iu);
+            let nidl = self.key_lower(iu);
+            let nidn = self.key_norm(iu);
+            let (nidl, nidn) = (nidl.as_slice(), nidn.as_slice());
+            let tier = if term == st {
+                0
+            } else if term == nl || term == bare || term == lt || term == nidl || nq == nl || nq == bare || nq == nidn {
+                1
+            } else if nl.starts_with(term)
+                || bare.starts_with(term)
+                || lt.starts_with(term)
+                || nidl.starts_with(term)
+                || nl.starts_with(nq)
+                || bare.starts_with(nq)
+            {
+                2
+            } else if ft.find(nl).is_some() || ft.find(lt).is_some() || fq.find(nl).is_some() {
+                3
+            } else {
+                continue;
+            };
+            out[tier].push(i);
+        }
+        out
+    }
+
+    // ---- query answer records -------------------------------------------------
+    /// For each traversal pair (us[k], vs[k]): the codes of `fields` in the
+    /// pair's merged attributes (`dict.update` over its links in order: the
+    /// last link carrying the field wins; 0 = absent), then the endpoints of
+    /// the last link (its `_src` / `_tgt`). Width `fields.len() + 2` per pair;
+    /// `u32::MAX` everywhere when the nodes are not adjacent.
+    pub fn pair_codes(&self, us: &[u32], vs: &[u32], fields: &[String]) -> Vec<u32> {
+        let cols: Vec<&[u32]> = fields.iter().map(|f| self.u32s(&format!("l.v.{f}"))).collect();
+        let (toff, tnbr, tpair) = (self.u64s("t.off"), self.u32s("t.nbr"), self.u32s("t.pair"));
+        let (loff, plinks) = (self.u64s("p.loff"), self.u32s("p.links"));
+        let (src, tgt) = (self.u32s("l.src"), self.u32s("l.tgt"));
+        let nf = fields.len();
+        let w = nf + 2;
+        let mut out = vec![u32::MAX; us.len() * w];
+        for k in 0..us.len().min(vs.len()) {
+            let (a, b) = (us[k] as usize, vs[k] as usize);
+            let (x, y) = if toff[a + 1] - toff[a] <= toff[b + 1] - toff[b] { (a, b) } else { (b, a) };
+            let Some(q) = (toff[x] as usize..toff[x + 1] as usize).find(|&q| tnbr[q] as usize == y) else {
+                continue;
+            };
+            let p = tpair[q] as usize;
+            let links = &plinks[loff[p] as usize..loff[p + 1] as usize];
+            for (f, col) in cols.iter().enumerate() {
+                let mut c = 0u32;
+                for &l in links {
+                    let v = col[l as usize];
+                    if v != 0 {
+                        c = v;
+                    }
+                }
+                out[k * w + f] = c;
+            }
+            let last = *links.last().expect("a pair has at least one link") as usize;
+            out[k * w + nf] = src[last];
+            out[k * w + nf + 1] = tgt[last];
+        }
+        out
+    }
+
+    /// `serve._complete_induced_edges` on the (filtered) traversal graph:
+    /// pairs between visited nodes that the traversal did not record, in the
+    /// order `G.edges(sorted(visited))` yields them. `seen_u` / `seen_v` are
+    /// the recorded pairs.
+    pub fn complete_induced(
+        &self,
+        visited: &[u32],
+        seen_u: &[u32],
+        seen_v: &[u32],
+        filt: Option<&[u32]>,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let words = self.n.div_ceil(64);
+        let set = |b: &mut [u64], i: u32| b[i as usize / 64] |= 1 << (i % 64);
+        let has = |b: &[u64], i: u32| b[i as usize / 64] >> (i % 64) & 1 == 1;
+        let key = |a: u32, b: u32| if a <= b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
+        let mut vis = vec![0u64; words];
+        for &i in visited {
+            set(&mut vis, i);
+        }
+        // sorted(visited): Python str order is code point order = UTF-8 byte
+        // order, which is what `n.idrank` ranks.
+        let rank = self.u32s("n.idrank");
+        let mut order = visited.to_vec();
+        order.sort_unstable_by_key(|&i| rank[i as usize]);
+        let mut seen: rustc_hash::FxHashSet<u64> = seen_u.iter().zip(seen_v).map(|(&a, &b)| key(a, b)).collect();
+        let mut done = vec![0u64; words];
+        let (mut ou, mut ov) = (Vec::new(), Vec::new());
+        for &u in &order {
+            for v in self.tneighbors(u as usize, filt) {
+                if has(&done, v) || u == v || !has(&vis, v) {
+                    continue;
+                }
+                if seen.insert(key(u, v)) {
+                    ou.push(u);
+                    ov.push(v);
+                }
+            }
+            set(&mut done, u);
+        }
+        (ou, ov)
+    }
+
+    /// Whether the node (`"n"`) or link (`"l"`) cold JSON contains `needle`.
+    pub fn cold_contains(&self, kind: &str, needle: &[u8]) -> bool {
+        let name = if kind == "n" { "cn.blob" } else { "cl.blob" };
+        memmem::find(self.need(name), needle).is_some()
+    }
+
+    /// Absolute byte range of a block, for zero-copy views.
+    pub fn block_range(&self, name: &str) -> Option<(usize, usize)> {
+        self.blocks.get(name).copied()
+    }
+
     // ---- traversal graph (undirected, networkx order) ---------------------------
     fn passes(&self, p: u32, filt: Option<&[u32]>) -> bool {
         match filt {
@@ -478,6 +636,13 @@ fn key_less(a: (f64, u32, u32, u32), b: (f64, u32, u32, u32)) -> bool {
         return a.2 < b.2;
     }
     a.3 < b.3
+}
+
+fn col_get<'a>(c: &[u32], p: &Pool<'a>, i: usize) -> &'a [u8] {
+    match c[i] {
+        0 => b"",
+        x => p.get(x as usize - 1),
+    }
 }
 
 fn rstrip_parens(s: &[u8]) -> &[u8] {
