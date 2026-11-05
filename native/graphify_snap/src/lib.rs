@@ -408,5 +408,6 @@ fn graphify_snap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(publish, m)?)?;
     m.add_function(wrap_pyfunction!(peek_generation, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;
+    m.add("API_VERSION", 1u32)?;
     Ok(())
 }
