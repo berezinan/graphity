@@ -258,7 +258,7 @@ def _is_searchable(term: str) -> bool:
     """
     if all("a" <= ch <= "z" for ch in term):
         return len(term) > 2
-    if len(term) <= 2 and all("Ѐ" <= ch <= "ԯ" for ch in term):
+    if len(term) <= 2 and all("\u0400" <= ch <= "\u052f" for ch in term):
         return False
     return True
 

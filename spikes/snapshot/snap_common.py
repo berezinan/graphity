@@ -76,7 +76,7 @@ def port_hash() -> str:
 
 # Recorded when the port was written (graphify 0.9.97, staging 8d9526c3); updated
 # after serve-cyrillic-terms-and-linear-ambiguity moved spike_patches into serve.py.
-PORT_HASH = "6e33a496e246619a9301bdd533bbb477bfbd0efc7d127ee28915a3ba5c1b7648"
+PORT_HASH = "327a785fbfe972243d05cb1187e3d5d21831caaf28077300fde98373ceb6af2c"
 
 
 class Unsupported(ValueError):
