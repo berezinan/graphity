@@ -141,22 +141,39 @@ def test_god_nodes_renders():
 # --- backend selection factory --------------------------------------------- #
 
 def test_resolve_config_default_backend(monkeypatch):
-    """The default backend with no GRAPHIFY_GRAPH_STORE set is the graph database.
+    """The default backend with no GRAPHIFY_GRAPH_STORE set is the snapshot.
 
-    Guarded on purpose: upstream knows nothing about ArcadeDB, so a merge can
+    Guarded on purpose: upstream knows nothing about the snapshot, so a merge can
     put ``json`` back as the default as silently as it can drop a call site —
-    and the whole point of this change is that graphify never quietly answers
-    from graph.json.
+    and graphify must never quietly answer from graph.json.
     """
     monkeypatch.delenv("GRAPHIFY_GRAPH_STORE", raising=False)
-    assert resolve_backend_config("g.json")["kind"] == "arcadedb"
+    cfg = resolve_backend_config("g.json")
+    assert cfg["kind"] == "snap"
+    assert cfg["snapshot_path"].endswith("g.snap")
+
+
+def test_resolve_config_empty_value_is_the_default(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "  ")
+    assert resolve_backend_config("g.json")["kind"] == "snap"
+
+
+def test_resolve_config_unknown_value_is_an_error(monkeypatch):
+    """A typo must not silently select JSON (loading a whole graph.json)."""
+    import pytest
+    from graphify.query_backend import GraphDBUnavailable
+    monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "snapshot")
+    with pytest.raises(GraphDBUnavailable) as exc:
+        resolve_backend_config("g.json")
+    msg = str(exc.value)
+    assert "snapshot" in msg and "snap" in msg and "arcadedb" in msg and "json" in msg
 
 
 def test_resolve_config_ignores_graphify_backend(monkeypatch):
     """GRAPHIFY_BACKEND is upstream's LLM selector (#4361) and never picks the store."""
     monkeypatch.delenv("GRAPHIFY_GRAPH_STORE", raising=False)
     monkeypatch.setenv("GRAPHIFY_BACKEND", "json")
-    assert resolve_backend_config("g.json")["kind"] == "arcadedb"
+    assert resolve_backend_config("g.json")["kind"] == "snap"
 
 
 def test_resolve_config_json_is_the_explicit_opt_out(monkeypatch):

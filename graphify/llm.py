@@ -3698,8 +3698,8 @@ def _graphify_backend_setting() -> str | None:
 
 
 def _stale_graph_store_values() -> frozenset[str]:
-    from graphify.query_backend import GRAPH_STORE_VALUES
-    return GRAPH_STORE_VALUES
+    from graphify.query_backend import STALE_BACKEND_VALUES
+    return STALE_BACKEND_VALUES
 
 
 _stale_graph_store_warned = False
@@ -3714,7 +3714,7 @@ def _warn_stale_graph_store(value: str) -> None:
     print(
         f"[graphify] WARNING: GRAPHIFY_BACKEND={value} no longer selects the graph "
         "store and is ignored — remove the variable. The graph store is set by "
-        "GRAPHIFY_GRAPH_STORE (default arcadedb); GRAPHIFY_BACKEND picks the LLM backend.",
+        "GRAPHIFY_GRAPH_STORE (default snap); GRAPHIFY_BACKEND picks the LLM backend.",
         file=sys.stderr,
     )
 

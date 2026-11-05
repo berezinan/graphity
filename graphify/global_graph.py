@@ -91,6 +91,11 @@ def _sync_global_db() -> None:
     import os
     from graphify.query_backend import resolve_backend_config, require_backend, shortfall_warning
     cfg = resolve_backend_config(None)
+    if cfg["kind"] == "snap":
+        # Snapshot next to ~/.graphify/global-graph.json; ArcadeDB is not touched.
+        from graphify.snap_store import publish_snapshot_for
+        publish_snapshot_for(_GLOBAL_GRAPH)
+        return
     if cfg["kind"] != "arcadedb":
         return
     cfg["database"] = os.environ.get("GRAPHIFY_ARCADE_GLOBAL_DB", "graphify_global")

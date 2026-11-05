@@ -1712,9 +1712,9 @@ def dispatch_command(cmd: str) -> None:
         # the backend interface supports them. For now, resolve seeds from
         # graph.json and pass start_nodes to the JSON backend.
         _cfg = resolve_backend_config(graph_path)
-        if _cfg["kind"] == "arcadedb":
+        if _cfg["kind"] != "json":
             backend = require_backend(config=_cfg)
-            _corpus = _cfg["database"]
+            _corpus = _cfg.get("database") or _cfg.get("snapshot_path")
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -2073,9 +2073,9 @@ def dispatch_command(cmd: str) -> None:
         # canonicalized files), so respect it unless the caller opts out.
         undirected = direction_flag == "undirected"
         _cfg = resolve_backend_config(graph_path)
-        if _cfg["kind"] == "arcadedb":
+        if _cfg["kind"] != "json":
             backend = require_backend(config=_cfg)
-            _corpus = _cfg["database"]
+            _corpus = _cfg.get("database") or _cfg.get("snapshot_path")
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -2182,9 +2182,9 @@ def dispatch_command(cmd: str) -> None:
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
         _cfg = resolve_backend_config(graph_path)
-        if _cfg["kind"] == "arcadedb":
+        if _cfg["kind"] != "json":
             backend = require_backend(config=_cfg)
-            _corpus = _cfg["database"]
+            _corpus = _cfg.get("database") or _cfg.get("snapshot_path")
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -2321,7 +2321,7 @@ def dispatch_command(cmd: str) -> None:
                 sys.exit(1)
             cfg = resolve_backend_config(str(gj))
             if cfg.get("kind") != "arcadedb":
-                print("unset GRAPHIFY_GRAPH_STORE (or set it to arcadedb) to reload an ArcadeDB database", file=sys.stderr)
+                print("set GRAPHIFY_GRAPH_STORE=arcadedb to reload an ArcadeDB database", file=sys.stderr)
                 sys.exit(2)
             from graphify.query_backend import shortfall_warning
             be = require_backend(config=cfg, require_database=False)
@@ -2335,6 +2335,11 @@ def dispatch_command(cmd: str) -> None:
             print("Usage: graphify arcade <status|install-service|uninstall-service|reload>",
                   file=sys.stderr)
             sys.exit(2)
+
+    elif cmd == "snap":
+        # Fork hook (graphify/snap_writer.py): graphify snap build [<project-dir|graph.json>]
+        from graphify.snap_writer import snap_build_command as _snap_build_command
+        sys.exit(_snap_build_command(sys.argv[2:]))
 
     elif cmd == "diagnose":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -5437,6 +5442,10 @@ def dispatch_command(cmd: str) -> None:
                       f"({_st['nodes']} nodes, {_st['edges']} edges).")
             if (_warn := shortfall_warning(_st)):
                 print(f"[graphify db] warning: {_warn}", file=sys.stderr)
+        elif _db_cfg["kind"] == "snap":
+            # Fork hook (graphify/snap_store.py): snapshot of the graph.json just written.
+            from graphify.snap_store import publish_snapshot_for as _publish_snapshot_for
+            _publish_snapshot_for(graph_json_path)
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
                 json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"

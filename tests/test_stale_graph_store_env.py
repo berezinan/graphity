@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from graphify import llm
-from graphify.query_backend import GRAPH_STORE_VALUES, resolve_backend_config
+from graphify.query_backend import STALE_BACKEND_VALUES, resolve_backend_config
 
 
 @pytest.fixture(autouse=True)
@@ -18,7 +18,7 @@ def _fresh_warning(monkeypatch):
     monkeypatch.setattr(llm, "_stale_graph_store_warned", False)
 
 
-@pytest.mark.parametrize("value", sorted(GRAPH_STORE_VALUES) + ["ArcadeDB"])
+@pytest.mark.parametrize("value", sorted(STALE_BACKEND_VALUES) + ["ArcadeDB"])
 def test_stale_store_value_falls_through_to_autodetect(monkeypatch, capsys, value):
     monkeypatch.setenv("GRAPHIFY_BACKEND", value)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
@@ -44,7 +44,15 @@ def test_provider_name_keeps_its_meaning(monkeypatch, capsys):
     monkeypatch.delenv("GRAPHIFY_GRAPH_STORE", raising=False)
     assert llm.detect_backend_with_source() == ("deepseek", "GRAPHIFY_BACKEND=deepseek")
     assert "no longer selects the graph store" not in capsys.readouterr().err
-    assert resolve_backend_config("g.json")["kind"] == "arcadedb"
+    assert resolve_backend_config("g.json")["kind"] == "snap"
+
+
+def test_snap_is_not_a_stale_backend_value(monkeypatch, capsys):
+    """`snap` never lived in GRAPHIFY_BACKEND: the filter must not swallow it."""
+    assert "snap" not in STALE_BACKEND_VALUES
+    monkeypatch.setenv("GRAPHIFY_BACKEND", "snap")
+    assert llm._graphify_backend_setting() == "snap"
+    assert "no longer selects the graph store" not in capsys.readouterr().err
 
 
 def test_upstream_disable_switch_keeps_its_meaning(monkeypatch, capsys):
@@ -53,4 +61,4 @@ def test_upstream_disable_switch_keeps_its_meaning(monkeypatch, capsys):
     assert llm.backend_disabled_by_env()
     assert llm.detect_backend_with_source()[0] is None
     assert "no longer selects the graph store" not in capsys.readouterr().err
-    assert resolve_backend_config("g.json")["kind"] == "arcadedb"
+    assert resolve_backend_config("g.json")["kind"] == "snap"

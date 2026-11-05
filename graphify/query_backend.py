@@ -1885,7 +1885,7 @@ class ArcadeDBBackend(GraphBackend):
                     **({"prune_blocked": prune_blocked} if prune_blocked else {})}
 
         if dirty:
-            self._run("DELETE VERTEX FROM Node WHERE source_file IN :d", params={"d": list(dirty)})
+            self._delete_by_sources(sorted(dirty))
         self._delete_by_ids(stale, batch=batch)
         if stale_sources:
             self._delete_by_sources(stale_sources)
@@ -2676,21 +2676,26 @@ def derive_db_name(graph_path: str | None) -> str:
     return f"proj_{safe}_{key}" if safe else f"proj_{key}"
 
 
-# Values of GRAPHIFY_GRAPH_STORE. Also the values the fork used to put in
-# GRAPHIFY_BACKEND before upstream took that variable for the LLM provider
-# (#4361): llm._graphify_backend_setting() filters them out so a stale setting
-# does not select an LLM backend.
-GRAPH_STORE_VALUES = frozenset({"arcadedb", "arcade", "json"})
+# Values of GRAPHIFY_GRAPH_STORE. `snap` is the default (D1); anything else is
+# an error, because a typo such as `snapshot` would otherwise silently select
+# JSON, i.e. loading a whole graph.json into memory.
+GRAPH_STORE_VALUES = frozenset({"snap", "arcadedb", "arcade", "json"})
+
+# The values the fork used to put in GRAPHIFY_BACKEND before upstream took that
+# variable for the LLM provider (#4361): llm._graphify_backend_setting() filters
+# them out so a stale setting does not select an LLM backend. `snap` never lived
+# in GRAPHIFY_BACKEND, so it is not here: a separate constant from the store set.
+STALE_BACKEND_VALUES = frozenset({"arcadedb", "arcade", "json"})
 
 
 def resolve_backend_config(graph_path: str | None = None) -> dict:
     """Resolve which backend to use from the environment.
 
-    ArcadeDB is the default: the graph database is where graphify reads from,
-    and the server is a machine service that is expected to be running (see
-    `require_backend` for what happens when it is not). ``GRAPHIFY_GRAPH_STORE=json``
-    is the explicit opt-out onto the in-process model — kept for tests, CI and
-    upstream compatibility, not as a fallback the system chooses on its own.
+    The snapshot (``snap``) is the default: a memory-mapped file next to each
+    graph.json (capability ``graph-snapshot-store``). ``arcadedb``/``arcade`` and
+    ``json`` are explicit choices; json is the in-process model, kept for tests,
+    CI and upstream compatibility, not as a fallback the system chooses on its
+    own. Any other value is an error that lists the valid ones.
     ``GRAPHIFY_BACKEND`` is not read: upstream uses it to pick the LLM provider.
 
     The database name defaults to a per-project name derived from ``graph_path``
@@ -2698,7 +2703,15 @@ def resolve_backend_config(graph_path: str | None = None) -> dict:
     """
     import os
     from graphify import arcade_server
-    kind = os.environ.get("GRAPHIFY_GRAPH_STORE", "arcadedb").strip().lower()
+    kind = os.environ.get("GRAPHIFY_GRAPH_STORE", "").strip().lower() or "snap"
+    if kind not in GRAPH_STORE_VALUES:
+        raise GraphDBUnavailable(
+            f"GRAPHIFY_GRAPH_STORE={kind!r} is not a graph store.\n"
+            f"Valid values: snap (default), arcadedb (or arcade), json.")
+    if kind == "snap":
+        from graphify.snap_store import snapshot_path_for
+        return {"kind": "snap", "graph_path": graph_path,
+                "snapshot_path": str(snapshot_path_for(graph_path)) if graph_path else None}
     if kind in ("arcadedb", "arcade"):
         # Precedence: environment, then the machine config the service writes,
         # then the built-in default. Environment on top so a test or a debugging
@@ -2730,6 +2743,11 @@ def open_backend(*, config: dict | None = None, graph=None, graph_path: str | No
     ArcadeDB: connects to the running server named in the config.
     """
     cfg = config or resolve_backend_config(graph_path)
+    if cfg["kind"] == "snap":
+        if not cfg.get("snapshot_path"):
+            raise GraphDBUnavailable("the graph snapshot needs a graph.json path to sit next to.")
+        from graphify.snap_backend import SnapBackend
+        return SnapBackend(cfg["snapshot_path"], graph_json=cfg.get("graph_path") or graph_path)
     if cfg["kind"] == "arcadedb":
         return ArcadeDBBackend(cfg["database"], host=cfg["host"], port=cfg["port"],
                                user=cfg["user"], password=cfg["password"],
@@ -2854,6 +2872,11 @@ def require_service(graph_path: str | None = None, *, config: dict | None = None
     No-op for the JSON backend.
     """
     cfg = config or resolve_backend_config(graph_path)
+    if cfg["kind"] == "snap":
+        # Before any LLM spend: the module must import and speak the expected API.
+        from graphify.snap_store import check_api
+        check_api()
+        return
     if cfg["kind"] != "arcadedb":
         return
     _await_ready(open_backend(config=cfg), **kw)

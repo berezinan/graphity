@@ -937,6 +937,7 @@ def _run_cli() -> None:
         print("    --relation R            edge relation to traverse in reverse (repeatable)")
         print("    --depth N               reverse traversal depth (default 2)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  snap build [dir|graph.json]  build graph.snap from graph.json (the default graph store)")
         print("  god-nodes               list the most connected nodes (architectural hubs)")
         print("    --top N                 how many to show (default 10)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")

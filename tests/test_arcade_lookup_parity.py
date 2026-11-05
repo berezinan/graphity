@@ -122,8 +122,41 @@ def _graph() -> nx.MultiDiGraph:
     return G
 
 
-@pytest.fixture(scope="module")
-def backends(tmp_path_factory):
+_PARALLEL_PAIR = ("p_caller", "p_callee")
+
+
+def _snap_graph() -> nx.MultiDiGraph:
+    # `_graph()` minus the second relation of the parallel pair: the snapshot writer
+    # refuses parallel links of one direction, so that pair is covered on ArcadeDB only.
+    G = _graph()
+    G.remove_edge(*_PARALLEL_PAIR, key=list(G[_PARALLEL_PAIR[0]][_PARALLEL_PAIR[1]])[-1])
+    return G
+
+
+def _skip_on_snap(backends, why):
+    if not isinstance(backends[1], ArcadeDBBackend):
+        pytest.skip(why)
+
+
+def _snap_backends(tmp_path_factory):
+    pytest.importorskip('graphify_snap', reason='graphify-snap wheel not installed')
+    from graphify.snap_backend import SnapBackend
+    from graphify.snap_store import snapshot_path_for
+    from graphify.snap_writer import build_snapshot
+    G = _snap_graph()
+    path = tmp_path_factory.mktemp('snapgraph') / 'graph.json'
+    # A simple graph file (no multigraph, no `key` attributes), as the writer requires.
+    data = json_graph.node_link_data(nx.DiGraph(G), edges='links')
+    path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    build_snapshot(path)
+    yield JsonBackend(G), SnapBackend(snapshot_path_for(path), graph_json=path)
+
+
+@pytest.fixture(scope="module", params=["arcadedb", "snap"])
+def backends(request, tmp_path_factory):
+    if request.param == "snap":
+        yield from _snap_backends(tmp_path_factory)
+        return
     rest = _URL.split("://", 1)[-1]
     host, _, port = rest.partition(":")
     arc = ArcadeDBBackend(_DB, host=host or "127.0.0.1", port=int(port or 2480), password=_PW)
@@ -268,6 +301,7 @@ def test_equal_routes_pick_the_smallest_ids(backends, undirected):
 
 @pytest.mark.parametrize("undirected", [False, True])
 def test_parallel_relations_share_one_segment(backends, undirected):
+    _skip_on_snap(backends, "the snapshot writer refuses parallel links of one direction")
     for b in backends:
         p = b.shortest_path("pairCaller()", "pairCallee()", undirected=undirected)
         assert p.found and p.segments[0].relation == "calls/references"
@@ -298,6 +332,7 @@ def test_neighbor_at_suffix_parity(backends):
 
 def test_parallel_edge_renders_two_lines(backends):
     """pairCaller–pairCallee carries `calls` and `references`; both must appear."""
+    _skip_on_snap(backends, "the snapshot writer refuses parallel links of one direction")
     jb, arc = backends
     for label, b in (("pairCaller()", jb), ("pairCaller()", arc)):
         n = b.get_neighbors(label)
@@ -357,6 +392,7 @@ def test_absolute_seed_is_anchored_at_the_graph_root(backends, tmp_path):
 def test_build_commit_survives_load_and_sync(backends, tmp_path):
     """graph_stats names the build commit on ArcadeDB as on JSON (748de12)."""
     from graphify.query_backend import render_stats
+    _skip_on_snap(backends, "load/sync of the build commit is an ArcadeDB path")
     _, arc = backends
     G = nx.DiGraph()
     G.add_node("a", label="a", source_file="a.py")

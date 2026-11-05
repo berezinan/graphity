@@ -68,6 +68,12 @@ def sync_community_changes(graph_json_path: str, raw: dict, changed: "dict | Non
     """
     from graphify.query_backend import resolve_backend_config, require_backend
     cfg = resolve_backend_config(graph_json_path)
+    if cfg["kind"] == "snap":
+        # Called only after graph.json was rewritten (an idle re-clustering never gets
+        # here), so the snapshot is rebuilt from the file just written.
+        from graphify.snap_store import publish_snapshot_for
+        publish_snapshot_for(graph_json_path)
+        return
     if cfg["kind"] != "arcadedb":
         return
     db = require_backend(config=cfg, require_database=False)

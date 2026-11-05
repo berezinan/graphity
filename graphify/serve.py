@@ -2393,7 +2393,8 @@ def _build_server(graph_path: str):
     # and supports the G-dependent resources; ArcadeDB connects to the running
     # server (one database per project) and leaves G unset (those resources
     # degrade gracefully below).
-    _IS_ARCADE = resolve_backend_config(graph_path)["kind"] == "arcadedb"
+    # Fork delta: any store but json (snap, arcadedb) serves without a loaded G.
+    _IS_ARCADE = resolve_backend_config(graph_path)["kind"] != "json"
     _arcade_ctx: dict[str, dict] = {}
     _arcade_lock = threading.Lock()
 

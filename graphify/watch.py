@@ -3199,6 +3199,11 @@ def _rebuild_code(
                           f"({_st['nodes']} nodes, {_st['edges']} edges).")
                 if (_warn := shortfall_warning(_st)):
                     print(f"[graphify db] warning: {_warn}")
+            elif _cfg["kind"] == "snap":
+                # Fork hook (graphify/snap_store.py): a failed writer raises, which the
+                # handler below reports as a failed rebuild.
+                from graphify.snap_store import publish_snapshot_for as _publish_snapshot_for
+                _publish_snapshot_for(out / "graph.json")
         # Stamped last: every output this rebuild writes is on disk by now, and
         # the gate compares against those outputs as well as the input manifest.
         _stamp_build_state()
