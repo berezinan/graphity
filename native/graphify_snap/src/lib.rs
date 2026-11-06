@@ -395,6 +395,72 @@ fn peek_generation(path: &str) -> Option<u64> {
     Snapshot::open_unchecked(Path::new(path)).ok().map(|s| s.header.meta.generation)
 }
 
+fn gj_err(e: snap_core::graph_json::GjError) -> PyErr {
+    match e {
+        snap_core::graph_json::GjError::Io(m) => PyIOError::new_err(m),
+        snap_core::graph_json::GjError::Damaged(m) => PyValueError::new_err(m),
+    }
+}
+
+/// A node-link graph.json read element by element (change streaming-snapshot-writer).
+///
+/// Members are addressed by their position in the file; keys come back as the
+/// raw key token (quotes included) for the caller to decode, so a repeated key
+/// is resolved the way `json.load` does it, in Python.
+#[pyclass(name = "GraphJson", unsendable)]
+struct PyGraphJson {
+    g: snap_core::graph_json::GraphJson,
+}
+
+#[pymethods]
+impl PyGraphJson {
+    /// Pass 1: sha256, size, mtime and the structure, from one open handle.
+    #[new]
+    fn new(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let p = path.to_owned();
+        let g = py
+            .allow_threads(move || snap_core::graph_json::GraphJson::open(Path::new(&p)))
+            .map_err(gj_err)?;
+        Ok(PyGraphJson { g })
+    }
+
+    /// (size, mtime_ns, sha256 bytes) of exactly the bytes scanned.
+    #[getter]
+    fn source<'py>(&self, py: Python<'py>) -> (u64, i64, Bound<'py, PyBytes>) {
+        (self.g.size, self.g.mtime_ns, PyBytes::new(py, &self.g.sha256))
+    }
+
+    /// Raw key tokens of the top-level members, in file order, repeats included.
+    fn keys<'py>(&mut self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let n = self.g.members.len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(PyBytes::new(py, &self.g.key(i).map_err(gj_err)?));
+        }
+        Ok(out)
+    }
+
+    /// Raw bytes of the value of member `i`.
+    fn value<'py>(&mut self, py: Python<'py>, i: usize) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(py, &self.g.value(i).map_err(gj_err)?))
+    }
+
+    /// Element count when member `i` is an array, else None.
+    fn count(&self, i: usize) -> Option<usize> {
+        self.g.count(i)
+    }
+
+    /// Elements `start .. start + n` of array member `i` as one JSON array.
+    fn batch<'py>(&mut self, py: Python<'py>, i: usize, start: usize, n: usize) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(py, &self.g.batch(i, start, n).map_err(gj_err)?))
+    }
+
+    /// Byte offset where element `k` of array member `i` starts (error messages).
+    fn element_offset(&self, i: usize, k: usize) -> Option<u64> {
+        self.g.members.get(i)?.elems.as_ref()?.get(2 * k).copied()
+    }
+}
+
 #[pyfunction]
 fn format_version() -> u32 {
     snap_core::FORMAT_VERSION
@@ -405,9 +471,10 @@ fn graphify_snap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoder>()?;
     m.add_class::<Snap>()?;
     m.add_class::<Block>()?;
+    m.add_class::<PyGraphJson>()?;
     m.add_function(wrap_pyfunction!(publish, m)?)?;
     m.add_function(wrap_pyfunction!(peek_generation, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;
-    m.add("API_VERSION", 1u32)?;
+    m.add("API_VERSION", 2u32)?;
     Ok(())
 }

@@ -24,7 +24,7 @@ SEARCH_FIELDS = ["nl", "nli", "lt", "src", "st", "rat", "atn", "att"]
 
 # Version of the Python <-> graphify_snap contract. The wheel exports its own
 # API_VERSION; a mismatch is a refusal that tells the user to reinstall it.
-EXPECTED_API_VERSION = 1
+EXPECTED_API_VERSION = 2
 
 
 class Unsupported(ValueError):

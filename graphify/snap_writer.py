@@ -1,9 +1,10 @@
-"""Snapshot writer: graph.json data -> published ``graph.snap`` generation.
+"""Snapshot writer: graph.json -> published ``graph.snap`` generation.
 
-Input is graph.json as data (``graph_stream.load`` of the file, or
-``node_link_data(G)`` for a fixture), in its own node and link order.
-Normalisation runs through the upstream ``serve.py`` functions; the byte layout
-is done by the Rust encoder in the ``graphify-snap`` wheel.
+Input is graph.json, in its own node and link order: the file read element by
+element through ``graphify_snap.GraphJson`` (any layout), or the data as a dict
+(``node_link_data(G)`` for a fixture). Normalisation runs through the upstream
+``serve.py`` functions; the byte layout is done by the Rust encoder in the
+``graphify-snap`` wheel.
 
 The writer never touches graph.json. Publication is a rename over the live
 name done in Rust (``std::fs::rename``): CPython ``os.replace`` fails with
@@ -62,40 +63,9 @@ def _has_nul(d: dict) -> bool:
                for k, v in d.items())
 
 
-def check_supported(data: dict) -> None:
-    """Refuse the graph shapes the snapshot does not reproduce."""
-    from graphify.build import has_parallel_links
-    hint = "; set GRAPHIFY_GRAPH_STORE=json for this project"
-    if data.get("multigraph", True):
-        raise Unsupported("multigraph graphs (or a file without 'multigraph': false)" + hint)
-    links = links_of(data)
-    seen = set()
-    for d in data["nodes"]:
-        nid = d.get("id")
-        if not isinstance(nid, str):
-            raise Unsupported(f"node id that is not a string: {nid!r}" + hint)
-        if nid in seen:
-            raise Unsupported(f"duplicate node id {nid!r}" + hint)
-        if _has_nul(d):
-            raise Unsupported(f"strings with NUL on node {nid!r}, which the format cannot hold" + hint)
-        seen.add(nid)
-    for l in links:
-        if l.get("source") not in seen or l.get("target") not in seen:
-            raise Unsupported("link endpoint that is not a node" + hint)
-        if "_src" in l or "_tgt" in l:
-            raise Unsupported("links with stored _src/_tgt markers" + hint)
-        if _has_nul(l):
-            raise Unsupported("link strings with NUL, which the format cannot hold" + hint)
-    if has_parallel_links(links, directed=True):
-        raise Unsupported("parallel links of one direction" + hint)
-
-
-def partition_hash(nodes) -> bytes:
-    """sha256 of (community, community_name) per node, in node order (information only)."""
-    h = hashlib.sha256()
-    for d in nodes:
-        h.update(_dumps([d.get("community"), d.get("community_name")]).encode())
-    return h.digest()
+_HINT = "; set GRAPHIFY_GRAPH_STORE=json for this project"
+_ARRAYS = ("nodes", "links", "edges")
+_ABSENT = object()
 
 
 def file_info(path: Path) -> tuple[int, int, bytes]:
@@ -107,18 +77,139 @@ def file_info(path: Path) -> tuple[int, int, bytes]:
     return st.st_size, st.st_mtime_ns, h.digest()
 
 
+class _DictGraph:
+    """graph.json data already in memory (fixtures, ``publish_snapshot(data)``)."""
+
+    source = None
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def rest(self) -> dict:
+        return {k: v for k, v in self._data.items() if k not in _ARRAYS}
+
+    def _nodes(self) -> list:
+        nodes = self._data.get("nodes")
+        if not isinstance(nodes, list):
+            raise Unsupported("graph.json without a 'nodes' list" + _HINT)
+        return nodes
+
+    def node_count(self) -> int:
+        return len(self._nodes())
+
+    def node_batches(self, n: int):
+        nodes = self._nodes()
+        for s in range(0, len(nodes), n):
+            yield nodes[s:s + n]
+
+    def link_batches(self, n: int):
+        links = links_of(self._data)
+        if not isinstance(links, list):
+            raise Unsupported("graph.json whose links are not a list" + _HINT)
+        for s in range(0, len(links), n):
+            yield links[s:s + n]
+
+
+class _FileGraph:
+    """graph.json read element by element through ``graphify_snap.GraphJson``.
+
+    Rust finds the byte range of every top-level member and array element; each
+    batch of elements is parsed here with ``json.loads``, so the values are the
+    ones ``json.load`` of the whole file gives. A repeated top-level key resolves
+    as in ``json.load``: first position, last value. ``source`` describes exactly
+    the bytes that were scanned.
+    """
+
+    def __init__(self, path):
+        import graphify_snap
+        self._gj = graphify_snap.GraphJson(str(path))
+        self._at: dict[str, int] = {}
+        for i, raw in enumerate(self._gj.keys()):
+            self._at[json.loads(raw)] = i
+        size, mtime_ns, sha = self._gj.source
+        self.source = (size, mtime_ns, bytes(sha))
+        self._values: dict[int, object] = {}
+
+    def _value(self, key):
+        i = self._at[key]
+        if i not in self._values:
+            try:
+                self._values[i] = json.loads(self._gj.value(i))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"graph.json is damaged in top-level member {key!r}: {exc.msg}") from None
+        return self._values[i]
+
+    def get(self, key, default=None):
+        return self._value(key) if key in self._at else default
+
+    def rest(self) -> dict:
+        return {k: self._value(k) for k in self._at if k not in _ARRAYS}
+
+    def _array(self, key: str | None, what: str) -> tuple[int | None, int]:
+        if key is None:
+            return None, 0
+        i = self._at[key]
+        n = self._gj.count(i)
+        if n is None:
+            raise Unsupported(f"graph.json whose {what} are not a list" + _HINT)
+        return i, n
+
+    def _links_key(self) -> str | None:
+        return "links" if "links" in self._at else "edges" if "edges" in self._at else None
+
+    def node_count(self) -> int:
+        if "nodes" not in self._at:
+            raise Unsupported("graph.json without a 'nodes' list" + _HINT)
+        return self._array("nodes", "nodes")[1]
+
+    def _batches(self, i: int | None, total: int, n: int):
+        for s in range(0, total, n):
+            raw = self._gj.batch(i, s, n)
+            try:
+                items = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                off = self._gj.element_offset(i, s) + exc.pos - 1
+                # exc.pos counts characters; equal to bytes for to_json's ASCII output.
+                raise ValueError(f"graph.json is damaged near byte {off}: {exc.msg}") from None
+            yield items
+
+    def node_batches(self, n: int):
+        yield from self._batches(*self._array("nodes", "nodes"), n)
+
+    def link_batches(self, n: int):
+        yield from self._batches(*self._array(self._links_key(), "links"), n)
+
+
+class _LightNodes:
+    """``G.nodes[nid]`` with the only attributes the ``analyze.god_nodes`` filters read."""
+
+    def __init__(self, idx, labels, files):
+        self._idx, self._labels, self._files = idx, labels, files
+
+    def __getitem__(self, nid):
+        i = self._idx[nid]
+        d = {}
+        if self._labels[i] is not _ABSENT:
+            d["label"] = self._labels[i]
+        if self._files[i] is not _ABSENT:
+            d["source_file"] = self._files[i]
+        return d
+
+
 class _GodGraph:
     """The slice of nx.DiGraph that ``analyze.god_nodes`` reads."""
 
-    def __init__(self, ids, nodes, deg):
-        self._ids, self._deg = ids, deg
-        self._pos = {nid: i for i, nid in enumerate(ids)}
-        self.nodes = {nid: d for nid, d in zip(ids, nodes)}
+    def __init__(self, ids, idx, labels, files, deg):
+        self._ids, self._idx, self._deg = ids, idx, deg
+        self.nodes = _LightNodes(idx, labels, files)
 
     def degree(self, n=None):
         if n is None:
             return list(zip(self._ids, self._deg))
-        return self._deg[self._pos[n]]
+        return self._deg[self._idx[n]]
 
 
 def _node_columns(d: dict) -> tuple:
@@ -153,28 +244,51 @@ def _node_columns(d: dict) -> tuple:
             len(label or nid), _dumps(rest) if rest else None)
 
 
-def encode(data: dict, out_path: Path, *, generation: int = 1, source: Path | None = None,
+def encode(graph, out_path: Path, *, generation: int = 1, source: Path | None = None,
            batch: int = 50_000) -> dict:
-    """Write one snapshot file at ``out_path`` (not published). Returns the report."""
+    """Write one snapshot file at ``out_path`` (not published). Returns the report.
+
+    ``graph`` is graph.json data (a dict; ``source`` then names the file it came
+    from) or a ``_FileGraph`` read element by element. Both give the same bytes.
+    The graph is never held whole: nodes and links are checked, normalised and
+    encoded batch by batch, and only what is needed after the pass stays — the
+    id index, degrees, communities, and label / source_file for ``god_nodes``.
+    """
     import graphify_snap
     from graphify.analyze import god_nodes as _god_nodes
 
+    g = graph if isinstance(graph, _FileGraph) else _DictGraph(graph)
     times: dict[str, float] = collections.defaultdict(float)
     t_all = time.perf_counter()
-    check_supported(data)
-    nodes = data["nodes"]
-    links = links_of(data)
-    directed = bool(data.get("directed", False))
+    if g.get("multigraph", True):
+        raise Unsupported("multigraph graphs (or a file without 'multigraph': false)" + _HINT)
+    n_nodes = g.node_count()
+    directed = bool(g.get("directed", False))
     enc = graphify_snap.Encoder(NODE_FIELDS, LINK_FIELDS, directed)
     idx: dict[str, int] = {}
+    ids: list[str] = []
+    labels: list = []
+    files: list = []
     communities: dict[int, list[int]] = {}
-    for start in range(0, len(nodes), batch):
+    part = hashlib.sha256()
+    for chunk_nodes in g.node_batches(batch):
         t = time.perf_counter()
-        chunk_nodes = nodes[start:start + batch]
-        rows = [_node_columns(d) for d in chunk_nodes]
-        for k, d in enumerate(chunk_nodes):
-            i = start + k
-            idx[d["id"]] = i
+        for d in chunk_nodes:
+            if not isinstance(d, dict):
+                raise Unsupported("node that is not a JSON object" + _HINT)
+            nid = d.get("id")
+            if not isinstance(nid, str):
+                raise Unsupported(f"node id that is not a string: {nid!r}" + _HINT)
+            if nid in idx:
+                raise Unsupported(f"duplicate node id {nid!r}" + _HINT)
+            if _has_nul(d):
+                raise Unsupported(f"strings with NUL on node {nid!r}, which the format cannot hold" + _HINT)
+            i = len(ids)
+            idx[nid] = i
+            ids.append(nid)
+            labels.append(d.get("label", _ABSENT))
+            files.append(d.get("source_file", _ABSENT))
+            part.update(_dumps([d.get("community"), d.get("community_name")]).encode())
             cid = d.get("community")
             if cid is not None:
                 try:
@@ -182,6 +296,7 @@ def encode(data: dict, out_path: Path, *, generation: int = 1, source: Path | No
                 except (TypeError, ValueError):
                     raise Unsupported(f"community that int() rejects: {cid!r}") from None
                 communities.setdefault(key, []).append(i)
+        rows = [_node_columns(d) for d in chunk_nodes]
         cols = list(zip(*rows))
         search = [list(c) for c in zip(*cols[3])]
         vals = [list(c) for c in zip(*cols[4])]
@@ -194,16 +309,38 @@ def encode(data: dict, out_path: Path, *, generation: int = 1, source: Path | No
             raise Unsupported(f"node strings the format cannot hold: {exc}") from None
         times["encode"] += time.perf_counter() - t
 
-    deg = [0] * len(nodes)
+    if len(ids) != n_nodes:
+        raise ValueError(f"graph.json changed while it was read ({n_nodes} nodes expected, {len(ids)} read)")
+
+    deg = [0] * n_nodes
     conf = collections.Counter()
-    for start in range(0, len(links), batch):
+    # Parallel links of one direction, as build.has_parallel_links(directed=True):
+    # ids are unique and endpoints are checked, so a pair is its two node numbers.
+    pairs: set[int] = set()
+    n_links = 0
+    for chunk in g.link_batches(batch):
         t = time.perf_counter()
-        chunk = links[start:start + batch]
-        src = [idx[l["source"]] for l in chunk]
-        tgt = [idx[l["target"]] for l in chunk]
-        for s, g in zip(src, tgt):
+        src: list[int] = []
+        tgt: list[int] = []
+        for l in chunk:
+            if not isinstance(l, dict):
+                raise Unsupported("link that is not a JSON object" + _HINT)
+            s, e = idx.get(l.get("source")), idx.get(l.get("target"))
+            if s is None or e is None:
+                raise Unsupported("link endpoint that is not a node" + _HINT)
+            if "_src" in l or "_tgt" in l:
+                raise Unsupported("links with stored _src/_tgt markers" + _HINT)
+            if _has_nul(l):
+                raise Unsupported("link strings with NUL, which the format cannot hold" + _HINT)
+            key = s * n_nodes + e
+            if key in pairs:
+                raise Unsupported("parallel links of one direction" + _HINT)
+            pairs.add(key)
+            src.append(s)
+            tgt.append(e)
             deg[s] += 1
-            deg[g] += 1
+            deg[e] += 1
+        n_links += len(chunk)
         conf.update(l.get("confidence", "EXTRACTED") for l in chunk)
         vals = [[_dumps(l[f]) if f in l else None for l in chunk] for f in LINK_FIELDS]
         cold = []
@@ -218,9 +355,9 @@ def encode(data: dict, out_path: Path, *, generation: int = 1, source: Path | No
             raise Unsupported(f"link strings the format cannot hold: {exc}") from None
         times["encode"] += time.perf_counter() - t
 
+    del pairs
     t = time.perf_counter()
-    ids = [d["id"] for d in nodes]
-    gods = _god_nodes(_GodGraph(ids, nodes, deg), top_n=GOD_NODES_KEPT)
+    gods = _god_nodes(_GodGraph(ids, idx, labels, files, deg), top_n=GOD_NODES_KEPT)
     cids = list(communities)
     comm_off = [0]
     comm_mem: list[int] = []
@@ -228,29 +365,31 @@ def encode(data: dict, out_path: Path, *, generation: int = 1, source: Path | No
         comm_mem.extend(communities[c])
         comm_off.append(len(comm_mem))
     stats = {
-        "nodes": len(nodes),
-        "edges": len(links),
+        "nodes": n_nodes,
+        "edges": n_links,
         "confidence": {k: v for k, v in conf.items() if isinstance(k, str)},
-        "god_nodes": [{"label": g["label"], "degree": g["degree"]} for g in gods],
+        "god_nodes": [{"label": gn["label"], "degree": gn["degree"]} for gn in gods],
         "god_nodes_kept": GOD_NODES_KEPT,
         "cids": cids,
-        "built_at_commit": data.get("built_at_commit"),
+        "built_at_commit": g.get("built_at_commit"),
     }
     meta = {"node_fields": NODE_FIELDS, "link_fields": LINK_FIELDS, "directed": directed,
             "graphify_version": graphify_version()}
-    graph_rest = {k: v for k, v in data.items() if k not in ("nodes", "links", "edges")}
-    if source is not None:
+    graph_rest = g.rest()
+    if g.source is not None:
+        size, mtime_ns, sha = g.source
+    elif source is not None:
         size, mtime_ns, sha = file_info(source)
     else:
         size, mtime_ns, sha = 0, 0, bytes(32)
     times["stats"] += time.perf_counter() - t
     rust = enc.finish(str(out_path), generation, norm_fingerprint(), size, mtime_ns, sha,
-                      partition_hash(nodes), _dumps(meta), _dumps(stats), _dumps(graph_rest),
+                      part.digest(), _dumps(meta), _dumps(stats), _dumps(graph_rest),
                       comm_off, comm_mem)
     for k, v in rust:
         times[k] += v
     times["total"] = time.perf_counter() - t_all
-    return {"nodes": len(nodes), "links": len(links), "bytes": out_path.stat().st_size,
+    return {"nodes": n_nodes, "links": n_links, "bytes": out_path.stat().st_size,
             "generation": generation, "times": dict(times)}
 
 
@@ -359,16 +498,16 @@ def publish_snapshot(data: dict, out_dir: Path, *, name: str = "graph.snap",
 def build_snapshot(graph_json: str | Path) -> dict:
     """Build and publish ``<graph>.snap`` next to ``graph_json`` from the written file.
 
-    ``graph_json`` is read with the streaming loader and never modified.
+    ``graph_json`` is read element by element, whatever its layout (indented or
+    one line, as ``to_json`` writes it), and never modified.
     """
-    from graphify import graph_stream
     src = Path(graph_json)
     t = time.perf_counter()
-    data = graph_stream.load(src)
-    load_s = time.perf_counter() - t
+    graph = _FileGraph(src)
+    scan_s = time.perf_counter() - t
     live = snapshot_path_for(src)
-    report = publish_snapshot(data, live.parent, name=live.name, source=src)
-    report["times"]["json_load"] = load_s
+    report = publish_snapshot(graph, live.parent, name=live.name)
+    report["times"]["scan"] = scan_s
     return report
 
 
@@ -393,9 +532,9 @@ def snap_build_command(args):
     check_api()
     try:
         rep = build_snapshot(gj)
-    except Unsupported as exc:
+    except ValueError as exc:  # Unsupported shape, or a damaged graph.json
         print('error: cannot build a snapshot of ' + str(gj) + ': ' + str(exc), file=sys.stderr)
         return 1
-    secs = rep['times']['total'] + rep['times'].get('json_load', 0.0)
+    secs = rep['times']['total'] + rep['times'].get('scan', 0.0)
     print('snapshot ' + rep['path'] + ': ' + str(rep['nodes']) + ' nodes, ' + str(rep['links']) + ' links, ' + str(rep['bytes']) + ' bytes, ' + format(secs, '.1f') + 's')
     return 0

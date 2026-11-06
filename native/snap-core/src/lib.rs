@@ -3,6 +3,7 @@
 pub mod blocks;
 pub mod encode;
 pub mod graph;
+pub mod graph_json;
 pub mod header;
 pub mod pool;
 pub mod reader;
