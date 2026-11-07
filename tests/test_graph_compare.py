@@ -294,8 +294,9 @@ def test_full_rebuild_parses_graph_json_once(tmp_path, graph_reads, no_cluster):
     reads.clear(), seen.clear()
     (corpus / 'a.py').write_text('def f():\n    return 2\n', encoding='utf-8')
     assert watch._rebuild_code(corpus, no_cluster=no_cluster, acquire_lock=False) is True
-    # prior (#1915) is read once; reconcile reads once; the compare reuses the reconcile parse.
-    assert len(reads) == 2, reads
+    # streaming-rebuild-graph-reads: prior (#1915) and reconcile read element-wise, the compare
+    # reuses the reconcile fingerprint — no whole-text read of graph.json at all.
+    assert len(reads) == 0, reads
     assert seen and not ({'prior', 'prior_paths'} & seen[0]), 'prior must be freed after #1915'
 
 
@@ -308,8 +309,9 @@ def test_watch_rebuild_parses_graph_json_once(tmp_path, graph_reads, no_cluster)
     (corpus / 'a.py').write_text('def f():\n    return 3\n', encoding='utf-8')
     assert watch._rebuild_code(corpus, changed_paths=[Path('a.py')], no_cluster=no_cluster,
                                acquire_lock=False) is True
-    # prior (#1915) + ctx_graph (#2406) + reconcile; no further parse for the compare.
-    assert len(reads) == 3, reads
+    # Only the resolution context (#2406) still parses the whole file; prior, reconcile and the
+    # compare do not (streaming-rebuild-graph-reads).
+    assert len(reads) == 1, reads
     assert seen and not ({'prior', 'prior_paths', 'ctx_graph', 'ctx_paths'} & seen[0])
 
 
@@ -325,9 +327,8 @@ def test_unchanged_rebuild_leaves_graph_json_untouched(tmp_path):
 # --- 3.5 port guard ---
 
 def test_every_port_func_resolves():
-    from graphify.snap_store import _port_func
     for name in PORT_FUNCS:
-        assert callable(_port_func(name)), name
+        assert callable(graph_compare._port_func(name)), name
 
 
 def test_port_hash_matches_recorded():

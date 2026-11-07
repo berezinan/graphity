@@ -2314,7 +2314,9 @@ def _rebuild_code(
         if ast_doc_files and existing_graph.exists():
             try:
                 check_graph_file_size_cap(existing_graph)
-                prior = json.loads(existing_graph.read_text(encoding="utf-8"))
+                # fork: only the fields this block reads, read element-wise (streaming-rebuild-graph-reads D3)
+                from graphify.graph_compare import load_graph_projection
+                prior = load_graph_projection(existing_graph)
                 prior_paths = _StoredSourcePaths(
                     prior,
                     out=out,
@@ -3034,7 +3036,11 @@ def _rebuild_code(
         json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit, community_labels=labels)
         if not json_written:
             return False
-        candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))
+        # fork: one element-wise pass — fingerprint, the nodes _check_shrink reads,
+        # the graph.html input — instead of the whole parsed graph (streaming-rebuild-graph-reads D4)
+        from graphify.graph_compare import read_candidate
+        candidate = read_candidate(graph_tmp)
+        candidate_graph_data = candidate.shrink_data
         same_graph = False
         same_report = False
         if existing_graph.exists():
@@ -3056,7 +3062,7 @@ def _rebuild_code(
                 )
                 return False
             try:
-                same_graph = existing_fp is not None and existing_fp == graph_fingerprint(candidate_graph_data)
+                same_graph = existing_fp is not None and existing_fp == candidate.fingerprint
             except Exception:
                 same_graph = False
         same_graph = same_graph and not legacy_layout
@@ -3145,7 +3151,8 @@ def _rebuild_code(
         # remains retryable from the unchanged-topology fast path.
         html_written = False
         if not no_change:
-            html_action = _reconcile_graph_html(out, candidate_graph_data)
+            # fork: projection when the view is aggregated, else the full graph (streaming-rebuild-graph-reads D4)
+            html_action = _reconcile_graph_html(out, candidate.html_data(existing_graph))
             html_written = html_action == "rendered"
 
         # Regenerate callflow HTML if the user previously generated one —
