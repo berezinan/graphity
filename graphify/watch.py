@@ -1140,15 +1140,16 @@ def _reconcile_existing_graph(
     # reads as "no baseline, write allowed", so the hook overwrote a graph it
     # merely failed to READ. A missing file (None) keeps first-build behavior:
     # reconcile proceeds with an empty baseline and the write is allowed.
-    from graphify.build import _load_existing_graph
-    if _load_existing_graph(existing_graph) is None:
+    # fork: one parse, same refusals (rebuild-single-graph-parse D3)
+    from graphify.graph_compare import load_existing_graph_json
+    existing = load_existing_graph_json(existing_graph)
+    if existing is None:
         return result, existing_graph_data
     # Cap + parse validated above. Reload as the full dict — reconcile needs
     # top-level keys (hyperedges, per-node community for _node_community_map,
     # topology compare) the (nodes, edges, hyperedges) tuple does not carry.
     # A failure here (e.g. a race rewriting the file) still propagates,
     # staying fail-closed.
-    existing = json.loads(existing_graph.read_text(encoding="utf-8"))
     existing_graph_data = existing
 
     # Backfill tier provenance on legacy items (#2334), mirroring
@@ -2356,6 +2357,7 @@ def _rebuild_code(
                         if prior_paths.absolute_identity(str(p), project_root)
                         in semantic_doc_identities
                     }
+                del prior, prior_paths  # fork: free the parsed graph (rebuild-single-graph-parse D2)
             except Exception:
                 semantic_doc_files = set()
 
@@ -2576,6 +2578,7 @@ def _rebuild_code(
                                 lexical_scopes
                             )
                     resolution_context_edges.append(context_edge)
+                del ctx_graph, ctx_paths  # fork: free the parsed graph (rebuild-single-graph-parse D2)
             except Exception:
                 # Unreadable/oversized graph: resolve with the changed batch only
                 # (pre-#2406 behavior). Reconcile below still fails closed on it.
@@ -2754,8 +2757,9 @@ def _rebuild_code(
             same_graph = False
             if existing_graph.exists():
                 try:
-                    check_graph_file_size_cap(existing_graph)
-                    existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
+                    # fork: fingerprint from the reconcile parse, re-read only if the file changed (D4)
+                    from graphify.graph_compare import existing_graph_fingerprint, graph_fingerprint
+                    existing_fp = existing_graph_fingerprint(existing_graph)
                 except Exception as exc:
                     # A load failure is NOT "graph changed" (#2251): refuse to
                     # overwrite a graph we merely failed to read. Normally
@@ -2769,10 +2773,7 @@ def _rebuild_code(
                     )
                     return False
                 try:
-                    same_graph = (
-                        json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
-                        == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
-                    )
+                    same_graph = existing_fp is not None and existing_fp == graph_fingerprint(candidate_graph_data)
                 except Exception:
                     same_graph = False
             same_graph = same_graph and not legacy_layout
@@ -2851,10 +2852,9 @@ def _rebuild_code(
         candidate_topology = _topology_from_graph(G)
         if existing_graph_data and not legacy_layout:
             try:
-                same_topology = (
-                    json.dumps(_canonical_topology_for_compare(existing_graph_data), sort_keys=True, ensure_ascii=False)
-                    == json.dumps(_canonical_topology_for_compare(candidate_topology), sort_keys=True, ensure_ascii=False)
-                )
+                # fork: fingerprints instead of graph-sized strings (D4)
+                from graphify.graph_compare import topology_fingerprint
+                same_topology = topology_fingerprint(existing_graph_data) == topology_fingerprint(candidate_topology)
             except Exception:
                 same_topology = False
             if same_topology:
@@ -3039,8 +3039,9 @@ def _rebuild_code(
         same_report = False
         if existing_graph.exists():
             try:
-                check_graph_file_size_cap(existing_graph)
-                existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
+                # fork: fingerprint from the reconcile parse, re-read only if the file changed (D4)
+                from graphify.graph_compare import existing_graph_fingerprint, graph_fingerprint
+                existing_fp = existing_graph_fingerprint(existing_graph)
             except Exception as exc:
                 # A load failure is NOT "graph changed" (#2251): refuse to
                 # overwrite a graph we merely failed to read. Normally
@@ -3055,10 +3056,7 @@ def _rebuild_code(
                 )
                 return False
             try:
-                same_graph = (
-                    json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
-                    == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
-                )
+                same_graph = existing_fp is not None and existing_fp == graph_fingerprint(candidate_graph_data)
             except Exception:
                 same_graph = False
         same_graph = same_graph and not legacy_layout
