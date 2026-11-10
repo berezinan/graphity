@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -612,15 +612,30 @@ def _file_to_text(path: Path) -> str:
     return _read_source_text(path)
 
 
-def _resolve_under_root(path: Path, root: Path) -> Path | None:
-    """Return the resolved path only when it stays inside ``root``."""
+def _resolve_under_root(path: Path, root: Path, external_roots: Iterable[Path] = ()) -> Path | None:
+    """Return the resolved path only when it stays inside ``root``.
+
+    Fork delta (external-roots-semantic-read): a path that resolves under one
+    of the allowed ``external_roots`` is accepted too, unless ``path`` is
+    itself a link — the same rule ``detect._WalkGate.admit`` applies, so a
+    file the walk admitted is not dropped here.
+    """
     try:
-        resolved_root = root.resolve()
         resolved_path = path.resolve()
-        resolved_path.relative_to(resolved_root)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError):
         return None
-    return resolved_path
+    try:
+        resolved_path.relative_to(root.resolve())
+        return resolved_path
+    except (OSError, RuntimeError, ValueError):
+        pass
+    if external_roots:
+        from graphify.detect import _is_dir_link, _key_under, _real_key
+
+        key = _real_key(resolved_path)
+        if not _is_dir_link(path) and any(_key_under(key, _real_key(e)) for e in external_roots):
+            return resolved_path
+    return None
 
 
 # Known prompt-injection / chat-template sentinels that a hostile source file
@@ -681,7 +696,7 @@ def _char_cap_for(path: Path) -> int:
     return _TEXT_SLICE_CHARS if is_sliceable(path) else _UNSLICED_CHAR_CAP
 
 
-def _read_files(units: "list[Path | FileSlice]", root: Path) -> str:
+def _read_files(units: "list[Path | FileSlice]", root: Path, *, external_roots: Iterable[Path] = ()) -> str:
     """Return file/slice contents formatted for the extraction prompt.
 
     Each unit is wrapped in an <untrusted_source> delimiter block and known
@@ -695,7 +710,7 @@ def _read_files(units: "list[Path | FileSlice]", root: Path) -> str:
     parts: list[str] = []
     for u in units:
         p = unit_path(u)
-        safe_path = _resolve_under_root(p, root)
+        safe_path = _resolve_under_root(p, root, external_roots)
         if safe_path is None:
             print(f"[graphify] skipping {p}: symlink target outside corpus root", file=sys.stderr)
             continue
@@ -762,7 +777,9 @@ def _label_identifiers(label: str) -> list[str]:
     return [t for t in _LABEL_IDENT_RE.findall(base) if len(t) >= 3]
 
 
-def _dispatched_source_text(units: "list[Path | FileSlice]", root: Path) -> dict[Path, str]:
+def _dispatched_source_text(
+    units: "list[Path | FileSlice]", root: Path, *, external_roots: Iterable[Path] = ()
+) -> dict[Path, str]:
     """Map each dispatched text unit's resolved path to the (lower-cased, capped)
     source bytes the model actually saw via :func:`_read_files`.
 
@@ -773,7 +790,7 @@ def _dispatched_source_text(units: "list[Path | FileSlice]", root: Path) -> dict
     by_path: dict[Path, str] = {}
     for u in units:
         p = unit_path(u)
-        safe = _resolve_under_root(p, root)
+        safe = _resolve_under_root(p, root, external_roots)
         if safe is None:
             continue
         try:
@@ -787,7 +804,9 @@ def _dispatched_source_text(units: "list[Path | FileSlice]", root: Path) -> dict
     return by_path
 
 
-def _bind_node_evidence(result: dict, text_units: "list[Path | FileSlice]", root: Path) -> int:
+def _bind_node_evidence(
+    result: dict, text_units: "list[Path | FileSlice]", root: Path, *, external_roots: Iterable[Path] = ()
+) -> int:
     """Downgrade code-typed nodes whose symbol name has no evidence in the source
     the model read, returning the number downgraded.
 
@@ -820,7 +839,7 @@ def _bind_node_evidence(result: dict, text_units: "list[Path | FileSlice]", root
     if not any(isinstance(n, dict) and n.get("file_type") == "code" and n.get("source_file")
                for n in nodes):
         return 0
-    source_by_path = _dispatched_source_text(text_units, root)
+    source_by_path = _dispatched_source_text(text_units, root, external_roots=external_roots)
     if not source_by_path:
         return 0
     downgraded = 0
@@ -940,7 +959,9 @@ def _partition_semantic_files(
     return text_units, image_files
 
 
-def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool = True) -> list[_ImageRef]:
+def _build_image_refs(
+    image_files: list[Path], root: Path, *, read_bytes: bool = True, external_roots: Iterable[Path] = ()
+) -> list[_ImageRef]:
     """Build `_ImageRef`s for raster images.
 
     `read_bytes=True` (base64 backends) loads the pixels and drops any image over
@@ -952,7 +973,7 @@ def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool =
     """
     refs: list[_ImageRef] = []
     for p in image_files:
-        abs_path = _resolve_under_root(p, root)
+        abs_path = _resolve_under_root(p, root, external_roots)
         if abs_path is None:
             print(f"[graphify] skipping image {p}: symlink target outside corpus root", file=sys.stderr)
             continue
@@ -2139,6 +2160,7 @@ def extract_files_direct(
     *,
     deep_mode: bool = False,
     max_output_tokens: int | None = None,
+    external_roots: Iterable[Path] = (),
 ) -> dict:
     """Extract semantic nodes/edges from a list of files using the given backend.
 
@@ -2200,12 +2222,15 @@ def extract_files_direct(
     # as before; images become structured refs the backend renders as pixels
     # (vision backends) or as a text reference node (everything else).
     text_files, image_files = _partition_semantic_files(files)
-    user_msg = _read_files(text_files, root)
+    user_msg = _read_files(text_files, root, external_roots=external_roots)
     vision = _backend_supports_vision(backend)
     # Only base64 (inline) vision backends need the bytes loaded + size-capped;
     # path-based backends (claude-cli) and non-vision backends do not.
     read_bytes = vision and backend not in _PATH_IMAGE_BACKENDS
-    image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
+    image_refs = (
+        _build_image_refs(image_files, root, read_bytes=read_bytes, external_roots=external_roots)
+        if image_files else []
+    )
     if image_refs and not vision:
         image_refs = _strip_pixels(image_refs)
     max_out = max_output_tokens or _resolve_max_tokens(cfg.get("max_tokens", 8192))
@@ -2259,7 +2284,7 @@ def extract_files_direct(
     # excluded (binary, unverifiable). Best-effort — never abort extraction.
     if isinstance(result, dict):
         try:
-            _n_unverified = _bind_node_evidence(result, text_files, root)
+            _n_unverified = _bind_node_evidence(result, text_files, root, external_roots=external_roots)
             if _n_unverified:
                 print(
                     f"[graphify] {_n_unverified} semantic node(s) had no evidence in "
@@ -2585,6 +2610,7 @@ def _extract_with_adaptive_retry(
     *,
     deep_mode: bool = False,
     max_output_tokens: int | None = None,
+    external_roots: Iterable[Path] = (),
 ) -> dict:
     """Extract a chunk; if the response is truncated (`finish_reason="length"`),
     the API rejects the prompt as too large for the model's context window, or
@@ -2641,11 +2667,13 @@ def _extract_with_adaptive_retry(
     def _merge_two(left_units, right_units, out_budget=None) -> dict:
         left = _extract_with_adaptive_retry(
             left_units, backend, api_key, model, root, max_depth, _depth + 1,
-            deep_mode=deep_mode, max_output_tokens=out_budget or max_output_tokens
+            deep_mode=deep_mode, max_output_tokens=out_budget or max_output_tokens,
+            external_roots=external_roots,
         )
         right = _extract_with_adaptive_retry(
             right_units, backend, api_key, model, root, max_depth, _depth + 1,
-            deep_mode=deep_mode, max_output_tokens=out_budget or max_output_tokens
+            deep_mode=deep_mode, max_output_tokens=out_budget or max_output_tokens,
+            external_roots=external_roots,
         )
         return {
             "nodes": left.get("nodes", []) + right.get("nodes", []),
@@ -2678,9 +2706,12 @@ def _extract_with_adaptive_retry(
         # that wraps `extract_files_direct` with a fixed signature keeps working
         # unless a shrunken budget is actually in play.
         budget_kw = {"max_output_tokens": max_output_tokens} if max_output_tokens else {}
+        # Same for external roots (fork delta, external-roots-semantic-read):
+        # passed only when there are some.
+        ext_kw = {"external_roots": external_roots} if external_roots else {}
         result = extract_files_direct(
             chunk, backend=backend, api_key=api_key, model=model, root=root,
-            deep_mode=deep_mode, **budget_kw,
+            deep_mode=deep_mode, **budget_kw, **ext_kw,
         )
         # A hollow response is retried as-is, with backoff — see _mark_hollow.
         # Bounded by a fixed number of attempts, so one misbehaving backend
@@ -2701,7 +2732,8 @@ def _extract_with_adaptive_retry(
             )
             time.sleep(_delay)
             result = extract_files_direct(
-                chunk, backend=backend, api_key=api_key, model=model, root=root, deep_mode=deep_mode
+                chunk, backend=backend, api_key=api_key, model=model, root=root, deep_mode=deep_mode,
+                **ext_kw,
             )
     except Exception as exc:  # noqa: BLE001 — re-raise unless it's a known context overflow or timeout
         is_timeout = _looks_like_timeout(exc)
@@ -2742,6 +2774,7 @@ def _extract_with_adaptive_retry(
                 return _extract_with_adaptive_retry(
                     chunk, backend, api_key, model, root, max_depth, _depth + 1,
                     deep_mode=deep_mode, max_output_tokens=smaller_out,
+                    external_roots=external_roots,
                 )
             fail_desc = "timed out" if is_timeout else "exceeds model context"
             print(
@@ -2842,11 +2875,13 @@ def _extract_with_adaptive_retry(
     # only the input shrinks — it is carried down unchanged, not reset.
     left = _extract_with_adaptive_retry(
         chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1,
-        deep_mode=deep_mode, max_output_tokens=max_output_tokens
+        deep_mode=deep_mode, max_output_tokens=max_output_tokens,
+        external_roots=external_roots,
     )
     right = _extract_with_adaptive_retry(
         chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1,
-        deep_mode=deep_mode, max_output_tokens=max_output_tokens
+        deep_mode=deep_mode, max_output_tokens=max_output_tokens,
+        external_roots=external_roots,
     )
 
     return {
@@ -2943,6 +2978,7 @@ def extract_corpus_parallel(
     max_retry_depth: int | None = None,
     deep_mode: bool = False,
     cache_root: "Path | None" = None,
+    external_roots: "Iterable[Path | str] | None" = None,
 ) -> dict:
     """Extract a corpus in chunks, merging results.
 
@@ -3000,6 +3036,14 @@ def extract_corpus_parallel(
     """
     if max_retry_depth is None:
         max_retry_depth = _resolve_max_retry_depth()
+    # Fork delta (external-roots-semantic-read): files the walk admitted through
+    # an allowed external root must be readable here too. Normalized the way
+    # the walk does it; the walk already warned about dropped roots.
+    if external_roots:
+        from graphify.detect import _normalize_external_roots
+
+        external_roots = _normalize_external_roots(external_roots, root, warn=False)
+    external_roots = list(external_roots or ())
     files = [f if isinstance(f, (Path, FileSlice)) else Path(f) for f in files]
     # Split oversized sliceable documents (text + PDF) into slices that cover
     # the whole file before packing, so content past `_TEXT_SLICE_CHARS` is
@@ -3037,6 +3081,7 @@ def extract_corpus_parallel(
                 root=root,
                 max_depth=max_retry_depth,
                 deep_mode=deep_mode,
+                external_roots=external_roots,
             )
             # Heal model-mangled attributions BEFORE the checkpoint cache write
             # and the merge, so the cache is written and the #1890/#1895 passes

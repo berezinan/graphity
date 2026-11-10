@@ -4744,6 +4744,10 @@ def dispatch_command(cmd: str) -> None:
                 }
                 if deep_mode:
                     corpus_kwargs["deep_mode"] = True
+                # Fork delta (external-roots-semantic-read): the LLM readers
+                # must accept the files this run's walk admitted through them.
+                if _effective_external_roots:
+                    corpus_kwargs["external_roots"] = list(_effective_external_roots)
                 if cli_token_budget is not None:
                     corpus_kwargs["token_budget"] = cli_token_budget
                 if cli_max_concurrency is not None:

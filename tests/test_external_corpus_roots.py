@@ -516,3 +516,150 @@ def test_extract_without_external_roots_prunes_their_nodes(projects, dir_link):
 
     assert result.returncode == 0, result.stderr
     assert not any(s.startswith("db/") for s in _graph_sources(consumer))
+
+
+# --- semantic read (external-roots-semantic-read) --------------------------
+#
+# The walk admits files under an allowed external root; the LLM readers in
+# llm.py must read them too instead of dropping them as "symlink target
+# outside corpus root".
+
+_OUTSIDE = "symlink target outside corpus root"
+
+
+@pytest.fixture
+def mounted(projects, dir_link):
+    """``consumer/_reversa_sdd/db`` mounted on ``src/_reversa_sdd/db`` (mirrored)."""
+    src, consumer = projects
+    (consumer / "_reversa_sdd").mkdir()
+    dir_link(consumer / "_reversa_sdd" / "db", src / "_reversa_sdd" / "db")
+    return src, consumer, consumer / "_reversa_sdd" / "db" / "mem" / "design.md"
+
+
+def test_read_files_includes_document_under_external_root(mounted, capsys):
+    from graphify.llm import _read_files
+
+    src, consumer, doc = mounted
+
+    msg = _read_files([doc], consumer, external_roots=[src])
+
+    assert "shared design" in msg
+    assert "_reversa_sdd/db/mem/design.md" in msg
+    assert _OUTSIDE not in capsys.readouterr().err
+
+
+def test_read_files_without_external_roots_still_drops_link(mounted, capsys):
+    from graphify.llm import _read_files
+
+    _src, consumer, doc = mounted
+
+    assert "shared design" not in _read_files([doc], consumer)
+    assert _OUTSIDE in capsys.readouterr().err
+
+
+def test_read_files_drops_link_past_allowed_roots(projects, dir_link, tmp_path, capsys):
+    from graphify.llm import _read_files
+
+    src, consumer = projects
+    other = tmp_path / "other_proj"
+    other.mkdir()
+    (other / "x.md").write_text("# X\n\nforeign text\n", encoding="utf-8")
+    dir_link(consumer / "other", other)
+
+    msg = _read_files([consumer / "other" / "x.md"], consumer, external_roots=[src])
+
+    assert "foreign text" not in msg
+    assert _OUTSIDE in capsys.readouterr().err
+
+
+def test_read_files_drops_file_link_into_external_root(requires_symlinks, projects, capsys):
+    from graphify.llm import _read_files
+
+    src, consumer = projects
+    (consumer / "note.md").symlink_to(src / "db" / "a.md")
+
+    msg = _read_files([consumer / "note.md"], consumer, external_roots=[src])
+
+    assert "shared document a" not in msg
+    assert _OUTSIDE in capsys.readouterr().err
+
+
+def test_build_image_refs_includes_image_under_external_root(projects, dir_link):
+    from graphify.llm import _build_image_refs
+
+    src, consumer = projects
+    (src / "db" / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 16)
+    dir_link(consumer / "db", src / "db")
+
+    refs = _build_image_refs([consumer / "db" / "diagram.png"], consumer, external_roots=[src])
+
+    assert [r.rel for r in refs] == ["db/diagram.png"]
+    assert refs[0].raw is not None
+
+
+def test_evidence_binding_checks_document_under_external_root(projects, dir_link):
+    from graphify.llm import _bind_node_evidence
+
+    src, consumer = projects
+    dir_link(consumer / "db", src / "db")
+    result = {"nodes": [{
+        "id": "a_ghost", "label": "NoSuchSymbolHere()",
+        "file_type": "code", "source_file": "db/a.md",
+    }]}
+
+    downgraded = _bind_node_evidence(
+        result, [consumer / "db" / "a.md"], consumer, external_roots=[src]
+    )
+
+    assert downgraded == 1
+    assert result["nodes"][0]["verification"] == "unverified"
+
+
+def test_extract_sends_external_document_to_model(mounted, tmp_path, monkeypatch):
+    """End to end: the CLI hands the run's external roots to the LLM readers,
+    both when given on the command line and when reused from the build config."""
+    import graphify.__main__ as mainmod
+
+    src, consumer, doc = mounted
+    out_dir = tmp_path / "out"
+    seen: list[str] = []
+
+    def _fake_claude(api_key, model, user_message, max_tokens=8192, *, deep_mode=False, images=None):
+        seen.append(user_message)
+        nodes = []
+        if "_reversa_sdd/db/mem/design.md" in user_message:
+            nodes.append({
+                "id": "design_doc", "label": "Design", "file_type": "document",
+                "source_file": "_reversa_sdd/db/mem/design.md",
+            })
+        return {"nodes": nodes, "edges": [], "hyperedges": [],
+                "input_tokens": 1, "output_tokens": 1, "finish_reason": "stop"}
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+    monkeypatch.setattr("graphify.llm._call_claude", _fake_claude)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+
+    def _extract(*extra: str) -> None:
+        monkeypatch.setattr(mainmod.sys, "argv", [
+            "graphify", "extract", str(consumer), "--backend", "claude",
+            "--no-cluster", "--out", str(out_dir), *extra,
+        ])
+        try:
+            mainmod.main()
+        except SystemExit as exc:
+            assert exc.code in (None, 0)
+
+    _extract("--external-root", str(src))
+
+    assert any("shared design" in m for m in seen)
+    graph = json.loads((out_dir / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    assert "_reversa_sdd/db/mem/design.md" in {
+        Path(str(n.get("source_file", ""))).as_posix() for n in graph["nodes"]
+    }
+
+    # Recorded roots: a later run without --external-root still reads the file.
+    seen.clear()
+    doc.write_text("# Design\n\nrevised shared design\n", encoding="utf-8")
+    _extract()
+
+    assert any("revised shared design" in m for m in seen)
