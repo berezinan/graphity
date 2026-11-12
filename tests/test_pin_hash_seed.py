@@ -29,6 +29,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 _PROBE = """
 import json, os, sys
 calls = []
@@ -37,12 +39,16 @@ import graphify.__main__ as mainmod
 mainmod._reexec = lambda argv, env: calls.append((argv[0], argv, env))
 mainmod._pin_hash_seed_if_needed()
 print(json.dumps({{"called": bool(calls), "argv": calls[0][1] if calls else None,
-                    "env_hashseed": calls[0][2].get("PYTHONHASHSEED") if calls else None}}))
+                    "env_hashseed": calls[0][2].get("PYTHONHASHSEED") if calls else None,
+                    "env_safepath": calls[0][2].get("PYTHONSAFEPATH") if calls else None}}))
 """
 
 
 def _run_probe(argv: list[str], extra_env: dict | None = None) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONHASHSEED", "PYTEST_CURRENT_TEST")}
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("PYTHONHASHSEED", "PYTEST_CURRENT_TEST", "PYTHONSAFEPATH")
+    }
     env.update(extra_env or {})
     result = subprocess.run(
         [sys.executable, "-c", _PROBE.format(argv=argv)],
@@ -137,6 +143,43 @@ def test_update_still_runs_end_to_end_with_hashseed_unset(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "graphify-out" / "graph.json").exists()
+
+
+def test_reexec_does_not_import_graphify_from_cwd():
+    """`python -m` puts the cwd first on sys.path, so the re-exec'd child used
+    to import `graphify` from the directory the user ran the command in. A
+    `graphify/` folder there without `__init__.py` (a sibling clone, a setuptools
+    `build/` leftover) became a namespace package and shadowed real submodules:
+    `cannot import name 'edge_data' from 'graphify.build' (unknown location)`.
+    The child must resolve graphify the way the launcher did, not from the cwd."""
+    outcome = _run_probe(["graphify", "update", "."])
+    assert outcome["env_safepath"] == "1"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="PYTHONSAFEPATH is 3.11+")
+def test_update_runs_from_dir_with_shadowing_graphify_folder(tmp_path):
+    """End to end: the shape of the original failure. The launcher lives outside
+    the project (like a console-script .exe, whose sys.path[0] is not the cwd),
+    and the project holds `graphify/build/` with no `__init__.py`."""
+    proj = tmp_path / "proj"
+    (proj / "graphify" / "build").mkdir(parents=True)
+    (proj / "a.py").write_text("def f():\n    return g()\n\ndef g():\n    return 1\n")
+    launcher = tmp_path / "launcher" / "run_graphify.py"
+    launcher.parent.mkdir()
+    launcher.write_text(
+        "import sys\nfrom graphify.__main__ import main\n"
+        "sys.argv = ['graphify', 'update', '.']\nmain()\n"
+    )
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("PYTHONHASHSEED", "PYTEST_CURRENT_TEST", "PYTHONSAFEPATH")
+    }
+    result = subprocess.run(
+        [sys.executable, str(launcher)],
+        cwd=proj, capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (proj / "graphify-out" / "graph.json").exists()
 
 
 def test_reexec_uses_execvpe_on_posix(monkeypatch):

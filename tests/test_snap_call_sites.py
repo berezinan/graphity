@@ -34,6 +34,27 @@ def snap_env(monkeypatch):
     return published
 
 
+def test_snapshot_writer_child_does_not_import_graphify_from_cwd(monkeypatch):
+    '''`python -m graphify` puts the cwd first on sys.path: a `graphify/` folder
+    without `__init__.py` there (a sibling clone, a build/ leftover) shadowed the
+    installed submodules in the writer child -- "cannot import name 'edge_data'
+    from 'graphify.build' (unknown location)".'''
+    import subprocess
+    seen = {}
+
+    class _Done:
+        returncode, stdout, stderr = 0, '', ''
+
+    def _run(argv, env=None, **kw):
+        seen['env'] = env
+        return _Done()
+
+    monkeypatch.delenv('PYTHONSAFEPATH', raising=False)
+    monkeypatch.setattr(subprocess, 'run', _run)
+    snap_store.publish_snapshot_for(Path('graph.json'))
+    assert seen['env'] is not None and seen['env'].get('PYTHONSAFEPATH') == '1'
+
+
 # --- read commands run to the end on the snap branch -------------------------- #
 
 @pytest.fixture

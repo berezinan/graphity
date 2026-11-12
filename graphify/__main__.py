@@ -768,9 +768,14 @@ def _pin_hash_seed_if_needed() -> None:
         # launcher on Windows is a native .exe with no .py content, so
         # `python.exe <that .exe path>` fails outright with "can't open
         # file" -- every command this function touches (#3779).
+        # PYTHONSAFEPATH: `-m` puts the cwd first on sys.path, so a `graphify/`
+        # folder without `__init__.py` in the directory the user ran from (a
+        # sibling clone, a setuptools build/ leftover) would become a namespace
+        # package and shadow the installed submodules. Python 3.11+; ignored
+        # on 3.10.
         _reexec(
             [sys.executable, "-m", "graphify", *sys.argv[1:]],
-            {**os.environ, "PYTHONHASHSEED": "0"},
+            {**os.environ, "PYTHONHASHSEED": "0", "PYTHONSAFEPATH": "1"},
         )
     except OSError:
         pass

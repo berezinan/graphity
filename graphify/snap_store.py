@@ -185,11 +185,15 @@ def publish_snapshot_for(graph_json) -> None:
     parent (watch) would never hand that heap back to the OS. A non-zero exit is an
     error: the command that wrote graph.json did not succeed.
     '''
+    import os
     import subprocess
     import sys
+    # PYTHONSAFEPATH: `-m` puts the cwd first on sys.path, and a `graphify/` folder
+    # without __init__.py there would shadow the installed submodules (3.11+).
     proc = subprocess.run(
         [sys.executable, '-m', 'graphify', 'snap', 'build', str(graph_json)],
-        capture_output=True, text=True, encoding='utf-8', errors='replace')
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        env={**os.environ, 'PYTHONSAFEPATH': '1'})
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or '').strip()[-2000:]
         raise SnapshotUnavailable(
