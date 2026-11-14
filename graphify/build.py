@@ -1550,7 +1550,11 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # node sharing (basename, label) with an AST node is a ghost.
     _loc_nodes: dict[tuple[str, str], str] = {}   # (source_file, label) -> canonical node id
     _loc_collisions: set[tuple[str, str]] = set()  # keys shared by 2+ AST nodes
-    _noloc_nodes: dict[tuple[str, str], str] = {}  # (source_file, label) -> ghost node id
+    # (source_file, label) -> EVERY ghost node id on that key. A single slot kept
+    # only the last ghost, so a key with two ghosts (a duplicate plus a reference
+    # stub of the same table) merged one per build and the written graph shrank
+    # again on the next rebuild (fork delta, stable-incremental-rebuild).
+    _noloc_nodes: dict[tuple[str, str], list[str]] = {}
     _ast_file_nodes: list[tuple[str, str]] = []  # (node_id, source_file) for AST file-self nodes (#3344)
     _ast_method_nodes: dict[tuple[str, str], list[str]] = {}  # (source_file, norm_method) -> [ast_nid, ...]
 
@@ -1639,7 +1643,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         if key in _loc_nodes and _loc_nodes[key] != nid:
             if not dedup and G.nodes[_loc_nodes[key]].get("_origin") != "ast":
                 continue
-            _noloc_nodes[key] = nid
+            _noloc_nodes.setdefault(key, []).append(nid)
         elif key not in _loc_nodes:
             # Spec-conformant method ghost omitting class segment / leading dot
             # (#3705). Normalize the same way the index was built so raw-label
@@ -1650,10 +1654,11 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             if len(m_candidates) == 1:
                 _ghost_remap[nid] = m_candidates[0]
     # For every ghost that has an AST counterpart, record a remap.
-    for key, sem_id in _noloc_nodes.items():
+    for key, sem_ids in _noloc_nodes.items():
         ast_id = _loc_nodes.get(key)
         if ast_id is not None:
-            _ghost_remap[sem_id] = ast_id
+            for sem_id in sem_ids:
+                _ghost_remap[sem_id] = ast_id
 
     # Pass 2b (#3344): catch ghosts the (source_file, label) key above cannot,
     # because their source_file is simply wrong — a semantic pass over a
@@ -1697,6 +1702,10 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     for ghost_id in _ghost_remap:
         G.remove_node(ghost_id)
         node_set.discard(ghost_id)
+    if _ghost_remap:
+        # The extract CLI's dedup-shrink guard names this cause apart from dedup
+        # (fork delta, stable-incremental-rebuild); popped before to_json.
+        G.graph["_ghost_collapsed"] = len(_ghost_remap)
 
     # Normalized ID map: lets edges survive when the LLM generates IDs with
     # slightly different casing or punctuation than the AST extractor.
@@ -2113,19 +2122,21 @@ def build(
     return G
 
 
-def take_shrink_accounting(G) -> tuple[int, int]:
-    """Read and remove the #3774 counters.
+def take_shrink_accounting(G) -> tuple[int, int, int]:
+    """Read and remove the #3774 counters: (dedup-collapsed, pruned, ghost-collapsed).
 
     ``build`` / ``build_merge`` stash these on ``G.graph`` for the extract
     CLI. ``to_json`` also removes them so any other writer cannot persist
-    them into graph.json.
+    them into graph.json. The third counter (fork delta,
+    stable-incremental-rebuild) is the #1145 ghost merges in build_from_json.
     """
     attrs = getattr(G, "graph", None)
     if not isinstance(attrs, dict):
-        return 0, 0
+        return 0, 0, 0
     collapsed = int(attrs.pop("_dedup_collapsed", 0) or 0)
     pruned = int(attrs.pop("_pruned_node_count", 0) or 0)
-    return collapsed, pruned
+    ghosts = int(attrs.pop("_ghost_collapsed", 0) or 0)
+    return collapsed, pruned, ghosts
 
 
 def _norm_label(label: str | None) -> str:

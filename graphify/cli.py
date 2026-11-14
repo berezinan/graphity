@@ -767,6 +767,37 @@ def _zero_node_stamped_code_sources(
     return healed
 
 
+def _healed_still_nodeless(healed: list[str], nodes, scan_root: Path) -> list[str]:
+    """Files the #2543 heal re-queued that STILL have no node after this build.
+
+    Fork delta (stable-incremental-rebuild): a file can produce nodes in
+    extraction and lose every one of them in the build (an id it shares with
+    another file's node). Re-queuing it is then a no-op that rebuilds the whole
+    graph on every incremental run. The caller marks such files ``ast_empty`` so
+    the heal skips them until their content changes, and names them.
+    """
+    if not healed:
+        return []
+    from graphify.paths import nfc
+    try:
+        root_res = scan_root.resolve()
+    except (OSError, RuntimeError):
+        root_res = scan_root
+
+    def _key(sf: str) -> str:
+        p = Path(sf)
+        if not p.is_absolute():
+            p = root_res / p
+        try:
+            p = p.resolve()
+        except (OSError, RuntimeError):
+            pass
+        return os.path.normcase(nfc(str(p)))
+
+    present = {_key(sf) for sf in (n.get("source_file") for n in nodes) if isinstance(sf, str) and sf}
+    return [f for f in healed if _key(f) not in present]
+
+
 def _zero_node_stamped_semantic_sources(
     graph_path: Path,
     scan_root: Path,
@@ -4145,6 +4176,8 @@ def dispatch_command(cmd: str) -> None:
         # --force: full scan, not the manifest-gated incremental diff — a warm
         # unchanged tree would otherwise dispatch zero files (#1894).
         incremental_mode = incremental_mode and not force
+        # #2543 heal re-queues of this run; see _healed_still_nodeless.
+        _healed_code_sources: list[str] = []
         # #2923/#3125: --force --code-only must NOT drop the existing semantic layer.
         # The AST pass is fully replaced (full code re-scan, AST extraction on all
         # code files), but the semantic pass is skipped, so doc/paper/image nodes
@@ -4216,7 +4249,7 @@ def dispatch_command(cmd: str) -> None:
             # graph.json, so the incremental gate skips them forever. Treat
             # such a file as changed and re-queue it; if it fails again this
             # run it is now left unstamped, so this cannot wedge.
-            _healed_sources = _zero_node_stamped_code_sources(
+            _healed_sources = _healed_code_sources = _zero_node_stamped_code_sources(
                 existing_graph_path,
                 target,
                 detection.get("unchanged_files", {}).get("code", []),
@@ -5058,6 +5091,21 @@ def dispatch_command(cmd: str) -> None:
         # stamped (not failures) but have zero nodes, so the manifest marks the
         # emptiness intentional and the #2543 heal stops re-queuing them.
         _ast_empty_sources = list(ast_result.get("skipped_sources") or [])
+
+        def _mark_nodeless_heals(built_nodes) -> None:
+            # Fork delta (stable-incremental-rebuild): a heal re-queue that ends
+            # with no node again is recorded ast_empty (skipped by the heal until
+            # the content changes) instead of rebuilding the graph every run.
+            _lost = _healed_still_nodeless(_healed_code_sources, built_nodes, target)
+            if not _lost:
+                return
+            _ast_empty_sources.extend(_lost)
+            _names = ", ".join(sorted(Path(p).name for p in _lost)[:6])
+            print(
+                f"[graphify extract] {len(_lost)} re-queued code file(s) produced nodes that "
+                f"were all lost in the build (an id shared with another file's node): "
+                f"{_names}. Recorded as empty; they are re-queued again only when changed."
+            )
         _manifest_files = _stamped_manifest_files(
             files_by_type,
             sem_result,
@@ -5200,6 +5248,7 @@ def dispatch_command(cmd: str) -> None:
                     _cleared_semantic = _shrink[2]
             merged["nodes"] = _dedupe_nodes(merged["nodes"])
             merged["edges"] = _dedupe_edges(merged["edges"])
+            _mark_nodeless_heals(merged["nodes"])
             # Disambiguate colliding-basename file-node labels (#2032). This raw
             # --no-cluster path bypasses build_from_json (where the clustered path
             # gets this), so apply it directly on the merged node list.
@@ -5363,6 +5412,7 @@ def dispatch_command(cmd: str) -> None:
                 sys.exit(1)
         else:
             G = _build([merged], dedup=not no_dedup, dedup_llm_backend=dedup_backend, root=target)
+        _mark_nodeless_heals([{"source_file": a.get("source_file")} for _n, a in G.nodes(data=True)])
         stages.mark("build")
         if G.number_of_nodes() == 0:
             print(
@@ -5411,7 +5461,7 @@ def dispatch_command(cmd: str) -> None:
         # passing --allow-partial (the good graph is preserved and the manifest
         # is not stamped, so the retry re-extracts).
         from graphify.build import take_shrink_accounting as _take_shrink_accounting
-        _dedup_collapsed, _pruned_nodes = _take_shrink_accounting(G)
+        _dedup_collapsed, _pruned_nodes, _ghost_collapsed = _take_shrink_accounting(G)
         _force_write = cli_allow_partial or not _extraction_incomplete
         _dedup_shrink_counts: tuple[int, int] | None = None
         if (
@@ -5429,11 +5479,18 @@ def dispatch_command(cmd: str) -> None:
             # Refuse before to_json. to_json's own refusal tells the caller to
             # pass force=True, which is not this flag (#3774).
             _old_n, _new_n = _dedup_shrink_counts
+            # Name both merge passes (fork delta, stable-incremental-rebuild):
+            # the #1145 ghost merge in build_from_json also shrinks the graph,
+            # and reporting only dedup's count misattributed the whole shrink.
+            _ghost_note = (
+                f" and {_ghost_collapsed} same-file ghost duplicate(s) were merged (#1145)"
+                if _ghost_collapsed else ""
+            )
             print(
                 f"[graphify extract] error: dedup merged {_dedup_collapsed} "
-                f"node(s); writing would shrink the graph from {_old_n} nodes "
-                f"to {_new_n} nodes. Refusing to overwrite {graph_json_path}. "
-                "Pass --allow-dedup-shrink to write the smaller graph.",
+                f"node(s){_ghost_note}; writing would shrink the graph from {_old_n} nodes "
+                f"to {_new_n} nodes ({_old_n - _new_n} fewer). Refusing to overwrite "
+                f"{graph_json_path}. Pass --allow-dedup-shrink to write the smaller graph.",
                 file=sys.stderr,
             )
             sys.exit(1)
