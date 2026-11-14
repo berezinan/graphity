@@ -115,13 +115,16 @@ def _write_build_config(
     excludes: "list[str] | None",
     gitignore: bool | None = None,
     external_roots: "list[str] | None" = None,
+    token_budget: "int | None" = None,
 ) -> None:
     """Persist corpus-shaping options under ``out_dir``.
 
     Best effort and non clobbering: omitted options retain their existing values.
     ``external_roots`` replaces the stored list as a whole; ``[]`` clears it.
+    ``token_budget`` (fork delta, owner-first-external-roots) is the semantic
+    chunk budget, kept so a later flag-less ``extract`` packs chunks the same way.
     """
-    if not excludes and gitignore is None and external_roots is None:
+    if not excludes and gitignore is None and external_roots is None and token_budget is None:
         return
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -138,9 +141,25 @@ def _write_build_config(
             config["gitignore"] = gitignore
         if external_roots is not None:
             config["external_roots"] = list(external_roots)
+        if token_budget is not None:
+            config["token_budget"] = int(token_budget)
         path.write_text(json.dumps(config), encoding="utf-8")
     except OSError:
         pass
+
+
+def _read_build_token_budget(out_dir: Path) -> "int | None":
+    """Return the persisted ``--token-budget`` for this graph, or None."""
+    try:
+        path = out_dir / _BUILD_CONFIG_FILENAME
+        if path.is_file():
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            tb = cfg.get("token_budget") if isinstance(cfg, dict) else None
+            if isinstance(tb, int) and not isinstance(tb, bool) and tb > 0:
+                return tb
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
 
 
 def _read_build_excludes(out_dir: Path) -> list[str]:

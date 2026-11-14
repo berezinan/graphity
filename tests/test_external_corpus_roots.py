@@ -617,7 +617,11 @@ def test_evidence_binding_checks_document_under_external_root(projects, dir_link
 
 def test_extract_sends_external_document_to_model(mounted, tmp_path, monkeypatch):
     """End to end: the CLI hands the run's external roots to the LLM readers,
-    both when given on the command line and when reused from the build config."""
+    both when given on the command line and when reused from the build config.
+
+    The source project has no graphify-out/, so owner-first external roots
+    (fork delta) would refuse; --allow-external-extract opts this run into
+    extracting the mounted document here."""
     import graphify.__main__ as mainmod
 
     src, consumer, doc = mounted
@@ -642,7 +646,7 @@ def test_extract_sends_external_document_to_model(mounted, tmp_path, monkeypatch
     def _extract(*extra: str) -> None:
         monkeypatch.setattr(mainmod.sys, "argv", [
             "graphify", "extract", str(consumer), "--backend", "claude",
-            "--no-cluster", "--out", str(out_dir), *extra,
+            "--no-cluster", "--out", str(out_dir), "--allow-external-extract", *extra,
         ])
         try:
             mainmod.main()

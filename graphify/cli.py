@@ -3863,7 +3863,7 @@ def dispatch_command(cmd: str) -> None:
                 "[--code-only] [--no-dedup] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] "
-                "[--allow-dedup-shrink] [--timing]",
+                "[--allow-dedup-shrink] [--allow-external-extract] [--timing]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -3913,6 +3913,9 @@ def dispatch_command(cmd: str) -> None:
         cli_exclude_hubs: float | None = None
         cli_excludes: list[str] = []
         cli_timing: bool = False
+        # Fork delta (owner-first-external-roots): one run may extract files
+        # whose owner data is unusable; never recorded.
+        allow_external_extract = False
         # --force parity with `graphify update`: the flag or GRAPHIFY_FORCE=1
         # disables the incremental gate and skips semantic-cache reads (#1894).
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
@@ -4023,6 +4026,8 @@ def dispatch_command(cmd: str) -> None:
                 cli_allow_partial = True; i += 1
             elif a == "--allow-dedup-shrink":
                 cli_allow_dedup_shrink = True; i += 1
+            elif a == "--allow-external-extract":
+                allow_external_extract = True; i += 1
             elif a == "--timing":
                 cli_timing = True; i += 1
             else:
@@ -4074,6 +4079,7 @@ def dispatch_command(cmd: str) -> None:
             _read_build_excludes as _read_build_ex,
             _read_build_gitignore as _read_build_gi,
             _read_build_external_roots as _read_build_er,
+            _read_build_token_budget as _read_build_tb,
         )
         # #1971 persistence: an explicit --gitignore/--no-gitignore persists that
         # mode; a later flag-less `graphify extract` must NOT clobber it, which
@@ -4096,6 +4102,12 @@ def dispatch_command(cmd: str) -> None:
         _effective_external_roots = (
             _cli_external if _cli_external is not None else _read_build_er(graphify_out)
         )
+        # Fork delta (owner-first-external-roots): the chunk budget shapes how
+        # detailed an extraction is, so a flag-less rerun reuses the recorded one.
+        _recorded_token_budget = _read_build_tb(graphify_out)
+        _effective_token_budget = (
+            cli_token_budget if cli_token_budget is not None else _recorded_token_budget
+        )
         # Written BEFORE the service check below: a run that dies on an
         # unreachable database used to leave no trace of the mode the user asked
         # for, so the next rebuild silently fell back to the default.
@@ -4104,6 +4116,7 @@ def dispatch_command(cmd: str) -> None:
             excludes=cli_excludes or None,
             gitignore=gitignore_mode,
             external_roots=_cli_external,
+            token_budget=cli_token_budget,
         )
         # Before anything expensive: the sync at the end of this pipeline is not
         # optional, so an unreachable database must cost milliseconds, not an
@@ -4355,6 +4368,51 @@ def dispatch_command(cmd: str) -> None:
                 f"(rename or move if wrongly flagged): {_snames}{_smore}"
             )
         stages.mark("detect")
+
+        # Fork delta (owner-first-external-roots): a document mounted from an
+        # external root is extracted once, by the project owning that root. Its
+        # semantic layer is taken from the owner's graph on EVERY run (also for
+        # files this manifest calls unchanged, and under --force), so the owner's
+        # re-extraction reaches every consumer. Unusable owner data stops the run
+        # here, before AST and LLM work, unless --allow-external-extract.
+        _owner_plan = None
+        _owner_here: list = []
+        if has_path and _effective_external_roots and not code_only:
+            from graphify import owner_graph as _og
+            from graphify.detect import _normalize_external_roots as _norm_er
+
+            _er = _norm_er(_effective_external_roots, target, warn=False)
+            _ext_all = _og.external_files(files_by_type, target, _er)
+            _ext_sem = [f for f in _ext_all if f.kind in _og.SEMANTIC_KINDS]
+            if _ext_sem:
+                _owner_plan = _og.plan_owner_semantics(_ext_sem, _ext_all)
+                if _owner_plan.refused:
+                    for _line in _og.refusal_lines(_owner_plan, allowed=allow_external_extract):
+                        print(_line, file=sys.stderr)
+                    if not allow_external_extract:
+                        sys.exit(1)
+                _owner_keys = _owner_plan.taken_keys()
+                _owner_here = [f for _fs in _owner_plan.refused.values() for f in _fs]
+
+                def _not_owned(paths: list) -> list:
+                    return [p for p in paths if _og.path_key(p) not in _owner_keys]
+
+                doc_files = _not_owned(doc_files)
+                paper_files = _not_owned(paper_files)
+                image_files = _not_owned(image_files)
+                # deep mode may have widened semantic_files past the three lists.
+                semantic_files = _not_owned(semantic_files)
+                # Files extracted here this run (--allow-external-extract) are
+                # dispatched whether or not this manifest saw them change: the
+                # graph may hold an owner layer they no longer have.
+                _queued = {_og.path_key(p) for p in semantic_files}
+                _lists = {"document": doc_files, "paper": paper_files, "image": image_files}
+                for _f in _owner_here:
+                    if _og.path_key(_f.path) not in _queued:
+                        _lists[_f.kind].append(Path(_f.path))
+                        semantic_files.append(Path(_f.path))
+                for _line in _og.summary_lines(_owner_plan, _owner_here):
+                    print(_line)
 
         # Resolve the LLM backend only now that we know whether the corpus
         # needs one. A code-only corpus is pure local AST and must not require
@@ -4688,6 +4746,12 @@ def dispatch_command(cmd: str) -> None:
         _partial_semantic_files: set[str] = set()
         sem_cache_hits = 0
         sem_cache_misses = 0
+        if _owner_plan is not None:
+            # The owner's semantic layer for its mounted files (see above):
+            # authoritative, never cached here, replaces this graph's layer.
+            sem_result["nodes"].extend(_owner_plan.nodes)
+            sem_result["edges"].extend(_owner_plan.edges)
+            sem_result["hyperedges"].extend(_owner_plan.hyperedges)
         # Deep mode uses its own namespace (cache/semantic-deep/) so deep and
         # standard results for the same content never shadow each other (#1894).
         sem_cache_mode = "deep" if deep_mode else None
@@ -4717,21 +4781,9 @@ def dispatch_command(cmd: str) -> None:
             sem_result["hyperedges"].extend(cached_hyperedges)
             if sem_cache_hits:
                 print(f"[graphify extract] semantic cache: {sem_cache_hits} hit / {sem_cache_misses} miss")
-            # Cache sharing with an external root's own project only works with
-            # mirrored mount paths and the same prompt/mode; the hit rate is the
-            # one place a silent mismatch shows.
-            if _effective_external_roots:
-                from graphify.detect import _key_under, _real_key
-                _uncached_set = set(uncached_paths)
-                for _ext in _effective_external_roots:
-                    _ext_key = _real_key(_ext)
-                    _ext_files = [s for s in sem_paths_str if _key_under(_real_key(s), _ext_key)]
-                    if _ext_files:
-                        _ext_miss = sum(1 for s in _ext_files if s in _uncached_set)
-                        print(
-                            f"[graphify extract] semantic cache via external root {_ext}: "
-                            f"{len(_ext_files) - _ext_miss} hit / {_ext_miss} miss"
-                        )
+            # External-root files: the per-root "from owner graph / extracted
+            # here" line is printed where the owner's data is planned (fork
+            # delta, owner-first-external-roots).
 
             if uncached_paths:
                 _via = f"{backend}" + (f", {backend_source}" if backend_source else "")
@@ -4748,8 +4800,13 @@ def dispatch_command(cmd: str) -> None:
                 # must accept the files this run's walk admitted through them.
                 if _effective_external_roots:
                     corpus_kwargs["external_roots"] = list(_effective_external_roots)
-                if cli_token_budget is not None:
-                    corpus_kwargs["token_budget"] = cli_token_budget
+                if _effective_token_budget is not None:
+                    corpus_kwargs["token_budget"] = _effective_token_budget
+                    if cli_token_budget is None:
+                        print(
+                            f"[graphify extract] token budget {_effective_token_budget} "
+                            f"(recorded in .graphify_build.json)"
+                        )
                 if cli_max_concurrency is not None:
                     corpus_kwargs["max_concurrency"] = cli_max_concurrency
 
@@ -5064,6 +5121,8 @@ def dispatch_command(cmd: str) -> None:
                 and not code_files
                 and not semantic_files
                 and not deleted_files
+                # The owner's layer is re-applied every run (owner-first-external-roots).
+                and not (_owner_plan is not None and _owner_plan.taken)
                 and not pg_result.get("nodes")
                 and not pg_result.get("edges")
                 and not cargo_result.get("nodes")
@@ -5121,8 +5180,9 @@ def dispatch_command(cmd: str) -> None:
                     # raw-dump this run's partial extraction over it.
                     print(f"error: {exc}", file=sys.stderr)
                     sys.exit(1)
+                from graphify.owner_graph import without_owner_sources as _wo_owner
                 _shrink = _handle_unverified_semantic_shrink(
-                    merged.get("_unverified_semantic_shrink"),
+                    _wo_owner(merged.get("_unverified_semantic_shrink"), _owner_plan),
                     cli_allow_partial=cli_allow_partial,
                     files_by_type=files_by_type,
                     sem_result=sem_result,
@@ -5273,8 +5333,12 @@ def dispatch_command(cmd: str) -> None:
                     dedup_llm_backend=dedup_backend,
                     root=target,
                 )
+                from graphify.owner_graph import without_owner_sources as _wo_owner
                 _shrink = _handle_unverified_semantic_shrink(
-                    G.graph.get("_unverified_semantic_shrink") if hasattr(G, "graph") else None,
+                    _wo_owner(
+                        G.graph.get("_unverified_semantic_shrink") if hasattr(G, "graph") else None,
+                        _owner_plan,
+                    ),
                     cli_allow_partial=cli_allow_partial,
                     files_by_type=files_by_type,
                     sem_result=sem_result,
@@ -5429,6 +5493,8 @@ def dispatch_command(cmd: str) -> None:
                     _norm_source_file(str(p), _root)
                     for p in (code_files + doc_files + paper_files + image_files)
                 }
+                if _owner_plan is not None:
+                    _changed |= {f.rel for f in _owner_plan.taken}
                 _pruned = {_norm_source_file(str(p), _root) for p in deleted_files}
                 _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=_pruned)
                 _pruned_stale = _st.get("pruned_stale_sources", 0)
