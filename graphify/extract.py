@@ -10146,6 +10146,38 @@ def extract(
         if _raw_tp != _tp:
             _remap_seen.add(_raw_tp)
             remap_paths.append(_raw_tp)
+    # Fork delta (batch-independent-node-ids): a node standing for ANOTHER file
+    # (a .slnx's project reference, ...) carries that file as source_file and an
+    # id minted from its absolute path. When the file is not in this batch and no
+    # edge stamps it as target_file, nothing above learns its canonical id: the
+    # backstop far below makes it relative only AFTER the colliding-id pass, so
+    # two files share one id or not depending on what else is in the batch, and
+    # an incremental run loses a node a full one keeps. Register such in-root
+    # files here, exactly as the target_file pass above does.
+    _sf_seen: set[str] = set()
+    for _n in all_nodes:
+        _sf = _n.get("source_file")
+        if not _sf or not isinstance(_sf, str) or _sf in _sf_seen:
+            continue
+        _sf_seen.add(_sf)
+        _raw_sp = Path(_sf)
+        try:
+            _sp = _resolved(_raw_sp)
+        except (OSError, RuntimeError):
+            continue
+        if _sp in _remap_seen:
+            continue
+        _remap_seen.add(_sp)
+        try:
+            _sp.relative_to(root)
+            if not _sp.is_file():
+                continue
+        except (ValueError, OSError):
+            continue
+        remap_paths.append(_sp)
+        if _raw_sp != _sp:
+            _remap_seen.add(_raw_sp)
+            remap_paths.append(_raw_sp)
     for path in remap_paths:
         old_id = _make_id(str(path))
         try:

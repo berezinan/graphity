@@ -727,6 +727,14 @@ def _disambiguate_defining_collisions(
             if _EXTENSION.search(d["source_file"]) and _EXTENSION.search(winner["source_file"]) and                     _EXTENSION.search(d["source_file"]).group(0).lower() ==                     _EXTENSION.search(winner["source_file"]).group(0).lower():
                 continue
             new_id = _extension_qualified_id(d)
+            if new_id and new_id in taken:
+                # Fork delta (batch-independent-node-ids): another node (e.g. a
+                # document's semantic node naming this file) already holds the
+                # extension-qualified id. Giving up here dropped this file's own
+                # node in the collapse below; salt by the file's path instead,
+                # deterministically, as _disambiguate_colliding_node_ids does (#1522).
+                import hashlib
+                new_id = f"{new_id}_{hashlib.sha1(k.encode('utf-8')).hexdigest()[:6]}"
             if new_id and new_id not in taken:
                 taken.add(new_id)
                 renames[(nid, k)] = new_id
