@@ -15,7 +15,7 @@ Name resolution: for an ordinary label the tiers of `_find_node_tiers` come
 from Rust (`Snap.tiers`, same predicates), and the upstream refusal and
 message functions run on a mini-graph of the winning tier only. A label with
 `::` or a dotted Python symbol runs the upstream functions on a mini-graph of
-candidates (as `ArcadeDBBackend` does). Traversal runs the upstream kernels
+candidates. Traversal runs the upstream kernels
 `_bfs_core` / `_dfs_core` over neighbours from Rust (the BFS frontier is a
 hash-ordered set, so only the Python kernel reproduces its edge order);
 `_complete_induced_edges` and the answer's edge attributes are computed in
@@ -505,7 +505,7 @@ class SnapBackend(GraphBackend):
     def _seed_candidates(self, value: str, seed_root) -> nx.DiGraph:
         """Mini-graph on which `affected.resolve_seed` answers as on the whole graph.
 
-        As `ArcadeDBBackend._candidate_graph_for_seed`: every node an equality step of
+        Every node an equality step of
         `resolve_seed` can accept (id, normalised label, bare name, source path) in
         full, plus at most three label-substring matches (more than one already
         means no answer). Known gap, pinned by an xfail(strict) test: `resolve_seed`

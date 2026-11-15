@@ -1,9 +1,9 @@
 """What a re-clustering actually changed (fork-owned; upstream has no such file).
 
 `cluster-only` on a 2M-node graph used to rewrite 11 GB of graph.json (45 GB peak
-inside to_json) and then need a 66-minute `arcade reload`, even when the partition
-came out identical. `community_changes` tells the CLI whether there is anything
-to write, and hands the ArcadeDB backend exactly the nodes to update.
+inside to_json) even when the partition came out identical. `community_changes`
+tells the CLI whether there is anything to write; `sync_community_changes`
+republishes the graph store after a write.
 """
 from __future__ import annotations
 
@@ -55,46 +55,17 @@ def needs_write(raw: dict, changed: "dict | None", built_at_commit: "str | None"
 def sync_community_changes(graph_json_path: str, raw: dict, changed: "dict | None",
                            communities: "dict[int, list[str]]",
                            labels: "dict[int, str] | None" = None) -> None:
-    """After graph.json is written: bring the ArcadeDB copy of the partition up to
-    date by updating only the nodes that moved. No-op for the JSON backend.
+    """After graph.json is written: republish the graph store. No-op for the JSON
+    store.
 
-    With *labels* (the map handed to to_json) the stored community names are
-    replaced too, built by the rule to_json writes them - so a relabel that moved
-    no node still reaches the database. Without them the stored names stand, as
-    they do in graph.json.
-
-    Not guarded, like the sync in `extract`/`update`: the graph database is
-    required, so a failed or short update raises and fails the command.
+    Called only after graph.json was rewritten (an idle re-clustering never gets
+    here), so the snapshot is rebuilt from the file just written. The other
+    arguments are kept for the call site in cli.py, which upstream merges must
+    not have to touch. Not guarded, like the write in `extract`/`update`: the
+    store is required, so a failed publish raises and fails the command.
     """
-    from graphify.query_backend import resolve_backend_config, require_backend
+    from graphify.query_backend import resolve_backend_config
     cfg = resolve_backend_config(graph_json_path)
     if cfg["kind"] == "snap":
-        # Called only after graph.json was rewritten (an idle re-clustering never gets
-        # here), so the snapshot is rebuilt from the file just written.
         from graphify.snap_store import publish_snapshot_for
         publish_snapshot_for(graph_json_path)
-        return
-    if cfg["kind"] != "arcadedb":
-        return
-    db = require_backend(config=cfg, require_database=False)
-    reload_hint = (f"[graphify db] ArcadeDB '{cfg['database']}' not updated - "
-                   f"run `graphify arcade reload` to load the new partition.")
-    if changed is None or not db.is_populated() or db.has_recorded_shortfall():
-        # Shape changed, first load, or a database already known to be short:
-        # patching communities is not enough (or not safe) - a reload is.
-        print(reload_hint)
-        return
-    stored = {n.get("id"): n.get("community") for n in raw.get("nodes", [])}
-    moved = {nid: cid for nid, (cid, _name) in changed.items() if stored.get(nid) != cid}
-    names = None
-    if labels:
-        by_cid = {int(k): v for k, v in labels.items()}
-        names = {int(cid): by_cid.get(int(cid), f"Community {cid}") for cid in communities}
-    if not moved and names is None:
-        return
-    stats = db.update_communities(moved, {cid: len(m) for cid, m in communities.items()}, names=names)
-    print(f"[graphify db] updated ArcadeDB '{cfg['database']}' ({stats['updated_nodes']} nodes moved"
-          f"{', community names refreshed' if names is not None else ''}).")
-    if not stats["reconciled"]:
-        raise RuntimeError("ArcadeDB community update did not reconcile: per-community node "
-                           f"counts differ from graph.json.\n{reload_hint}")

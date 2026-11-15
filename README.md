@@ -2,12 +2,12 @@ The project was driven by the need to process very large source code arrays for 
 
 Support for the 1C programming language (BSL) has been added to the project. 
 
-The data access layer has been redesigned: the GraphBackend abstraction has been introduced, and graph storage in ArcadeDB has been implemented (improving memory efficiency by a factor of 300).
+The data access layer has been redesigned: the GraphBackend abstraction has been introduced, and graph queries are served from a memory-mapped snapshot instead of loading the whole graph (an ArcadeDB store used before it was retired on 2026-11-15).
 
 **Default graph store: the snapshot.** Next to every `graph.json` graphify publishes `graph.snap`, an immutable memory-mapped file read by a Rust module, so `query`/`path`/`explain` and the MCP server answer without loading the graph into memory (ERP2, 2 M nodes: first query 1.3 s). Answers are byte-identical to the in-process JSON model. The snapshot is rebuilt after every write of `graph.json` (`extract`, `update`, `watch`, `cluster-only`/`label`, `global add`/`remove`); a missing or stale snapshot is refused with a hint, never answered from `graph.json`.
 
 - Build one from an existing graph (no LLM, no rebuild): `graphify snap build [<project-dir|graph.json>]`.
-- Store selection: `GRAPHIFY_GRAPH_STORE=snap` (default), `arcadedb`, or `json`; any other value is an error.
+- Store selection: `GRAPHIFY_GRAPH_STORE=snap` (default) or `json`; any other value is an error (`arcadedb` reports that ArcadeDB was retired).
 - The Rust module ships as a separate wheel, `graphify-snap` (built from `native/graphify_snap` with `maturin build --release`, attached to the fork's releases). Install it next to graphify, e.g. `uv tool install --editable . --with <path to graphify_snap-*.whl>`; for a development venv run `maturin develop --release` in `native/graphify_snap`.
 
 <p align="center">

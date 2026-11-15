@@ -84,18 +84,17 @@ def test_update_without_flag_keeps_the_default_mode(tmp_path):
     assert any(s.endswith("generated/gen.py") for s in sources)
 
 
-def test_mode_is_recorded_even_when_the_database_probe_fails(tmp_path):
-    """The setting is written before the probe, so a failed run is not silent."""
+def test_mode_is_recorded_even_when_the_store_check_fails(tmp_path):
+    """The setting is written before the store check, so a failed run is not silent."""
     corpus = _corpus(tmp_path)
 
     result = _run(
         ["extract", ".", "--gitignore", "--code-only", "--no-cluster"],
         cwd=corpus,
-        GRAPHIFY_GRAPH_STORE="arcadedb",
-        GRAPHIFY_ARCADE_URL="http://127.0.0.1:1",  # nothing listens here
+        GRAPHIFY_GRAPH_STORE="nosuchstore",  # refused by the store check
     )
 
-    assert result.returncode != 0, "an unreachable database must still fail the run"
+    assert result.returncode != 0, "a refused store check must still fail the run"
     assert _build_config(corpus)["gitignore"] is True
 
 

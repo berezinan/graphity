@@ -3198,32 +3198,13 @@ def _rebuild_code(
             if callflow_files:
                 products += f", {len(callflow_files)} callflow HTML"
             print(f"[graphify watch] {products} updated in {out}")
-            # Sync the configured graph database. Not guarded: the database is
-            # required, so a rebuild that could not sync it did not succeed. The
-            # failure reaches the rebuild's own handler below, which reports a
-            # failed rebuild — a watch loop keeps running and keeps saying so.
-            from graphify.query_backend import resolve_backend_config, require_backend, shortfall_warning
+            # Publish the graph store. Not guarded: the store is required, so a
+            # rebuild that could not write it did not succeed. The failure
+            # reaches the rebuild's own handler below, which reports a failed
+            # rebuild — a watch loop keeps running and keeps saying so.
+            from graphify.query_backend import resolve_backend_config
             _cfg = resolve_backend_config(str(out / "graph.json"))
-            if _cfg["kind"] == "arcadedb":
-                _db = require_backend(config=_cfg, require_database=False)
-                _db.ensure_database()
-                # Same gate as the CLI build path: a database that reconciled
-                # short is repaired by a full load, not patched again.
-                if (changed_paths is not None and _db.is_populated()
-                        and not _db.has_recorded_shortfall()):
-                    _changed = {_nsf(str(p), str(project_root)) for p in extract_targets}
-                    _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=set(deleted_paths))
-                    print(f"[graphify db] synced ArcadeDB '{_cfg['database']}' "
-                          f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
-                          f"{_st['deleted_sources']} dirty sources).")
-                else:
-                    _db.ensure_database(drop=True)
-                    _st = _db.load_from_graph_json(str(out / "graph.json"))
-                    print(f"[graphify db] loaded ArcadeDB '{_cfg['database']}' "
-                          f"({_st['nodes']} nodes, {_st['edges']} edges).")
-                if (_warn := shortfall_warning(_st)):
-                    print(f"[graphify db] warning: {_warn}")
-            elif _cfg["kind"] == "snap":
+            if _cfg["kind"] == "snap":
                 # Fork hook (graphify/snap_store.py): a failed writer raises, which the
                 # handler below reports as a failed rebuild.
                 from graphify.snap_store import publish_snapshot_for as _publish_snapshot_for

@@ -59,78 +59,11 @@ def test_changed_partition_is_still_written(tmp_path):
                for n in json.loads(graph.read_text(encoding="utf-8"))["nodes"])
 
 
-class _FakeDb:
-    def __init__(self, populated=True, shortfall=False, reconciled=True):
-        self.populated, self.shortfall, self.reconciled = populated, shortfall, reconciled
-        self.calls, self.names = [], []
-
-    def is_populated(self):
-        return self.populated
-
-    def has_recorded_shortfall(self):
-        return self.shortfall
-
-    def update_communities(self, node_community, expected_sizes, **kw):
-        self.calls.append((node_community, expected_sizes))
-        self.names.append(kw.get("names"))
-        return {"updated_nodes": len(node_community), "reconciled": self.reconciled}
-
-
-RAW = {"nodes": [{"id": "a", "community": 0, "community_name": "A"},
-                 {"id": "узел_б", "community": 0, "community_name": "A"}]}
-COMMUNITIES = {0: ["a"], 1: ["узел_б"]}
-
-
-def _patch(monkeypatch, db, kind="arcadedb"):
-    monkeypatch.setattr(qb, "resolve_backend_config", lambda p=None: {"kind": kind, "database": "proj_t"})
-    monkeypatch.setattr(qb, "require_backend", lambda **kw: db)
-
-
-def test_moved_nodes_go_to_the_database(monkeypatch):
-    db = _FakeDb()
-    _patch(monkeypatch, db)
-    sync_community_changes("g.json", RAW, {"узел_б": (1, "B")}, COMMUNITIES)
-    assert db.calls == [({"узел_б": 1}, {0: 1, 1: 1})]
-
-
-def test_name_only_change_sends_nothing(monkeypatch):
-    db = _FakeDb()
-    _patch(monkeypatch, db)
-    sync_community_changes("g.json", RAW, {"a": (0, "Renamed")}, {0: ["a", "узел_б"]})
-    assert db.calls == []
-
-
-def test_name_only_change_with_labels_reaches_the_database(monkeypatch):
-    """A relabel that moved no node used to stop here, so the database kept the
-    old names for good. With the labels to_json got, the full map goes down."""
-    db = _FakeDb()
-    _patch(monkeypatch, db)
-    sync_community_changes("g.json", RAW, {"a": (0, "Renamed")}, {0: ["a", "узел_б"], 1: []},
-                           {"0": "Renamed"})
-    assert db.calls == [({}, {0: 2, 1: 0})]
-    # Mirrors to_json: a community without a label is written as "Community N".
-    assert db.names == [{0: "Renamed", 1: "Community 1"}]
-
-
-def test_json_backend_is_a_noop(monkeypatch):
-    db = _FakeDb()
-    _patch(monkeypatch, db, kind="json")
-    sync_community_changes("g.json", RAW, {"узел_б": (1, "B")}, COMMUNITIES)
-    assert db.calls == []
-
-
-def test_empty_short_or_reshaped_database_gets_a_reload_hint(monkeypatch, capsys):
-    for db, changed in ((_FakeDb(populated=False), {"узел_б": (1, "B")}),
-                        (_FakeDb(shortfall=True), {"узел_б": (1, "B")}),
-                        (_FakeDb(), None)):
-        _patch(monkeypatch, db)
-        sync_community_changes("g.json", RAW, changed, COMMUNITIES)
-        assert db.calls == []
-        assert "arcade reload" in capsys.readouterr().out
-
-
-def test_unreconciled_update_fails_the_command(monkeypatch):
-    import pytest
-    _patch(monkeypatch, _FakeDb(reconciled=False))
-    with pytest.raises(RuntimeError, match="did not reconcile"):
-        sync_community_changes("g.json", RAW, {"узел_б": (1, "B")}, COMMUNITIES)
+def test_json_store_is_a_noop(monkeypatch):
+    """On the JSON store there is nothing to republish after a write."""
+    published = []
+    import graphify.snap_store as snap_store
+    monkeypatch.setattr(snap_store, "publish_snapshot_for", lambda p: published.append(p))
+    monkeypatch.setattr(qb, "resolve_backend_config", lambda p=None: {"kind": "json", "graph_path": p})
+    sync_community_changes("g.json", {"nodes": []}, {"a": (1, "B")}, {1: ["a"]})
+    assert published == []

@@ -2389,14 +2389,14 @@ def _build_server(graph_path: str):
     )
     from graphify import paths as _paths
 
-    # Backend selection: JSON (default) loads graphs into the context cache below
-    # and supports the G-dependent resources; ArcadeDB connects to the running
-    # server (one database per project) and leaves G unset (those resources
+    # Backend selection: JSON loads graphs into the context cache below and
+    # supports the G-dependent resources; the snapshot (default) opens the
+    # memory-mapped file of each project and leaves G unset (those resources
     # degrade gracefully below).
-    # Fork delta: any store but json (snap, arcadedb) serves without a loaded G.
-    _IS_ARCADE = resolve_backend_config(graph_path)["kind"] != "json"
-    _arcade_ctx: dict[str, dict] = {}
-    _arcade_lock = threading.Lock()
+    # Fork delta: any store but json (snap) serves without a loaded G.
+    _NO_GRAPH = resolve_backend_config(graph_path)["kind"] != "json"
+    _store_ctx: dict[str, dict] = {}
+    _store_lock = threading.Lock()
 
     # Graph contexts comprise one pinned configured default plus a bounded LRU
     # of project_path graphs. This preserves the configured graph's warm index
@@ -2411,20 +2411,19 @@ def _build_server(graph_path: str):
         graph terminate the MCP process; it raises so other projects remain
         available on the same server.
         """
-        # ArcadeDB mode: the context is keyed by path alone (no graph.json file is
-        # needed — the database name derives from the path) and G stays None, so
-        # queries go to the DB backend and G-dependent extras degrade gracefully.
-        # Kept out of _GraphContextCache: that cache evicts by graph.json
-        # (mtime, size), which an ArcadeDB context has no file to provide.
-        if _IS_ARCADE:
-            ent = _arcade_ctx.get(path)
+        # Snapshot mode: the context is keyed by path alone and G stays None, so
+        # queries go to the snapshot backend and G-dependent extras degrade
+        # gracefully. Kept out of _GraphContextCache: that cache loads and evicts
+        # whole networkx graphs, which is exactly what the snapshot avoids.
+        if _NO_GRAPH:
+            ent = _store_ctx.get(path)
             if ent is None:
-                with _arcade_lock:
-                    ent = _arcade_ctx.get(path)
+                with _store_lock:
+                    ent = _store_ctx.get(path)
                     if ent is None:
                         be = require_backend(config=resolve_backend_config(path))
                         ent = {"G": None, "communities": {}, "backend": be}
-                        _arcade_ctx[path] = ent
+                        _store_ctx[path] = ent
             return ent["G"], ent["communities"], ent["backend"]
         resolved_path = str(Path(path).resolve())
         g, comms = _ctx_cache.load(resolved_path, pinned=resolved_path == _default_graph_path)
@@ -2823,7 +2822,7 @@ def _build_server(graph_path: str):
             return _tool_god_nodes({"top_n": 10})
         if uri_str == "graphify://surprises":
             if G is None:
-                return "Surprising connections are not available on the ArcadeDB backend yet."
+                return "Surprising connections are not available on the snapshot store (set GRAPHIFY_GRAPH_STORE=json)."
             try:
                 from graphify.analyze import surprising_connections
                 surprises = surprising_connections(G, communities, top_n=10)
@@ -2837,7 +2836,7 @@ def _build_server(graph_path: str):
                 return f"Could not compute surprising connections: {exc}"
         if uri_str == "graphify://audit":
             if G is None:
-                return "Confidence audit is not available on the ArcadeDB backend yet."
+                return "Confidence audit is not available on the snapshot store (set GRAPHIFY_GRAPH_STORE=json)."
             confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
             total = len(confs) or 1
             return (
@@ -2848,7 +2847,7 @@ def _build_server(graph_path: str):
             )
         if uri_str == "graphify://questions":
             if G is None:
-                return "Suggested questions are not available on the ArcadeDB backend yet."
+                return "Suggested questions are not available on the snapshot store (set GRAPHIFY_GRAPH_STORE=json)."
             try:
                 from graphify.analyze import suggest_questions
                 community_labels = _load_community_labels()

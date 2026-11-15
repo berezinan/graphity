@@ -445,13 +445,12 @@ def test_external_root_flags_are_exclusive(projects):
     assert "mutually exclusive" in result.stderr
 
 
-def test_external_root_is_recorded_even_when_the_database_probe_fails(projects):
+def test_external_root_is_recorded_even_when_the_store_check_fails(projects):
     src, consumer = projects
     result = _run(
         ["extract", ".", "--external-root", str(src), "--code-only", "--no-cluster"],
         cwd=consumer,
-        GRAPHIFY_GRAPH_STORE="arcadedb",
-        GRAPHIFY_ARCADE_URL="http://127.0.0.1:1",
+        GRAPHIFY_GRAPH_STORE="nosuchstore",  # refused by the store check
     )
     assert result.returncode != 0
     assert _build_config(consumer)["external_roots"] == [src.resolve().as_posix()]

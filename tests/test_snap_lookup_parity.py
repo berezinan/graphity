@@ -1,29 +1,23 @@
-"""Upstream 0.9.97 lookup rules answer the same on ArcadeDB as on JSON.
+"""Upstream 0.9.97 lookup rules answer the same on the snapshot as on JSON.
 
 Each lookup kind here is a case `serve._resolve_single_node` /
 `_resolve_path_endpoint` refuse or resolve on the networkx graph: same-file and
 cross-file name ties, source-less stubs, a substring near miss (#3917), dotted
 Python symbols (#4366), same-named files of two repos (#4512), `path::symbol`
 and node-id endpoints (#3913), a `file::symbol` miss (#4264) and the full-token
-endpoint pick (#1785). Skipped when no ArcadeDB answers.
+endpoint pick (#1785). Parallel relations of one pair, which the snapshot writer
+refuses, are checked on JSON alone (graph-read-backend).
 """
 import json
-import os
 
 import networkx as nx
 import pytest
 from networkx.readwrite import json_graph
 
-from graphify import arcade_server
 from graphify.query_backend import (
-    ArcadeDBBackend, JsonBackend, Neighbors, NodeDetail,
+    JsonBackend, Neighbors, NodeDetail,
     Refusal, render_explain, render_neighbors, render_node, render_path, render_query,
 )
-
-_MACHINE = arcade_server.read_machine_config()
-_URL = os.environ.get("GRAPHIFY_ARCADE_URL") or _MACHINE.get("url") or "http://127.0.0.1:2480"
-_PW = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or _MACHINE.get("password") or ""
-_DB = "graphify_lookup_parity_test"
 
 
 def _graph() -> nx.MultiDiGraph:
@@ -127,15 +121,10 @@ _PARALLEL_PAIR = ("p_caller", "p_callee")
 
 def _snap_graph() -> nx.MultiDiGraph:
     # `_graph()` minus the second relation of the parallel pair: the snapshot writer
-    # refuses parallel links of one direction, so that pair is covered on ArcadeDB only.
+    # refuses parallel links of one direction, so that pair is covered on JSON only.
     G = _graph()
     G.remove_edge(*_PARALLEL_PAIR, key=list(G[_PARALLEL_PAIR[0]][_PARALLEL_PAIR[1]])[-1])
     return G
-
-
-def _skip_on_snap(backends, why):
-    if not isinstance(backends[1], ArcadeDBBackend):
-        pytest.skip(why)
 
 
 def _snap_backends(tmp_path_factory):
@@ -152,40 +141,23 @@ def _snap_backends(tmp_path_factory):
     yield JsonBackend(G), SnapBackend(snapshot_path_for(path), graph_json=path)
 
 
-@pytest.fixture(scope="module", params=["arcadedb", "snap"])
-def backends(request, tmp_path_factory):
-    if request.param == "snap":
-        yield from _snap_backends(tmp_path_factory)
-        return
-    rest = _URL.split("://", 1)[-1]
-    host, _, port = rest.partition(":")
-    arc = ArcadeDBBackend(_DB, host=host or "127.0.0.1", port=int(port or 2480), password=_PW)
-    if not arc.ready():
-        pytest.skip(f"ArcadeDB not reachable at {_URL}")
-    G = _graph()
-    path = tmp_path_factory.mktemp("graph") / "graph.json"
-    path.write_text(json.dumps(json_graph.node_link_data(G, edges="links")), encoding="utf-8")
-    arc.ensure_database(drop=True)
-    arc.load_from_graph_json(str(path))
-    yield JsonBackend(G), arc
-    try:
-        arc._server(f"drop database {_DB}")
-    except Exception:
-        pass
+@pytest.fixture(scope="module")
+def backends(tmp_path_factory):
+    yield from _snap_backends(tmp_path_factory)
 
 
 def _shape(result, render):
     """What both backends must agree on.
 
     A refusal that lists candidates is compared by kind and candidate set: the
-    order follows graph iteration on JSON and id order on ArcadeDB. Any other
+    order follows graph iteration on JSON and id order on the snapshot. Any other
     refusal, and every answer, is compared as rendered text.
     """
     if isinstance(result, Refusal):
         lines = [l.strip() for l in result.message.splitlines()]
         if "in different files" in lines[0]:
             # One representative node per file: the first in tier order, which is
-            # graph order on JSON and id order on ArcadeDB. The files must agree.
+            # graph order on JSON and id order on the snapshot. The files must agree.
             listed = sorted(l for l in lines[1:-1] if not l.startswith("id:"))
         else:
             listed = sorted(l for l in lines if l.startswith("id:"))
@@ -285,7 +257,7 @@ def test_query_refuses_an_exact_name_tie_like_json(backends, question, refused):
 
 
 def test_path_walks_contains_back_to_the_file(backends):
-    """#3878 on ArcadeDB: the route closes through the file's `contains` edge."""
+    """#3878 on the snapshot: the route closes through the file's `contains` edge."""
     _, arc = backends
     out = render_path(arc.shortest_path("alpha.py", "beta.py"), "alpha.py", "beta.py")
     assert "alpha.py --imports [EXTRACTED]--> sharedThing() <--contains [EXTRACTED]-- beta.py" in out
@@ -300,9 +272,9 @@ def test_equal_routes_pick_the_smallest_ids(backends, undirected):
 
 
 @pytest.mark.parametrize("undirected", [False, True])
-def test_parallel_relations_share_one_segment(backends, undirected):
-    _skip_on_snap(backends, "the snapshot writer refuses parallel links of one direction")
-    for b in backends:
+def test_parallel_relations_share_one_segment(undirected):
+    # JSON only: the snapshot writer refuses parallel links of one direction.
+    for b in (JsonBackend(_graph()),):
         p = b.shortest_path("pairCaller()", "pairCallee()", undirected=undirected)
         assert p.found and p.segments[0].relation == "calls/references"
         assert p.segments[0].confidence == "EXTRACTED/INFERRED" and p.segments[0].outgoing
@@ -330,11 +302,10 @@ def test_neighbor_at_suffix_parity(backends):
     assert neighbor_lines(j) == neighbor_lines(a)
 
 
-def test_parallel_edge_renders_two_lines(backends):
-    """pairCaller–pairCallee carries `calls` and `references`; both must appear."""
-    _skip_on_snap(backends, "the snapshot writer refuses parallel links of one direction")
-    jb, arc = backends
-    for label, b in (("pairCaller()", jb), ("pairCaller()", arc)):
+def test_parallel_edge_renders_two_lines():
+    """pairCaller–pairCallee carries `calls` and `references`; both must appear.
+    JSON only: the snapshot writer refuses parallel links of one direction."""
+    for label, b in (("pairCaller()", JsonBackend(_graph())),):
         n = b.get_neighbors(label)
         assert isinstance(n, Neighbors)
         rels = {r.relation for r in n.neighbors}
@@ -389,40 +360,8 @@ def test_absolute_seed_is_anchored_at_the_graph_root(backends, tmp_path):
     assert j.seeds == a.seeds == ["throttleGate()"] and j.given and a.given
 
 
-def test_build_commit_survives_load_and_sync(backends, tmp_path):
-    """graph_stats names the build commit on ArcadeDB as on JSON (748de12)."""
-    from graphify.query_backend import render_stats
-    _skip_on_snap(backends, "load/sync of the build commit is an ArcadeDB path")
-    _, arc = backends
-    G = nx.DiGraph()
-    G.add_node("a", label="a", source_file="a.py")
-    data = {**json_graph.node_link_data(G, edges="links"), "built_at_commit": "c0ffee1234567"}
-    p = tmp_path / "graph.json"
-    p.write_text(json.dumps(data), encoding="utf-8")
-    host, _, port = arc.base.split("://", 1)[-1].partition(":")
-    other = ArcadeDBBackend(_DB + "_commit", host=host, port=int(port), password=_PW)
-    other.ensure_database(drop=True)
-    try:
-        other.load_from_graph_json(str(p))
-        assert other.graph_stats().built_at_commit == "c0ffee1234567"
-        G.graph["_built_at_commit"] = "deadbeef9999"
-        G.add_node("b", label="b", source_file="b.py")
-        other.sync_graph(G, changed_sources={"b.py"}, pruned_sources=set())
-        s = other.graph_stats()
-        assert s.built_at_commit == "deadbeef9999"
-        assert render_stats(s, head="0123456789") .endswith(
-            "HEAD is 0123456, graph built at deadbee: graph may be stale\n")
-        assert render_stats(JsonBackend(G).graph_stats(), head="deadbeef9999").endswith(
-            "Built at commit: deadbeef9999 (matches HEAD)\n")
-    finally:
-        try:
-            other._server(f"drop database {_DB}_commit")
-        except Exception:
-            pass
-
-
-def test_full_token_endpoint_wins_on_arcadedb(backends):
-    """#1785 on ArcadeDB: scored[0] alone anchored on the disconnected decoy."""
+def test_full_token_endpoint_wins_on_the_snapshot(backends):
+    """#1785 on the snapshot: scored[0] alone anchored on the disconnected decoy."""
     _, arc = backends
     p = arc.shortest_path("Reject-everything judge", "Judge Helper 0")
     assert p.found and p.hops == 1

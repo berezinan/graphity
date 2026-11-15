@@ -6,15 +6,6 @@ from typing import Any
 
 import pytest
 
-# Test files that are ABOUT the ArcadeDB backend and therefore choose their own
-# GRAPHIFY_GRAPH_STORE. Everything else runs against the JSON backend.
-_ARCADE_TEST_FILES = frozenset({
-    "test_arcade_backend.py",
-    "test_arcade_server.py",
-    "test_arcade_service.py",
-    "test_cli_arcadedb_branch.py",
-})
-
 @pytest.fixture(scope="session")
 def _can_symlink() -> bool:
     """Whether this machine can create symlinks at all (#2642).
@@ -113,12 +104,13 @@ _ANALYZE_WARNING_FILTERS = (
 def _pin_json_backend(
     request: Any, monkeypatch: pytest.MonkeyPatch, _scrub_graphify_env: None
 ) -> None:
-    """Pin ``GRAPHIFY_GRAPH_STORE=json`` for every test not about ArcadeDB.
+    """Pin ``GRAPHIFY_GRAPH_STORE=json`` for every test.
 
-    The default backend is ArcadeDB and an unreachable server is a fatal error,
-    so without this the whole suite would demand a running service. Setting the
-    variable (rather than deleting it) also stops whatever the developer happens
-    to have exported from leaking in — the suite is deterministic either way.
+    The default store is the snapshot, which needs the graphify-snap wheel and a
+    ``graph.snap`` next to every graph; most tests build a graph.json and read it
+    back, so they run on the in-process model. Setting the variable (rather than
+    deleting it) also stops whatever the developer happens to have exported from
+    leaking in — the suite is deterministic either way.
     ``GRAPHIFY_BACKEND`` is dropped for every test: upstream reads it as the LLM
     provider, and a developer's stale ``GRAPHIFY_BACKEND=arcadedb`` must not
     steer those tests.
@@ -127,8 +119,6 @@ def _pin_json_backend(
     after this fixture and wins.
     """
     monkeypatch.delenv("GRAPHIFY_BACKEND", raising=False)
-    if request.path.name in _ARCADE_TEST_FILES:
-        return
     monkeypatch.setenv("GRAPHIFY_GRAPH_STORE", "json")
 
 

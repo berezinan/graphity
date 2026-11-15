@@ -126,7 +126,7 @@ from graphify.install import (  # noqa: E402,F401
     _PLATFORM_CONFIG,
     _skill_lock,
 )
-from graphify.arcade_server import GraphDBUnavailable as _GraphDBUnavailable  # noqa: E402
+from graphify.store_errors import GraphDBUnavailable as _GraphDBUnavailable  # noqa: E402
 from graphify.cli import (  # noqa: E402,F401
     dispatch_command,
     _StageTimer,
@@ -815,7 +815,7 @@ def main() -> None:
         # as a noisy "Exception ignored on flushing sys.stdout" and a nonzero exit.
         sys.stdout.flush()
     except _GraphDBUnavailable as exc:
-        # The graph database is required and there is no fallback to weigh up,
+        # The graph store is required and there is no fallback to weigh up,
         # so the message is already the whole answer: print it, exit non-zero.
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)

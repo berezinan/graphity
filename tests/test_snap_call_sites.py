@@ -1,7 +1,7 @@
 '''Call-site guards of the snapshot store (5.10).
 
-Every command that writes graph.json publishes a snapshot, never touches ArcadeDB
-on the snap store, and the CLI read commands run to the END on the snap branch
+Every command that writes graph.json publishes a snapshot, and the CLI read
+commands run to the END on the snap branch
 (the c147cde class of breakage: a variable bound in one branch only).
 None of these tests needs the graphify-snap wheel.
 '''
@@ -20,15 +20,9 @@ from graphify import snap_store
 
 @pytest.fixture
 def snap_env(monkeypatch):
-    '''Store = snap, module check a no-op, ArcadeDB booby-trapped. Returns the list of published paths.'''
+    '''Store = snap, module check a no-op. Returns the list of published paths.'''
     monkeypatch.setenv('GRAPHIFY_GRAPH_STORE', 'snap')
     monkeypatch.setattr(snap_store, 'check_api', lambda: None)
-
-    def _boom(*a, **k):
-        raise AssertionError('ArcadeDB must not be touched on the snapshot store')
-
-    monkeypatch.setattr(qb, '_await_ready', _boom)
-    monkeypatch.setattr(qb, 'ArcadeDBBackend', _boom)
     published: list[Path] = []
     monkeypatch.setattr(snap_store, 'publish_snapshot_for', lambda p: published.append(Path(p)))
     return published
@@ -102,9 +96,9 @@ def test_explain_snap_branch_runs_to_completion(snap_cli, capsys):
     assert _stamp(tmp_path).exists()
 
 
-# --- writers publish a snapshot and leave ArcadeDB alone ---------------------- #
+# --- writers publish a snapshot ----------------------------------------------- #
 
-def test_update_on_snap_rebuilds_without_probing_arcadedb(snap_env, monkeypatch, tmp_path):
+def test_update_on_snap_rebuilds(snap_env, monkeypatch, tmp_path):
     from graphify import watch
 
     rebuilt = []

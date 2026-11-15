@@ -1745,7 +1745,7 @@ def dispatch_command(cmd: str) -> None:
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] != "json":
             backend = require_backend(config=_cfg)
-            _corpus = _cfg.get("database") or _cfg.get("snapshot_path")
+            _corpus = _cfg.get("snapshot_path")
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -1812,7 +1812,7 @@ def dispatch_command(cmd: str) -> None:
             token_budget=budget,
             context_filters=context_filters,
             # graph_path, не gp: `gp` связан только в JSON-ветке, а на пути
-            # arcadedb его нет вовсе — тот же отказ, что чинил c147cde.
+            # снапшота его нет вовсе — тот же отказ, что чинил c147cde.
             graph_path=str(graph_path),
         )
         querylog.log_query(
@@ -1826,7 +1826,7 @@ def dispatch_command(cmd: str) -> None:
             duration_ms=(_time.perf_counter() - _t0) * 1000,
             seeds=seeds or None,
         )
-        # graph_path, not gp: the arcadedb branch never binds gp, and the stamp
+        # graph_path, not gp: the snapshot branch never binds gp, and the stamp
         # lives next to the project's graph.json either way.
         _touch_query_stamp(Path(graph_path))
         print(_result)
@@ -2106,7 +2106,7 @@ def dispatch_command(cmd: str) -> None:
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] != "json":
             backend = require_backend(config=_cfg)
-            _corpus = _cfg.get("database") or _cfg.get("snapshot_path")
+            _corpus = _cfg.get("snapshot_path")
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -2183,7 +2183,7 @@ def dispatch_command(cmd: str) -> None:
             corpus=_corpus,
             nodes_returned=result.hops,
         )
-        # graph_path, not gp: the arcadedb branch never binds gp, and the stamp
+        # graph_path, not gp: the snapshot branch never binds gp, and the stamp
         # lives next to the project's graph.json either way.
         _touch_query_stamp(Path(graph_path))
 
@@ -2215,7 +2215,7 @@ def dispatch_command(cmd: str) -> None:
         _cfg = resolve_backend_config(graph_path)
         if _cfg["kind"] != "json":
             backend = require_backend(config=_cfg)
-            _corpus = _cfg.get("database") or _cfg.get("snapshot_path")
+            _corpus = _cfg.get("snapshot_path")
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
@@ -2275,97 +2275,21 @@ def dispatch_command(cmd: str) -> None:
             corpus=_corpus,
             nodes_returned=len(result.connections),
         )
-        # graph_path, not gp: the arcadedb branch never binds gp, and the stamp
+        # graph_path, not gp: the snapshot branch never binds gp, and the stamp
         # lives next to the project's graph.json either way.
         _touch_query_stamp(Path(graph_path))
 
     elif cmd == "arcade":
-        from graphify import arcade_server as _arc
-        sub = sys.argv[2] if len(sys.argv) > 2 else "status"
-        _machine = _arc.read_machine_config()
-        pw = os.environ.get("GRAPHIFY_ARCADE_PASSWORD") or _machine.get("password") or ""
-        url = os.environ.get("GRAPHIFY_ARCADE_URL") or _machine.get("url") or "http://127.0.0.1:2480"
-        _rest = url.split("://", 1)[-1]
-        _host, _, _port = _rest.partition(":")
-        _host = _host or "127.0.0.1"
-        _port = int(_port or 2480)
-        if sub == "status":
-            st = _arc.status(_host, _port, pw)
-            print(f"ArcadeDB: {'answering' if st['ready'] else 'not answering'} | "
-                  f"service={st['service']} | installed={st['installed']} | {url}")
-            if not st["ready"]:
-                print(f"  layout: {st['home']}", file=sys.stderr)
-                print(f"  logs:   {_arc.log_dir()}", file=sys.stderr)
-        elif sub == "install-service":
-            _svc_port = _port
-            _svc_heap = None
-            _svc_pw = None
-            _sargs = sys.argv[3:]
-            for _i, _a in enumerate(_sargs):
-                if _a == "--port" and _i + 1 < len(_sargs):
-                    _svc_port = int(_sargs[_i + 1])
-                elif _a == "--heap" and _i + 1 < len(_sargs):
-                    _svc_heap = _sargs[_i + 1]
-                elif _a == "--password" and _i + 1 < len(_sargs):
-                    _svc_pw = _sargs[_i + 1]
-            try:
-                res = _arc.install_service(password=_svc_pw, port=_svc_port, heap=_svc_heap)
-            except RuntimeError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                sys.exit(1)
-            print(f"Service '{res['service']}' installed and started.")
-            print(f"  url:       {res['url']}")
-            print(f"  layout:    {res['home']}")
-            print(f"  databases: {res['databases']}")
-            print(f"  java:      {res['java']}")
-        elif sub == "uninstall-service":
-            if _arc.uninstall_service():
-                print(f"Service '{_arc.SERVICE_NAME}' removed. Databases left in "
-                      f"{_arc.databases_dir()}.")
-            else:
-                print("No installed service found.", file=sys.stderr)
-                sys.exit(1)
-        elif sub in ("start", "stop", "download"):
-            print(f"'graphify arcade {sub}' is gone: ArcadeDB runs as the Windows service "
-                  f"'{_arc.SERVICE_NAME}'.\n"
-                  f"  install it:  graphify arcade install-service\n"
-                  f"  start/stop:  sc start {_arc.SERVICE_NAME} / sc stop {_arc.SERVICE_NAME}\n"
-                  f"  check it:    graphify arcade status", file=sys.stderr)
-            sys.exit(2)
-        elif sub == "reload":
-            # Drop + full reload of one project's ArcadeDB database from its
-            # graph.json. Recovers a database left inconsistent by a failed
-            # incremental sync without re-running extraction (no API cost).
-            from graphify.query_backend import resolve_backend_config, require_backend
-            arg = sys.argv[3] if len(sys.argv) > 3 else None
-            if not arg:
-                print("Usage: graphify arcade reload <project-dir|graph.json>", file=sys.stderr)
-                sys.exit(2)
-            p = Path(arg)
-            if p.is_dir():
-                cand = p / "graphify-out" / "graph.json"
-                gj = cand if cand.exists() else p / "graph.json"
-            else:
-                gj = p
-            if not gj.exists():
-                print(f"graph.json not found: {gj}", file=sys.stderr)
-                sys.exit(1)
-            cfg = resolve_backend_config(str(gj))
-            if cfg.get("kind") != "arcadedb":
-                print("set GRAPHIFY_GRAPH_STORE=arcadedb to reload an ArcadeDB database", file=sys.stderr)
-                sys.exit(2)
-            from graphify.query_backend import shortfall_warning
-            be = require_backend(config=cfg, require_database=False)
-            print(f"reloading ArcadeDB '{cfg['database']}' from {gj} (drop + full load)...")
-            be.ensure_database(drop=True)
-            st = be.load_from_graph_json(str(gj))
-            print(f"reloaded: {st['nodes']} nodes, {st['edges']} edges")
-            if (_warn := shortfall_warning(st)):
-                print(f"warning: {_warn}", file=sys.stderr)
-        else:
-            print("Usage: graphify arcade <status|install-service|uninstall-service|reload>",
-                  file=sys.stderr)
-            sys.exit(2)
+        # Fork delta (retire-arcadedb): ArcadeDB was retired on 2026-11-15; the
+        # graph store is the snapshot. Say so, and how to remove a leftover service.
+        _svc = r"C:\ProgramData\graphify\arcadedb\GraphifyArcadeDB.exe"
+        print("'graphify arcade' is gone: ArcadeDB was retired, the graph store is the "
+              "snapshot (graphify snap build).\n"
+              "  A leftover GraphifyArcadeDB service is removed from an elevated console:\n"
+              f"    {_svc} stop\n"
+              f"    {_svc} uninstall",
+              file=sys.stderr)
+        sys.exit(2)
 
     elif cmd == "snap":
         # Fork hook (graphify/snap_writer.py): graphify snap build [<project-dir|graph.json>]
@@ -2882,8 +2806,8 @@ def dispatch_command(cmd: str) -> None:
         # a report and labels describing a clustering graph.json does not contain
         # are worse than no run at all (#2436).
         # Fork hook (graphify/recluster.py): a re-clustering that reproduced the
-        # stored partition has nothing to write; one that moved nodes patches the
-        # graph database instead of needing a full `arcade reload`.
+        # stored partition has nothing to write; one that moved nodes is written
+        # and its snapshot republished.
         from graphify.recluster import community_changes as _community_changes
         from graphify.recluster import needs_write as _needs_write
         from graphify.recluster import sync_community_changes as _sync_community_changes
@@ -5531,45 +5455,12 @@ def dispatch_command(cmd: str) -> None:
             pass
         stages.mark("export")
 
-        # Sync the configured graph database. Not guarded: the graph database is
-        # required, so a failed sync is a failed build — swallowing it used to
-        # end an hours-long, paid extraction with exit 0 and one line of stderr.
-        # Incremental updates touch only the changed/deleted files; a first/full
-        # build loads fresh.
-        from graphify.query_backend import resolve_backend_config, require_backend, shortfall_warning
+        # Publish the graph store. Not guarded: the store is required, so a failed
+        # write is a failed build — swallowing it used to end an hours-long, paid
+        # extraction with exit 0 and one line of stderr.
+        from graphify.query_backend import resolve_backend_config
         _db_cfg = resolve_backend_config(str(graph_json_path))
-        if _db_cfg["kind"] == "arcadedb":
-            _db = require_backend(config=_db_cfg, require_database=False)
-            _db.ensure_database()
-            # Non-emptiness alone is not enough: a database whose last
-            # reconciliation came up short must be reloaded, not patched again.
-            if incremental_mode and _db.is_populated() and not _db.has_recorded_shortfall():
-                from graphify.build import _norm_source_file
-                _root = str(target.resolve())
-                _changed = {
-                    _norm_source_file(str(p), _root)
-                    for p in (code_files + doc_files + paper_files + image_files)
-                }
-                if _owner_plan is not None:
-                    _changed |= {f.rel for f in _owner_plan.taken}
-                _pruned = {_norm_source_file(str(p), _root) for p in deleted_files}
-                _st = _db.sync_graph(G, changed_sources=_changed, pruned_sources=_pruned)
-                _pruned_stale = _st.get("pruned_stale_sources", 0)
-                _stale_note = (f", {_pruned_stale} stale sources pruned"
-                               if _pruned_stale else "")
-                print(f"[graphify db] synced ArcadeDB '{_db_cfg['database']}' "
-                      f"(+{_st['upserted_nodes']} nodes, +{_st['upserted_edges']} edges, "
-                      f"{_st['deleted_sources']} dirty sources{_stale_note}).")
-                if _st.get("prune_blocked"):
-                    print(f"[graphify db] warning: {_st['prune_blocked']}", file=sys.stderr)
-            else:
-                _db.ensure_database(drop=True)
-                _st = _db.load_from_graph_json(str(graph_json_path))
-                print(f"[graphify db] loaded ArcadeDB '{_db_cfg['database']}' "
-                      f"({_st['nodes']} nodes, {_st['edges']} edges).")
-            if (_warn := shortfall_warning(_st)):
-                print(f"[graphify db] warning: {_warn}", file=sys.stderr)
-        elif _db_cfg["kind"] == "snap":
+        if _db_cfg["kind"] == "snap":
             # Fork hook (graphify/snap_store.py): snapshot of the graph.json just written.
             from graphify.snap_store import publish_snapshot_for as _publish_snapshot_for
             _publish_snapshot_for(graph_json_path)

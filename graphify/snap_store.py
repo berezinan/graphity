@@ -12,7 +12,7 @@ import inspect
 import os
 from pathlib import Path
 
-from graphify.arcade_server import GraphDBUnavailable
+from graphify.store_errors import GraphDBUnavailable
 
 # Hot value columns. Every other attribute goes to the cold JSON, losslessly.
 NODE_FIELDS = ["label", "norm_label", "source_file", "source_location", "community",
