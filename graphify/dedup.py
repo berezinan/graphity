@@ -608,6 +608,42 @@ def _merge_missing_attributes(survivor: dict, duplicate: dict) -> dict:
     return merged
 
 
+def _same_anchor(survivor: dict, duplicate: dict) -> bool:
+    """True when two records are copies of one shared anchor (fork delta,
+    metadata-object-owns-its-node).
+
+    The BSL/EDT extractor marks a metadata FQN node (`CommonCommand.X`) as
+    ``shared_anchor``: every file naming the object mints the same id on purpose,
+    so an id match under one label is one entity, not a #1504 collision. One
+    marked side is enough: a form or a DCS names the object by the same FQN
+    label without the mark.
+    """
+    return (bool(survivor.get("shared_anchor") or duplicate.get("shared_anchor"))
+            and bool(survivor.get("label"))
+            and survivor.get("label") == duplicate.get("label"))
+
+
+def _not_own_mdo(node: dict) -> bool:
+    """False only for a shared anchor read from the object's own `.mdo`.
+
+    `Kind.Name` (or `Extension.<project>.Kind.Name`) is defined by
+    `.../<Name>/<Name>.mdo`, a nested subsystem `Subsystem.A.B` by
+    `.../A/Subsystems/B/B.mdo`; the registration in `Configuration.mdo` and every
+    reference from code only name it. Prefixed to the collision rank, so a group
+    without such a record keeps the upstream order.
+    """
+    if not node.get("shared_anchor"):
+        return True
+    parts = str(node.get("label") or "").split(".")
+    if len(parts) >= 4 and parts[0] == "Extension":
+        parts = parts[2:]
+    names = parts[1:]
+    if not all(names) or not (len(names) == 1 or parts[0] == "Subsystem"):
+        return True
+    sf = str(node.get("source_file") or "").replace("\\", "/")
+    return not sf.endswith("/" + "/Subsystems/".join(names) + f"/{names[-1]}.mdo")
+
+
 _SHARED_ID_TYPES = ("module", "namespace")
 
 
@@ -626,6 +662,10 @@ def _report_id_collision(nid: str, survivor: dict, losers: list[dict]) -> None:
     # they exempt these types from collision disambiguation. Only a group of one
     # such type under one label is that shared entity; a module colliding with a
     # namespace, or two differently named modules, is still a real collision.
+    # Copies of one shared anchor are one entity, merged above — nothing is lost.
+    losers = [n for n in losers if not _same_anchor(survivor, n)]
+    if not losers:
+        return
     group = (survivor, *losers)
     if (
         survivor.get("type") in _SHARED_ID_TYPES
@@ -1112,6 +1152,12 @@ def deduplicate_entities(
         nodes, edges, hyperedges, root_resolved,
     )
     mentions = _mentions(nodes, edges, root_resolved) | _slice_references(nodes, root_resolved)
+
+    def _rank(n: dict) -> tuple:
+        # A shared anchor's own .mdo outranks every other copy (fork delta,
+        # metadata-object-owns-its-node); all other groups tie on this key.
+        return (_not_own_mdo(n), *_collision_rank(n, root_resolved, mentions))
+
     seen_ids: dict[str, dict] = {}
     dropped: dict[str, list[dict]] = defaultdict(list)
     for node in nodes:
@@ -1121,8 +1167,7 @@ def deduplicate_entities(
         incumbent = seen_ids.get(nid)
         if incumbent is None:
             seen_ids[nid] = node
-        elif (_collision_rank(node, root_resolved, mentions)
-              < _collision_rank(incumbent, root_resolved, mentions)):
+        elif _rank(node) < _rank(incumbent):
             # Smallest-ranked node wins; the min over a total order is independent
             # of the order nodes arrive in, so the survivor no longer depends on
             # chunk ordering (#1851).
@@ -1139,8 +1184,9 @@ def deduplicate_entities(
     for nid, losers in dropped.items():
         survivor = seen_ids[nid]
         same_source = sorted(
-            (l for l in losers if _same_source_entity(survivor, l)),
-            key=lambda l: _collision_rank(l, root_resolved, mentions),
+            (l for l in losers
+             if _same_source_entity(survivor, l) or _same_anchor(survivor, l)),
+            key=_rank,
         )
         for loser in same_source:
             survivor = _merge_missing_attributes(survivor, loser)
