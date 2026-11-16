@@ -617,10 +617,27 @@ def _same_anchor(survivor: dict, duplicate: dict) -> bool:
     so an id match under one label is one entity, not a #1504 collision. One
     marked side is enough: a form or a DCS names the object by the same FQN
     label without the mark.
+
+    A nested member is also named two ways: bare by its owner's .mdo
+    (`Архивный`) and by a marked FQN stub from a document journal column
+    (`Document.Д.Attribute.Архивный`). The id encodes the whole chain, so the
+    pair is one entity when the FQN has at least `Kind.Name.Sub.Member` and the
+    bare label is its last segment; a two-segment FQN (`CommonForm.X` against a
+    bare `X` from Form.form) stays a collision.
     """
-    return (bool(survivor.get("shared_anchor") or duplicate.get("shared_anchor"))
-            and bool(survivor.get("label"))
-            and survivor.get("label") == duplicate.get("label"))
+    if not (survivor.get("shared_anchor") or duplicate.get("shared_anchor")):
+        return False
+    a, b = str(survivor.get("label") or ""), str(duplicate.get("label") or "")
+    if a and a == b:
+        return True
+    for fqn, bare, marked in ((a, b, survivor), (b, a, duplicate)):
+        parts = fqn.split(".")
+        if parts[0] == "Extension":
+            parts = parts[2:]
+        if (marked.get("shared_anchor") and len(parts) >= 4 and bare
+                and "." not in bare and parts[-1] == bare):
+            return True
+    return False
 
 
 def _not_own_mdo(node: dict) -> bool:

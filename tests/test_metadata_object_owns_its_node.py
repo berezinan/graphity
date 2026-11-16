@@ -81,6 +81,53 @@ def test_unmarked_copy_and_nested_subsystem(capsys):
     assert "minted by two different files" not in capsys.readouterr().err
 
 
+def test_nested_member_named_by_journal_column(capsys):
+    """UNF 2026-11-16: the document's own .mdo names its attribute bare
+    (`Архивный`, with uuid), a document journal column references it by an FQN
+    stub carrying the mark. Same id by construction — one entity, no warning,
+    the own .mdo survives. A common form named bare by its Form.form is a
+    different label shape (two segments) and stays a collision (D2/D4)."""
+    from graphify.dedup import deduplicate_entities
+
+    def pair(nid, fqn, bare, own, ref):
+        return [
+            {"id": nid, "label": bare, "file_type": "code", "source_file": own,
+             "source_location": "L1", "uuid": "u-" + bare, "_origin": "ast"},
+            {"id": nid, "label": fqn, "file_type": "code", "source_file": ref,
+             "source_location": "L1", "shared_anchor": True, "_origin": "ast"},
+        ]
+
+    nid = "document_чекккмвозврат_attribute_архивный"
+    own = "src/Documents/ЧекККМВозврат/ЧекККМВозврат.mdo"
+    xid = "extension_volkova_document_д_attribute_р"
+    xown = "Volkova/src/Documents/Д/Д.mdo"
+    recs = (pair(nid, "Document.ЧекККМВозврат.Attribute.Архивный", "Архивный", own,
+                 "src/DocumentJournals/ЧекиККМ/ЧекиККМ.mdo")
+            + pair(xid, "Extension.Volkova.Document.Д.Attribute.Р", "Р", xown,
+                   "Volkova/src/DocumentJournals/Ж/Ж.mdo"))
+    edges = [
+        {"source": "document_чекккмвозврат", "target": nid, "relation": "contains",
+         "confidence": "EXTRACTED", "source_file": own},
+        {"source": "documentjournal_чекиккм_column_архивный", "target": nid,
+         "relation": "references", "confidence": "EXTRACTED",
+         "source_file": "src/DocumentJournals/ЧекиККМ/ЧекиККМ.mdo"},
+    ]
+    for perm in itertools.permutations(recs):
+        out, out_edges = deduplicate_entities([dict(n) for n in perm], [dict(e) for e in edges],
+                                              communities={}, root=None)
+        by_id = {n["id"]: n for n in out}
+        assert by_id[nid]["source_file"] == own and by_id[nid]["uuid"] == "u-Архивный"
+        assert by_id[xid]["source_file"] == xown and by_id[xid]["uuid"] == "u-Р"
+        assert {e["relation"] for e in out_edges if e["target"] == nid} == {"contains", "references"}
+    assert "minted by two different files" not in capsys.readouterr().err
+
+    form = pair("commonform_выбортовара", "CommonForm.ВыборТовара", "ВыборТовара",
+                "src/CommonForms/ВыборТовара/Form.form",
+                "src/CommonForms/ВыборТовара/ВыборТовара.mdo")
+    deduplicate_entities(form, [], communities={}, root=None)
+    assert "minted by two different files" in capsys.readouterr().err
+
+
 def test_non_anchor_collisions_keep_the_upstream_rule(capsys):
     from graphify.dedup import deduplicate_entities
 
