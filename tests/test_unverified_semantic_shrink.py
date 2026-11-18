@@ -244,6 +244,7 @@ def test_3203_e2e_repro_protected_and_manifest_unstamped(tmp_path, monkeypatch, 
 
     err = capsys.readouterr().err
     assert "unverified semantic shrink detected for 'README.md' (3 -> 1 nodes)" in err
+    assert "stays armed for this write; pass --allow-partial" in err
     assert "Refusing to overwrite" in err
 
     # The existing graph on disk is still the healthy 5-node graph
@@ -311,6 +312,12 @@ def test_3203_allow_partial_override_permits_intentional_reduction(tmp_path, mon
 
     code2 = _run_cli()
     assert code2 == 0
+
+    # The notice must not tell the user to pass the flag they already passed.
+    err = capsys.readouterr().err
+    assert "unverified semantic shrink detected for 'README.md' (3 -> 1 nodes)" in err
+    assert "--allow-partial was passed, so the shrink guard is off" in err
+    assert "stays armed" not in err
 
     # With override, the 1-node graph is persisted
     graph = json.loads((out_dir / "graph.json").read_text(encoding="utf-8"))

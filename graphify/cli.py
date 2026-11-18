@@ -472,11 +472,21 @@ def _handle_unverified_semantic_shrink(
     )
     print(
         f"[graphify extract] semantic extraction is incomplete: unverified semantic "
-        f"shrink detected for {details}. The shrink guard stays armed for this write; "
-        "pass --allow-partial to overwrite a larger existing graph anyway.",
+        f"shrink detected for {details}.{_shrink_guard_tail(cli_allow_partial)}",
         file=sys.stderr,
     )
     return incomplete, manifest_files, cleared_semantic
+
+
+def _shrink_guard_tail(cli_allow_partial: bool) -> str:
+    """Closing sentence of an incomplete-extraction notice. Under --allow-partial
+    the guard is off, so telling the user to pass that flag misleads (fork delta)."""
+    if cli_allow_partial:
+        return " --allow-partial was passed, so the shrink guard is off for this write."
+    return (
+        " The shrink guard stays armed for this write; "
+        "pass --allow-partial to overwrite a larger existing graph anyway."
+    )
 
 
 def _stale_graph_sources(
@@ -4884,8 +4894,7 @@ def dispatch_command(cmd: str) -> None:
                         f"[graphify extract] semantic extraction is incomplete: "
                         f"{len(_omitted_files)} dispatched file(s) produced no nodes and "
                         f"{len(_partial_semantic_files)} came back truncated or hollow."
-                        f"{_coverage_note} The shrink guard stays armed for this write; "
-                        f"pass --allow-partial to overwrite a larger existing graph anyway.",
+                        f"{_coverage_note}{_shrink_guard_tail(cli_allow_partial)}",
                         file=sys.stderr,
                     )
                 try:
@@ -5385,6 +5394,8 @@ def dispatch_command(cmd: str) -> None:
         # passing --allow-partial (the good graph is preserved and the manifest
         # is not stamped, so the retry re-extracts).
         from graphify.build import take_shrink_accounting as _take_shrink_accounting
+        # Popped before take_shrink_accounting, which discards it (fork delta).
+        _source_shrink = G.graph.pop("_source_shrink", None) if hasattr(G, "graph") else None
         _dedup_collapsed, _pruned_nodes, _ghost_collapsed = _take_shrink_accounting(G)
         _force_write = cli_allow_partial or not _extraction_incomplete
         _dedup_shrink_counts: tuple[int, int] | None = None
@@ -5410,11 +5421,30 @@ def dispatch_command(cmd: str) -> None:
                 f" and {_ghost_collapsed} same-file ghost duplicate(s) were merged (#1145)"
                 if _ghost_collapsed else ""
             )
+            # Dedup merging something does not make it the cause: a re-extracted
+            # file whose fresh LLM output names fewer entities shrinks the graph
+            # too. Name the files that actually lost nodes (fork delta).
+            _sources_note = ""
+            if _source_shrink:
+                _worst = sorted(
+                    _source_shrink.items(), key=lambda kv: (kv[1][1] - kv[1][0], kv[0])
+                )
+                _shown = ", ".join(
+                    f"'{sf or '<no source_file>'}' ({old} -> {new})"
+                    for sf, (old, new) in _worst[:5]
+                )
+                _more = f" (+{len(_worst) - 5} more)" if len(_worst) > 5 else ""
+                _sources_note = (
+                    f" Sources with fewer nodes than in the saved graph: {_shown}{_more}"
+                    " — a re-extraction that returns fewer entities shrinks a file as"
+                    " well, so check these before blaming dedup."
+                )
             print(
                 f"[graphify extract] error: dedup merged {_dedup_collapsed} "
                 f"node(s){_ghost_note}; writing would shrink the graph from {_old_n} nodes "
-                f"to {_new_n} nodes ({_old_n - _new_n} fewer). Refusing to overwrite "
-                f"{graph_json_path}. Pass --allow-dedup-shrink to write the smaller graph.",
+                f"to {_new_n} nodes ({_old_n - _new_n} fewer).{_sources_note} Refusing to "
+                f"overwrite {graph_json_path}. Pass --allow-dedup-shrink to write the "
+                f"smaller graph.",
                 file=sys.stderr,
             )
             sys.exit(1)

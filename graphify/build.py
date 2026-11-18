@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import unicodedata
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 import networkx as nx
@@ -2136,6 +2137,9 @@ def take_shrink_accounting(G) -> tuple[int, int, int]:
     collapsed = int(attrs.pop("_dedup_collapsed", 0) or 0)
     pruned = int(attrs.pop("_pruned_node_count", 0) or 0)
     ghosts = int(attrs.pop("_ghost_collapsed", 0) or 0)
+    # Fork delta: build_merge's per-source shrink map. Extract pops it first;
+    # discarding it here keeps every other writer from persisting it.
+    attrs.pop("_source_shrink", None)
     return collapsed, pruned, ghosts
 
 
@@ -2980,6 +2984,26 @@ def build_merge(
 
     if unverified_semantic_shrink:
         G.graph["_unverified_semantic_shrink"] = unverified_semantic_shrink
+
+    # Per-source node counts that went DOWN versus the saved graph (fork delta).
+    # The extract CLI names these when it refuses a #3774 dedup shrink, so the
+    # user sees which files lost nodes instead of a bare dedup total.
+    if had_graph:
+        def _per_source(items) -> "Counter[str]":
+            return Counter(
+                (_norm_source_file(sf, _eff_root) or sf) if sf else ""
+                for sf in items
+            )
+        _before = _per_source(
+            n.get("source_file") for n in _disk_nodes if isinstance(n, dict)
+        )
+        _after = _per_source(d.get("source_file") for _n, d in G.nodes(data=True))
+        _source_shrink = {
+            sf: (old, _after.get(sf, 0))
+            for sf, old in _before.items() if _after.get(sf, 0) < old
+        }
+        if _source_shrink:
+            G.graph["_source_shrink"] = _source_shrink
 
     return G
 

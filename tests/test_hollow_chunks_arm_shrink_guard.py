@@ -124,11 +124,14 @@ def test_a_hollow_chunk_arms_the_shrink_guard(monkeypatch, tmp_path, capsys):
     assert "1 came back truncated or hollow" in capsys.readouterr().err
 
 
-def test_allow_partial_still_overrides(monkeypatch, tmp_path):
+def test_allow_partial_still_overrides(monkeypatch, tmp_path, capsys):
     rec = _record_force(monkeypatch)
     _arm(monkeypatch, tmp_path, uncovered=("GUIDE.md",), extra_argv=["--allow-partial"])
     _run()
     assert rec["called"] and rec["force"] is True
+    err = capsys.readouterr().err
+    assert "--allow-partial was passed, so the shrink guard is off" in err
+    assert "stays armed" not in err
 
 
 def test_a_run_with_every_file_covered_keeps_force_write(monkeypatch, tmp_path, capsys):

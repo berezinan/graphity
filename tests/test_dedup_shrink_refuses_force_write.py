@@ -117,6 +117,8 @@ def test_complete_run_refuses_a_same_file_dedup_shrink(monkeypatch, tmp_path, ca
     # (1 merged node), not the whole 3->2 delta
     assert "merged 1" in err
     assert "--allow-dedup-shrink" in err
+    # names the file that lost nodes, not only the dedup total (fork delta)
+    assert "Sources with fewer nodes than in the saved graph: 'README.md' (3 -> 2)" in err
 
 
 def test_allow_dedup_shrink_writes_the_smaller_graph(monkeypatch, tmp_path):
@@ -133,6 +135,37 @@ def test_allow_dedup_shrink_writes_the_smaller_graph(monkeypatch, tmp_path):
     raw = graph_path.read_text(encoding="utf-8")
     assert "_dedup_collapsed" not in raw
     assert "_pruned_node_count" not in raw
+    assert "_source_shrink" not in raw
+
+
+def test_source_shrink_lists_only_files_that_lost_nodes(tmp_path):
+    """build_merge records per-source counts that went down; a file that grew
+    or stayed the same is not listed (fork delta)."""
+    from graphify.build import build_merge, take_shrink_accounting
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    disk = [
+        {"id": "a1", "label": "A1", "file_type": "document", "source_file": "a.md"},
+        {"id": "a2", "label": "A2", "file_type": "document", "source_file": "a.md"},
+        {"id": "a3", "label": "A3", "file_type": "document", "source_file": "a.md"},
+        {"id": "b1", "label": "B1", "file_type": "document", "source_file": "b.md"},
+    ]
+    graph_path = root / "graphify-out" / "graph.json"
+    _write_graph(graph_path, disk)
+    chunk = {
+        "nodes": [
+            {"id": "a1", "label": "A1", "file_type": "document", "source_file": "a.md"},
+            {"id": "b1", "label": "B1", "file_type": "document", "source_file": "b.md"},
+            {"id": "b2", "label": "B2", "file_type": "document", "source_file": "b.md"},
+        ],
+        "edges": [],
+        "hyperedges": [],
+    }
+    G = build_merge([chunk], graph_path, root=root)
+    assert G.graph.get("_source_shrink") == {"a.md": (3, 1)}
+    take_shrink_accounting(G)
+    assert "_source_shrink" not in G.graph
 
 
 def test_a_deleted_file_still_writes(monkeypatch, tmp_path):
