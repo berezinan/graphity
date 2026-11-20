@@ -99,6 +99,8 @@ from graphify.extractors.sql import _norm_ident as _sql_norm_ident, extract_sql 
 from graphify.extractors.terraform import extract_terraform, prepare_terraform, resolve_terraform_modules  # noqa: F401
 from graphify.extractors.verilog import extract_verilog  # noqa: F401
 from graphify.extractors.vbnet import extract_vbnet, resolve_vbnet_partial_calls  # noqa: F401
+from graphify.extractors.xdto import extract_xdto  # noqa: F401
+from graphify.extractors.xsd import extract_xsd  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
 from graphify.paths import disambiguate_ambiguous_candidates
@@ -9012,6 +9014,9 @@ _DISPATCH: dict[str, Any] = {
     ".dcs": extract_edt_dcs,
     ".oform": extract_edt_oform,
     ".cmi": extract_edt_cmi,
+    ".xsd": extract_xsd,
+    ".wsdl": extract_xsd,
+    ".xdto": extract_xdto,
 }
 
 

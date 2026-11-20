@@ -2,6 +2,8 @@ The project was driven by the need to process very large source code arrays for 
 
 Support for the 1C programming language (BSL) has been added to the project. 
 
+XML schemas are extracted deterministically (no LLM): W3C XSD (`.xsd`), the schemas inside a WSDL's `<types>` (`.wsdl`) and 1C XDTO packages (`Package.xdto`) become namespace, type and property nodes. A type is one node however many files declare or reference it — its id is built from the namespace URI and the name, not the file — and its label carries a short namespace prefix (`EnterpriseData/1.22 · СправочникСсылка.Банки`). References to built-in types (`xs:string`, the 1C platform's `http://v8.1c.ru/8.N/...`) are kept as the `type_ref` attribute instead of edges. In a 1C:EDT project the operations of a web service link to the XDTO types they return and accept.
+
 The data access layer has been redesigned: the GraphBackend abstraction has been introduced, and graph queries are served from a memory-mapped snapshot instead of loading the whole graph (an ArcadeDB store used before it was retired on 2026-11-15).
 
 **Default graph store: the snapshot.** Next to every `graph.json` graphify publishes `graph.snap`, an immutable memory-mapped file read by a Rust module, so `query`/`path`/`explain` and the MCP server answer without loading the graph into memory (ERP2, 2 M nodes: first query 1.3 s). Answers are byte-identical to the in-process JSON model. The snapshot is rebuilt after every write of `graph.json` (`extract`, `update`, `watch`, `cluster-only`/`label`, `global add`/`remove`); a missing or stale snapshot is refused with a hint, never answered from `graph.json`.

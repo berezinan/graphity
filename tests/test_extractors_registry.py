@@ -65,3 +65,12 @@ def test_bsl_migrated():
     }.items():
         assert getattr(facade, fn.__name__) is fn
         assert LANGUAGE_EXTRACTORS[lang] is fn
+
+
+def test_xml_schema_extractors_registered():
+    # xml-schema-types: W3C XSD/WSDL (xsd.py) and 1C XDTO packages (xdto.py, fork delta).
+    from graphify.extractors.xdto import extract_xdto
+    from graphify.extractors.xsd import extract_xsd
+
+    assert facade.extract_xsd is extract_xsd and LANGUAGE_EXTRACTORS["xsd"] is extract_xsd
+    assert facade.extract_xdto is extract_xdto and LANGUAGE_EXTRACTORS["xdto"] is extract_xdto

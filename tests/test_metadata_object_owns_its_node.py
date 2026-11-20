@@ -61,6 +61,26 @@ def test_without_own_mdo_attributes_still_merge(capsys):
     assert "minted by two different files" not in capsys.readouterr().err
 
 
+def test_same_named_object_of_another_kind_is_not_the_own_mdo(capsys):
+    # ERP2 (xml-schema-types acceptance): WebService.EquipmentService references
+    # XDTOPackage.EquipmentService. Both own .mdo files end in
+    # `EquipmentService/EquipmentService.mdo`; only the kind folder tells them apart.
+    from graphify.dedup import deduplicate_entities
+
+    nid, label = "xdtopackage_equipmentservice", "XDTOPackage.EquipmentService"
+    own = "src/XDTOPackages/EquipmentService/EquipmentService.mdo"
+    base = {"id": nid, "label": label, "file_type": "code", "shared_anchor": True,
+            "_origin": "ast"}
+    recs = [
+        {**base, "source_file": "src/WebServices/EquipmentService/EquipmentService.mdo"},
+        {**base, "source_file": own, "uuid": "u-pkg"},
+    ]
+    for perm in itertools.permutations(recs):
+        out, _ = deduplicate_entities([dict(n) for n in perm], [], communities={}, root=None)
+        [node] = [n for n in out if n["id"] == nid]
+        assert node["source_file"] == own and node["uuid"] == "u-pkg"
+
+
 def test_unmarked_copy_and_nested_subsystem(capsys):
     """A form names the object by its FQN without the mark — still one entity; a
     nested subsystem `Subsystem.A.B` is owned by `A/Subsystems/B/B.mdo`, not by

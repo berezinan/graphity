@@ -18,6 +18,9 @@ from graphify.extractors.base import (
     _project_xml_is_safe,
     _read_text,
 )
+from graphify.extractors import xsd as _xsd
+
+_XSI_NS = _xsd.XSI_NS
 
 # ── BSL (1C / OneScript) extractor (custom walk) ──────────────────────────────
 
@@ -1147,6 +1150,40 @@ def extract_edt_mdo(path: Path) -> dict:
                 return c.text.strip()
         return None
 
+    def add_xml_stub(nid: str, label: str, ns: str, xml_kind: str) -> None:
+        """A stub of an XML schema node, under the id and label the schema
+        extractors give its declaration, so the two merge (xml-schema-types)."""
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1",
+                          "namespace": ns, "xml_kind": xml_kind,
+                          "shared_anchor": True})
+
+    def add_xml_namespace(ns: str) -> str | None:
+        if not ns or _xsd.is_builtin_namespace(ns):
+            return None
+        nid = _xsd.namespace_id(ns)
+        add_xml_stub(nid, ns, ns, "namespace")
+        return nid
+
+    def add_xdto_type_ref(src_id: str, elem, context: str) -> None:
+        """`<name>`/`<nsUri>` of an XDTO type: an edge to the type node, or the
+        `type_ref` attribute for a built-in type (never an edge into `string`)."""
+        name = child_text(elem, "name")
+        if not name:
+            return
+        ns = child_text(elem, "nsUri") or ""
+        if _xsd.is_builtin_namespace(ns):
+            for node in nodes:
+                if node["id"] == src_id:
+                    node.setdefault("type_ref", f"{{{ns}}}{name}")
+                    break
+            return
+        tid = _xsd.symbol_id(ns, "type", name)
+        add_xml_stub(tid, _xsd.symbol_label(ns, "type", name), ns, "type")
+        add_ref_edge(src_id, tid, context)
+
     kind = _edt_localname(root.tag)
     # Objects of a configuration extension carry the extension in their id;
     # everything else is unscoped and unchanged (design.md, Decision 6).
@@ -1373,9 +1410,36 @@ def extract_edt_mdo(path: Path) -> dict:
         if ln == "operations":
             op_name = child_text(child, "name")
             if op_name:
-                add_procedure_ref(_make_id(*id_parts, "Operation", op_name),
-                                  child_text(child, "procedureName"),
+                op_id = _make_id(*id_parts, "Operation", op_name)
+                add_procedure_ref(op_id, child_text(child, "procedureName"),
                                   "service-procedure")
+                # The XDTO types an operation returns and its parameters accept
+                # (xml-schema-types): the same type nodes the schema extractors
+                # mint, reached through {nsUri}name.
+                for c in child:
+                    cl = _edt_localname(c.tag)
+                    if cl == "xdtoReturningValueType":
+                        add_xdto_type_ref(op_id, c, "xdto-return-type")
+                    elif cl == "parameters":
+                        p_name = child_text(c, "name")
+                        for t in c:
+                            if p_name and _edt_localname(t.tag) == "xdtoValueType":
+                                add_xdto_type_ref(
+                                    _make_id(*id_parts, "Operation", op_name,
+                                             "Parameter", p_name),
+                                    t, "xdto-param-type")
+
+        # A web service names the XDTO packages it uses either by FQN
+        # (`core:ReferenceValue`) or by namespace URI (`core:StringValue`).
+        if ln == "xdtoPackages":
+            value = child_text(child, "value")
+            form = child.get(f"{{{_XSI_NS}}}type", "").rpartition(":")[2]
+            if value and form == "ReferenceValue":
+                add_ref(obj_id, "object", value, "xdtoPackages")
+            elif value and form == "StringValue":
+                ns_id = add_xml_namespace(value)
+                if ns_id:
+                    add_ref_edge(obj_id, ns_id, "xdtoPackages")
 
         if ln == "columns":
             col_name = child_text(child, "name")
@@ -1424,6 +1488,16 @@ def extract_edt_mdo(path: Path) -> dict:
         mod = path.parent / "CommandModule.bsl"
         if mod.is_file():
             add_edge(obj_id, _make_id(str(mod)), "defines")
+
+    # An XDTO package is the 1C face of one XML namespace; its schema lives in
+    # the sibling Package.xdto, extracted by graphify.extractors.xdto.
+    if kind == "XDTOPackage":
+        ns_id = add_xml_namespace(child_text(root, "namespace") or "")
+        if ns_id:
+            add_ref_edge(obj_id, ns_id, "namespace")
+        schema = path.parent / "Package.xdto"
+        if schema.is_file():
+            add_edge(obj_id, _make_id(str(schema)), "defines")
 
     return {"nodes": nodes, "edges": edges}
 

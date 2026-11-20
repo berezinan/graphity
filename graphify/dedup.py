@@ -657,8 +657,23 @@ def _not_own_mdo(node: dict) -> bool:
     names = parts[1:]
     if not all(names) or not (len(names) == 1 or parts[0] == "Subsystem"):
         return True
+    # The kind's own folder is part of the test: WebService.X and XDTOPackage.X
+    # both live in `X/X.mdo`, and a web service naming its package is a reference.
+    from graphify.extractors.bsl import _EDT_KIND_TO_PLURAL
+    plural = _EDT_KIND_TO_PLURAL.get(parts[0])
+    if not plural:
+        return True
     sf = str(node.get("source_file") or "").replace("\\", "/")
-    return not sf.endswith("/" + "/Subsystems/".join(names) + f"/{names[-1]}.mdo")
+    return not sf.endswith(f"/{plural}/" + "/Subsystems/".join(names) + f"/{names[-1]}.mdo")
+
+
+def _not_own_definition(node: dict) -> bool:
+    """False for the defining record of a shared anchor: a metadata object's own
+    `.mdo` (see _not_own_mdo) or the file that declares an XML schema symbol
+    (`xml_defined`, set by the schema extractors; stubs never carry it)."""
+    if node.get("shared_anchor") and node.get("xml_defined"):
+        return False
+    return _not_own_mdo(node)
 
 
 _SHARED_ID_TYPES = ("module", "namespace")
@@ -1172,8 +1187,10 @@ def deduplicate_entities(
 
     def _rank(n: dict) -> tuple:
         # A shared anchor's own .mdo outranks every other copy (fork delta,
-        # metadata-object-owns-its-node); all other groups tie on this key.
-        return (_not_own_mdo(n), *_collision_rank(n, root_resolved, mentions))
+        # metadata-object-owns-its-node), and so does the declaration of an XML
+        # schema symbol over the stubs its referrers mint (xml-schema-types);
+        # all other groups tie on this key.
+        return (_not_own_definition(n), *_collision_rank(n, root_resolved, mentions))
 
     seen_ids: dict[str, dict] = {}
     dropped: dict[str, list[dict]] = defaultdict(list)
