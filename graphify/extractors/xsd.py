@@ -278,7 +278,10 @@ class SchemaEmitter:
     def property(self, owner: Owner, name: str, line: int, *,
                  attribute: bool = False) -> Owner:
         parts = owner.parts + (_ATTR_TOKEN if attribute else _PROP_TOKEN, name)
-        tail = f"{owner.tail}.{'@' if attribute else ''}{name}"
+        # `/` cannot occur in an XML name, while `.` can and does: EnterpriseData
+        # names a tabular-section row type `Документ.X.Строки`, which a `.`
+        # separator would print exactly like property `Строки` of `Документ.X`.
+        tail = f"{owner.tail}/{'@' if attribute else ''}{name}"
         nid = _make_id(*parts)
         self._node(nid, _label(owner.ns, tail), line, namespace=owner.ns,
                    xml_kind="property", shared_anchor=True)

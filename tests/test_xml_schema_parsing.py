@@ -97,14 +97,14 @@ def test_prefix_declared_on_the_element_and_rebound(tmp_path):
     r = extract_xsd(_write(tmp_path, "scoped.xsd", _SCOPED))
     assert "error" not in r
     edges = _edges(r)
-    assert ("t:a · Holder.First", "t:one · T", "references", "property-type") in edges
-    assert ("t:a · Holder.Second", "t:two · T", "references", "property-type") in edges
+    assert ("t:a · Holder/First", "t:one · T", "references", "property-type") in edges
+    assert ("t:a · Holder/Second", "t:two · T", "references", "property-type") in edges
     # Unknown prefix: no edge, no invented node.
-    assert not any(src == "t:a · Holder.Third" for src, *_ in edges)
+    assert not any(src == "t:a · Holder/Third" for src, *_ in edges)
     assert not any(n["label"].endswith("· T") and "zz" in n["label"] for n in r["nodes"])
     # Built-in: attribute, not edge.
     props = _by_label(r)
-    assert props["t:a · Holder.Fourth"]["type_ref"] == XS_STRING
+    assert props["t:a · Holder/Fourth"]["type_ref"] == XS_STRING
     assert not any(n["label"].endswith("string") for n in r["nodes"])
 
 
@@ -212,18 +212,18 @@ def test_globals_and_symbol_spaces(orders):
 def test_properties_through_compositors(orders):
     edges = _edges(orders)
     for prop in ("Id", "Customer", "Guest", "@Id"):
-        assert (f"{O} · Order", f"{O} · Order.{prop}", "contains", None) in edges
+        assert (f"{O} · Order", f"{O} · Order/{prop}", "contains", None) in edges
     # Element and attribute of one name stay two properties.
     nodes = _by_label(orders)
-    assert nodes[f"{O} · Order.Id"]["id"] != nodes[f"{O} · Order.@Id"]["id"]
+    assert nodes[f"{O} · Order/Id"]["id"] != nodes[f"{O} · Order/@Id"]["id"]
     assert not any(n.get("label", "").endswith(("sequence", "choice")) for n in orders["nodes"])
 
 
 def test_anonymous_types_nest(orders):
     edges = _edges(orders)
-    assert (f"{O} · Order.Guest", f"{O} · Order.Guest#type", "contains", None) in edges
-    assert (f"{O} · Order.Guest#type", f"{O} · Order.Guest#type.Email", "contains", None) in edges
-    email_type = _by_label(orders)[f"{O} · Order.Guest#type.Email#type"]
+    assert (f"{O} · Order/Guest", f"{O} · Order/Guest#type", "contains", None) in edges
+    assert (f"{O} · Order/Guest#type", f"{O} · Order/Guest#type/Email", "contains", None) in edges
+    email_type = _by_label(orders)[f"{O} · Order/Guest#type/Email#type"]
     assert email_type["xml_kind"] == "anonymous-type"
     assert email_type["base_ref"] == XS_STRING
     assert email_type["xml_pattern"] == [".+@.+"] and email_type["xml_maxLength"] == "100"
@@ -232,9 +232,9 @@ def test_anonymous_types_nest(orders):
 def test_references_and_inheritance(orders):
     edges = _edges(orders)
     assert (f"{O} · Order [element]", f"{O} · Order", "references", "property-type") in edges
-    assert (f"{O} · Order.Customer", "example.com/common · Party", "references", "property-type") in edges
+    assert (f"{O} · Order/Customer", "example.com/common · Party", "references", "property-type") in edges
     assert (f"{O} · Special", f"{O} · Order", "inherits", None) in edges
-    assert (f"{O} · Special", f"{O} · Special.Reason", "contains", None) in edges
+    assert (f"{O} · Special", f"{O} · Special/Reason", "contains", None) in edges
     assert (f"{O} · Order", f"{O} · Note [element]", "references", "element-ref") in edges
     assert (f"{O} · Order", f"{O} · Audit [group]", "references", "group-ref") in edges
     assert (f"{O} · Order", f"{O} · Tracking [attributeGroup]", "references", "attribute-group-ref") in edges
@@ -243,7 +243,7 @@ def test_references_and_inheritance(orders):
     assert (f"{O} · Code", f"{O} · Status", "references", "union-member") in edges
     nodes = _by_label(orders)
     assert nodes[f"{O} · Code"]["member_type_refs"] == ["{http://www.w3.org/2001/XMLSchema}int"]
-    assert nodes[f"{O} · Audit [group]"] and (f"{O} · Audit [group]", f"{O} · Audit [group].Created", "contains", None) in edges
+    assert nodes[f"{O} · Audit [group]"] and (f"{O} · Audit [group]", f"{O} · Audit [group]/Created", "contains", None) in edges
 
 
 def test_enumeration_is_an_attribute(orders):
@@ -281,7 +281,8 @@ def test_dotted_type_name_does_not_collide_with_property(tmp_path):
         '<xs:complexType name="A.B"/></xs:schema>'))
     nodes = _by_label(r)
     assert nodes["t:d · A.B"]["xml_kind"] == "type"
-    assert nodes["t:d · A.B"]["id"] != [n for n in r["nodes"] if n.get("xml_kind") == "property"][0]["id"]
+    assert nodes["t:d · A/B"]["xml_kind"] == "property"
+    assert nodes["t:d · A.B"]["id"] != nodes["t:d · A/B"]["id"]
 
 
 # ── WSDL ─────────────────────────────────────────────────────────────────────
@@ -307,7 +308,7 @@ def test_wsdl_reads_only_types(tmp_path):
     r = extract_xsd(_write(tmp_path, "WsDefinitions.wsdl", _WSDL))
     labels = set(_by_label(r))
     p = "file.api.update.onec.ru"
-    assert {f"{p} · getFiles", f"{p} · getFiles [element]", f"{p} · getFiles.version"} <= labels
+    assert {f"{p} · getFiles", f"{p} · getFiles [element]", f"{p} · getFiles/version"} <= labels
     # The prefix xsd1 is declared on <definitions>, outside the schema.
     assert (f"{p} · getFiles [element]", f"{p} · getFiles", "references", "property-type") in _edges(r)
     assert not any(word in label for label in labels

@@ -79,8 +79,8 @@ def test_object_type_properties_and_builtin_refs(tmp_path):
     r = extract_xdto(_write(tmp_path, "AgentScripts", _AGENT))
     nodes = _by_label(r)
     assert nodes["scripts/1.0 · UpdateFile"]["xml_kind"] == "type"
-    assert nodes["scripts/1.0 · UpdateFile.Id"]["type_ref"] == "{http://v8.1c.ru/8.1/data/core}UUID"
-    assert nodes["scripts/1.0 · UpdateFile.Extension"]["type_ref"] == f"{XS}string"
+    assert nodes["scripts/1.0 · UpdateFile/Id"]["type_ref"] == "{http://v8.1c.ru/8.1/data/core}UUID"
+    assert nodes["scripts/1.0 · UpdateFile/Extension"]["type_ref"] == f"{XS}string"
     edges = _edges(r)
     assert ("Package.xdto", "http://v8.1c.ru/agent/scripts/1.0", "contains", None) in edges
     assert ("http://v8.1c.ru/agent/scripts/1.0", "scripts/1.0 · UpdateFile", "contains", None) in edges
@@ -103,7 +103,7 @@ def test_inheritance_references_and_global_property(tmp_path):
     r = extract_xdto(_write(tmp_path, "ED", _ED))
     edges = _edges(r)
     assert (f"{ED} · СправочникСсылка.Банки", f"{ED} · КлючевыеСвойства", "inherits", None) in edges
-    assert (f"{ED} · СправочникСсылка.Банки.БИК", f"{ED} · ИНН", "references", "property-type") in edges
+    assert (f"{ED} · СправочникСсылка.Банки/БИК", f"{ED} · ИНН", "references", "property-type") in edges
     assert (f"{ED} · ЛюбаяСсылка", f"{ED} · Body [element]", "references", "element-ref") in edges
     assert _by_label(r)[f"{ED} · Body [element]"]["xml_kind"] == "element"
     assert ("http://v8.1c.ru/edi/edi_stnd/EnterpriseData/1.22",
@@ -113,26 +113,26 @@ def test_inheritance_references_and_global_property(tmp_path):
 def test_type_def_is_an_anonymous_type_under_its_property(tmp_path):
     r = extract_xdto(_write(tmp_path, "ED", _ED))
     edges = _edges(r)
-    owner = f"{ED} · ЛюбаяСсылка.СсылкаНаОбъект"
+    owner = f"{ED} · ЛюбаяСсылка/СсылкаНаОбъект"
     anon = f"{owner}#type"
     assert (owner, anon, "contains", None) in edges
-    assert (anon, f"{anon}.БанкиСсылка", "contains", None) in edges
-    assert (f"{anon}.БанкиСсылка", f"{ED} · СправочникСсылка.Банки", "references", "property-type") in edges
+    assert (anon, f"{anon}/БанкиСсылка", "contains", None) in edges
+    assert (f"{anon}/БанкиСсылка", f"{ED} · СправочникСсылка.Банки", "references", "property-type") in edges
     nodes = _by_label(r)
     assert nodes[anon]["xml_kind"] == "anonymous-type"
-    comment = nodes[f"{ED} · ЛюбаяСсылка.Комментарий#type"]
+    comment = nodes[f"{ED} · ЛюбаяСсылка/Комментарий#type"]
     assert comment["xml_maxLength"] == "100" and comment["base_ref"] == f"{XS}string"
 
 
 def test_dotted_type_and_property_of_its_prefix_stay_apart(tmp_path):
     # Type `СправочникСсылка.Банки` and property `Банки` of type `СправочникСсылка`
-    # share a label (the label format cannot tell them apart), but not an id:
-    # make_id folds the dot, so without the member token they would be one node.
-    r = extract_xdto(_write(tmp_path, "ED", _ED))
-    same = [n for n in r["nodes"] if n["label"] == f"{ED} · СправочникСсылка.Банки"]
-    assert sorted(n["xml_kind"] for n in same) == ["property", "type"]
-    assert len({n["id"] for n in same}) == 2
-    [dotted] = [n for n in same if n["xml_kind"] == "type"]
+    # (EnterpriseData names tabular-section row types this way): two nodes, and
+    # the labels tell them apart — `/` cannot occur in an XML name, `.` can.
+    nodes = _by_label(extract_xdto(_write(tmp_path, "ED", _ED)))
+    dotted = nodes[f"{ED} · СправочникСсылка.Банки"]
+    member = nodes[f"{ED} · СправочникСсылка/Банки"]
+    assert dotted["xml_kind"] == "type" and member["xml_kind"] == "property"
+    assert dotted["id"] != member["id"]
     assert dotted["id"] == symbol_id("http://v8.1c.ru/edi/edi_stnd/EnterpriseData/1.22",
                                      "type", "СправочникСсылка.Банки")
 
@@ -168,7 +168,7 @@ def test_xsd_and_xdto_of_one_namespace_share_nodes(tmp_path, monkeypatch, capsys
     err = capsys.readouterr().err
 
     graph = json.loads((proj / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
-    for label in ("scripts/1.0 · UpdateFile", "scripts/1.0 · UpdateFile.Extension",
+    for label in ("scripts/1.0 · UpdateFile", "scripts/1.0 · UpdateFile/Extension",
                   "http://v8.1c.ru/agent/scripts/1.0"):
         assert len([n for n in graph["nodes"] if n.get("label") == label]) == 1, label
     assert "minted by two different files" not in err
