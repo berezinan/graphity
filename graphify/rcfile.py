@@ -241,15 +241,31 @@ def effective_suffix(path: Path | str) -> str:
     return active.get(suffix.lower(), suffix)
 
 
+# Fork delta (xml-schema-types): version of the fork's own extractors, per
+# extension. The AST cache key covers graphify's version, upstream's cache
+# schema and the grammars — not the fork's extractor code — so a changed `.mdo`
+# extractor kept serving old entries for unchanged files, even under --force
+# (which skips only the semantic cache). Bump an extension's value when its
+# extractor's output for unchanged input changes; add an extension the first
+# time its extractor changes. The manifest stores this salt, so a bump also
+# re-queues those files on a plain incremental update.
+_FORK_EXTRACTOR_VERSIONS: dict[str, str] = {
+    ".mdo": "1", ".xsd": "1", ".wsdl": "1", ".xdto": "1",
+}
+
+
 def cache_salt(path: Path | str) -> str | None:
-    """Extra cache-key material for a remapped file, else ``None``.
+    """Extra cache-key material for a remapped file or a fork extractor, else ``None``.
 
     An AST cache entry is keyed by content, and the same bytes parse to a
     different graph under a different extractor — so a ``.inc`` cached as
     Pascal must not be served once the project declares it PHP.
     """
+    suffix = Path(path).suffix.lower()
     active = _active()
-    if not active:
-        return None
-    target = active.get(Path(path).suffix.lower())
-    return f"language={target}" if target else None
+    target = active.get(suffix) if active else None
+    parts = [f"language={target}"] if target else []
+    fork = _FORK_EXTRACTOR_VERSIONS.get(target or suffix)
+    if fork:
+        parts.append(f"fork={fork}")
+    return ";".join(parts) or None
