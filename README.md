@@ -10,7 +10,7 @@ The data access layer has been redesigned: the GraphBackend abstraction has been
 
 - Build one from an existing graph (no LLM, no rebuild): `graphify snap build [<project-dir|graph.json>]`.
 - Store selection: `GRAPHIFY_GRAPH_STORE=snap` (default) or `json`; any other value is an error (`arcadedb` reports that ArcadeDB was retired).
-- The Rust module ships as a separate wheel, `graphify-snap` (built from `native/graphify_snap` with `maturin build --release`, attached to the fork's releases). Install it next to graphify, e.g. `uv tool install --editable . --with <path to graphify_snap-*.whl>`; for a development venv run `maturin develop --release` in `native/graphify_snap`.
+- The Rust module ships as a separate wheel, `graphify-snap` (built from `native/graphify_snap` with `maturin build --release`, attached to the fork's releases). It targets the CPython stable ABI (`cp312-abi3`), so one wheel installs on every CPython 3.12 and later. Install it next to graphify, e.g. `uv tool install --editable . --with <path to graphify_snap-*.whl>`; for a development venv run `maturin develop --release` in `native/graphify_snap`.
 
 <p align="center">
   <a href="https://graphify.com"><img src="https://raw.githubusercontent.com/Graphify-Labs/graphify/v8/docs/graphify-logo.png" width="360" height="189" alt="Graphify"/></a>

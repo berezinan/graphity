@@ -10,6 +10,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 snap-core = { path = "../snap-core" }
-# No abi3: zero-copy views need the buffer protocol, which the limited API
-# exposes only from 3.11; the spike builds for its own interpreter.
-pyo3 = { version = "0.25", features = ["extension-module"] }
+# Stable ABI from CPython 3.12: one wheel (cp312-abi3) for every 3.12+ release.
+# Zero-copy views need the buffer protocol, which the limited API exposes from
+# 3.11; the floor is 3.12 because that is the oldest version tested. Measured on
+# ERP2 against a cp312-cp312 build of the same tree: build, memory and query
+# times within 1 % (python-version-agnostic-distribution, spike.md).
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
